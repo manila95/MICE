@@ -16,33 +16,44 @@ def estimate_true_value(agent,
 
         eval_env = make(env_id, num_envs=num_envs, device=cfgs.train_cfgs.device)
         
-        true_cvalues = []
-        estimate_cvalues = []
+        true_cvalues, true_rvalues = [], []
+        estimate_rvalues, estimate_cvalues = [], []
         for _ in range(eval_episodes):
             obs0, _ = eval_env.reset()
 
-            _, _, estimate_cvalue, _ = agent.step(obs0)
+            _, estimate_rvalue, estimate_cvalue, _ = agent.step(obs0)
 
             obs = obs0
 
             true_cvalue = 0.0
+            true_rvalue = 0.0
             step = 0
             while True:
                 act, _, _, _ = agent.step(obs)
-                next_obs, _, c, termniated, truncated, info = eval_env.step(act)
+                next_obs, r, c, termniated, truncated, info = eval_env.step(act)
                 true_cvalue += c * (discount ** step)
-
+                true_rvalue += r * (discount ** step)
                 step += 1
                 obs = next_obs
 
                 if termniated or truncated:
                     break
             true_cvalues.append(true_cvalue)
+            true_rvalues.append(true_rvalue)
             estimate_cvalues.append(estimate_cvalue)
-
+            estimate_rvalues.append(estimate_rvalue)
             print("Estimation took: ", step)
 
-        return torch.mean(torch.stack(true_cvalues)), torch.mean(torch.stack(estimate_cvalues))
+        c_error = torch.mean(torch.stack(true_cvalues) - torch.stack(estimate_cvalues))
+        r_error = torch.mean(torch.stack(true_rvalues) - torch.stack(estimate_rvalues))
+
+        true_c = torch.mean(torch.stack(true_cvalues))
+        true_r = torch.mean(torch.stack(true_rvalues))
+        estimate_c = torch.mean(torch.stack(estimate_cvalues))
+        estimate_r = torch.mean(torch.stack(estimate_rvalues))
+        print(true_r, estimate_r, r_error)    
+        return c_error, true_c, estimate_c, r_error, true_r, estimate_r
+        #return torch.mean(torch.stack(true_cvalues) - torch.stack(estimate_cvalues)), torch.mean(torch.stack(true_cvalues)), torch.mean(torch.stack(estimate_cvalues))
 
 
 class RandomProjection(torch.nn.Module):

@@ -67,7 +67,10 @@ class MICE(CPO):
         self._logger.register_key('Value/Adv_c')
         self._logger.register_key('Eval/true_value_c')
         self._logger.register_key('Eval/estimate_value_c')
-        
+        self._logger.register_key('Eval/EstimationError_c')
+        self._logger.register_key('Eval/true_value_r')
+        self._logger.register_key('Eval/estimate_value_r')
+        self._logger.register_key('Eval/EstimationError_r')
 
     def learn(self) -> Tuple[Union[int, float], ...]:
         start_time = time.time()
@@ -92,7 +95,7 @@ class MICE(CPO):
             )
 
             if self._cfgs.algo_cfgs.test_estimate:
-                true_value_c, estimate_value_c = utl.estimate_true_value(
+                error_c, true_value_c, estimate_value_c, error_r, true_value_r, estimate_value_r = utl.estimate_true_value(
                     agent=self._actor_critic,
                     env_id=self._env_id,
                     num_envs=1,
@@ -101,9 +104,12 @@ class MICE(CPO):
                     discount=self._cfgs.algo_cfgs.cost_gamma,
                     eval_episodes=1,
                 )
+                self._logger.store(**{'Eval/EstimationError_c': error_c})
                 self._logger.store(**{'Eval/true_value_c': true_value_c})
                 self._logger.store(**{'Eval/estimate_value_c': estimate_value_c})
-
+                self._logger.store(**{'Eval/EstimationError_r': error_r})
+                self._logger.store(**{'Eval/true_value_r': true_value_r})
+                self._logger.store(**{'Eval/estimate_value_r': estimate_value_r})
             self._logger.store({'Time/Rollout': time.time() - rollout_time})
 
             update_time = time.time()
