@@ -58,6 +58,7 @@ class MICEBuffer(OnPolicyBuffer):
         self.beta_lr = 0.1
         self._beta_list = []
         self._deltas_n_list = []
+        self._deltas_n_mc_list = []
 
     def get(self) -> Dict[str, torch.Tensor]:
         """Get the data in the buffer."""
@@ -65,8 +66,10 @@ class MICEBuffer(OnPolicyBuffer):
 
         beta_flat = torch.cat(self._beta_list, dim=0) if self._beta_list else torch.tensor([self.beta], device=self._device, dtype=torch.float32)
         deltas_n_flat = torch.cat(self._deltas_n_list, dim=0) if self._deltas_n_list else torch.zeros(1, device=self._device, dtype=torch.float32)
+        deltas_n_mc_flat = torch.cat(self._deltas_n_mc_list, dim=0) if self._deltas_n_mc_list else torch.zeros(1, device=self._device, dtype=torch.float32)
         self._beta_list = []
         self._deltas_n_list = []
+        self._deltas_n_mc_list = []
 
         data = {
             'obs': self.data['obs'],
@@ -85,6 +88,7 @@ class MICEBuffer(OnPolicyBuffer):
             'beta_': beta_flat,
             'beta': torch.tensor([self.beta], device=self._device, dtype=torch.float32),
             'deltas_n': deltas_n_flat,
+            'deltas_n_mc': deltas_n_mc_flat,
         }
 
         adv_mean, adv_std, *_ = distributed.dist_statistics_scalar(data['adv_r'])
@@ -150,11 +154,21 @@ class MICEBuffer(OnPolicyBuffer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if self._advantage_estimator == 'gae':
-            # GAE formula: A_t = \sum_{k=0}^{n-1} (lam*gamma)^k delta_{t+k}
+            # TD(0) deltas: one-step TD error
             deltas_n = (
                 costs[:-1] + self.beta * intrinsic_costs + self._gamma * values_c[1:] - values_c[:-1]
             )
             self._deltas_n_list.append(deltas_n.detach().flatten())
+
+            # Monte Carlo deltas: true return from trajectory - V(s_t)
+            # G_t = sum_{k>=0} gamma^k * (cost_{t+k} + beta*intrinsic_{t+k}) with bootstrap at path end
+            path_rewards = costs[:-1] + self.beta * intrinsic_costs
+            last_v = values_c[-1:].reshape(-1)  # bootstrap value at path end
+            R = torch.cat([path_rewards, last_v])
+            mc_returns = discount_cumsum(R, self._gamma)[:-1]  # G_0, ..., G_{n-1}
+            deltas_n_mc = mc_returns - values_c[:-1]
+            self._deltas_n_mc_list.append(deltas_n_mc.detach().flatten())
+
             beta_ = torch.where(
                 intrinsic_costs != 0,
                 self.beta - lr * deltas_n / intrinsic_costs,

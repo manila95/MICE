@@ -126,6 +126,14 @@ class MICE(CPO):
                 ylabel='beta_',
                 step=epoch + 1,
             )
+            self._logger.log_scatter_image(
+                'Train/deltas_n_TD_vs_MC',
+                self._epoch_deltas_n,
+                self._epoch_deltas_n_mc,
+                xlabel='deltas_n (TD(0))',
+                ylabel='deltas_n_mc (MC)',
+                step=epoch + 1,
+            )
             self._logger.store({'Train/log_beta': np.log(max(self._epoch_beta, 1e-10))})
             self._logger.store({'Time/Update': time.time() - update_time})
 
@@ -192,6 +200,7 @@ class MICE(CPO):
         self._epoch_beta_ = data['beta_']
         self._epoch_beta = data['beta'].mean().item()
         self._epoch_deltas_n = data['deltas_n']
+        self._epoch_deltas_n_mc = data['deltas_n_mc']
         self._update_actor(obs, act, logp, adv_r, adv_c, intrinsic_costs, balancing_ep_dicount_ci)
 
         dataloader = DataLoader(
