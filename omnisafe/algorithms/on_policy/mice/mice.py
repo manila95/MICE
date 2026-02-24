@@ -2,6 +2,7 @@
 
 import time
 from typing import Dict, Tuple, Optional, Union
+import numpy as np
 import torch
 
 
@@ -64,6 +65,7 @@ class MICE(CPO):
         self._logger.register_key('Train/intrinsic_costs')
         self._logger.register_key('Train/discount_ci')
         self._logger.register_key('Train/intrinsic_factor')
+        self._logger.register_key('Train/log_beta')
         self._logger.register_key('Value/Adv_c')
         self._logger.register_key('Eval/true_value_c')
         self._logger.register_key('Eval/estimate_value_c')
@@ -114,6 +116,17 @@ class MICE(CPO):
 
             update_time = time.time()
             self._update()
+            # self._logger.log_histogram('plots/beta_', self._epoch_beta_, step=epoch + 1)
+            self._logger.log_histogram_image('plots/beta_', self._epoch_beta_, step=epoch + 1)
+            self._logger.log_scatter_image(
+                'Train/deltas_n_vs_beta_',
+                self._epoch_deltas_n,
+                self._epoch_beta_,
+                xlabel='deltas_n',
+                ylabel='beta_',
+                step=epoch + 1,
+            )
+            self._logger.store({'Train/log_beta': np.log(max(self._epoch_beta, 1e-10))})
             self._logger.store({'Time/Update': time.time() - update_time})
 
             if self._cfgs.model_cfgs.exploration_noise_anneal:
@@ -164,8 +177,7 @@ class MICE(CPO):
             adv_r,
             adv_c,
             intrinsic_costs,
-            balancing_ep_dicount_ci, 
-            
+            balancing_ep_dicount_ci,
         ) = (
             data['obs'],
             data['act'],
@@ -174,9 +186,12 @@ class MICE(CPO):
             data['target_value_c'],
             data['adv_r'],
             data['adv_c'],
-            data['intrinsic_costs'], 
-            data['ep_discount_ci'], 
+            data['intrinsic_costs'],
+            data['ep_discount_ci'],
         )
+        self._epoch_beta_ = data['beta_']
+        self._epoch_beta = data['beta'].mean().item()
+        self._epoch_deltas_n = data['deltas_n']
         self._update_actor(obs, act, logp, adv_r, adv_c, intrinsic_costs, balancing_ep_dicount_ci)
 
         dataloader = DataLoader(

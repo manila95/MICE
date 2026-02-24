@@ -56,10 +56,17 @@ class MICEBuffer(OnPolicyBuffer):
         self.data['time_step'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.beta = 1.0
         self.beta_lr = 0.1
+        self._beta_list = []
+        self._deltas_n_list = []
 
     def get(self) -> Dict[str, torch.Tensor]:
         """Get the data in the buffer."""
         self.ptr, self.path_start_idx = 0, 0
+
+        beta_flat = torch.cat(self._beta_list, dim=0) if self._beta_list else torch.tensor([self.beta], device=self._device, dtype=torch.float32)
+        deltas_n_flat = torch.cat(self._deltas_n_list, dim=0) if self._deltas_n_list else torch.zeros(1, device=self._device, dtype=torch.float32)
+        self._beta_list = []
+        self._deltas_n_list = []
 
         data = {
             'obs': self.data['obs'],
@@ -75,6 +82,9 @@ class MICEBuffer(OnPolicyBuffer):
             'value_c': self.data['value_c'],
             'intrinsic_costs': self.data['intrinsic_costs'],
             'time_step': self.data['time_step'],
+            'beta_': beta_flat,
+            'beta': torch.tensor([self.beta], device=self._device, dtype=torch.float32),
+            'deltas_n': deltas_n_flat,
         }
 
         adv_mean, adv_std, *_ = distributed.dist_statistics_scalar(data['adv_r'])
@@ -144,15 +154,17 @@ class MICEBuffer(OnPolicyBuffer):
             deltas_n = (
                 costs[:-1] + self.beta * intrinsic_costs + self._gamma * values_c[1:] - values_c[:-1]
             )
-            beta_ =torch.where(
-                intrinsic_costs != 0, 
-                self.beta - lr * deltas_n / intrinsic_costs,  
-                torch.ones_like(deltas_n) * self.beta  
+            self._deltas_n_list.append(deltas_n.detach().flatten())
+            beta_ = torch.where(
+                intrinsic_costs != 0,
+                self.beta - lr * deltas_n / intrinsic_costs,
+                torch.ones_like(deltas_n) * self.beta,
             )
+            self._beta_list.append(beta_.detach().flatten())
             deltas = (
                 costs[:-1] + beta_ * intrinsic_costs + self._gamma * values_c[1:] - values_c[:-1]
             )
-            ep_disount_ci = discount_cumsum( beta_ * intrinsic_costs, self._gamma)
+            ep_disount_ci = discount_cumsum(beta_ * intrinsic_costs, self._gamma)
             ep_disount_ci[:] = ep_disount_ci[0].clone()
             self.beta = (1 - self.beta_lr) * self.beta + self.beta_lr * beta_.mean().item() 
             

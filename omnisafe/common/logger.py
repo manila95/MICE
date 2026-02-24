@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import atexit
 import csv
+import io
 import os
 import time
 from collections import deque
@@ -26,6 +27,11 @@ from typing import Any, TextIO
 import numpy as np
 import torch
 import wandb
+from PIL import Image
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from rich import print  # pylint: disable=redefined-builtin,wrong-import-order
 from rich.console import Console  # pylint: disable=wrong-import-order
 from rich.table import Table  # pylint: disable=wrong-import-order
@@ -280,6 +286,131 @@ class Logger:  # pylint: disable=too-many-instance-attributes
                 self._data[key].append(val.mean())
             else:
                 raise ValueError(f'Unsupported type {type(val)}')
+
+    def log_histogram(
+        self,
+        key: str,
+        values: np.ndarray | torch.Tensor,
+        step: int | None = None,
+    ) -> None:
+        """Log a histogram of values to tensorboard and/or wandb.
+
+        Args:
+            key (str): The name of the histogram.
+            values (np.ndarray or torch.Tensor): The values to histogram (1-d).
+            step (int or None, optional): Global step. Defaults to current epoch.
+        """
+        if not self._maste_proc:
+            return
+        if step is None:
+            step = self._epoch
+        vals = values.cpu().numpy() if isinstance(values, torch.Tensor) else np.asarray(values)
+        vals = np.atleast_1d(vals).flatten()
+        if self._use_tensorboard:
+            self._tensorboard_writer.add_histogram(key, vals, global_step=step)
+        if self._use_wandb:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.hist(vals, bins=min(50, max(1, len(vals) // 5)), edgecolor='black', alpha=0.7)
+            ax.set_xlabel('value')
+            ax.set_ylabel('count')
+            ax.set_title(f'{key} (step {step})')
+            fig.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            buf.seek(0)
+            img = np.array(Image.open(buf))
+            wandb.log({key: wandb.Image(img)}, step=step)
+            plt.close(fig)
+
+    def log_histogram_image(
+        self,
+        key: str,
+        values: np.ndarray | torch.Tensor,
+        step: int | None = None,
+    ) -> None:
+        """Log a histogram of values as an image (matplotlib figure) to tensorboard and/or wandb.
+
+        Args:
+            key (str): The name of the histogram image.
+            values (np.ndarray or torch.Tensor): The values to histogram (1-d).
+            step (int or None, optional): Global step. Defaults to current epoch.
+        """
+        if not self._maste_proc:
+            return
+        if step is None:
+            step = self._epoch
+        vals = values.cpu().numpy() if isinstance(values, torch.Tensor) else np.asarray(values)
+        vals = np.atleast_1d(vals).flatten()
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.hist(vals, bins=min(50, max(1, len(vals) // 5)), edgecolor='black', alpha=0.7)
+        ax.set_xlabel('beta_')
+        ax.set_ylabel('count')
+        ax.set_title(f'{key} (step {step})')
+        fig.tight_layout()
+
+        if self._use_tensorboard:
+            self._tensorboard_writer.add_figure(key, fig, global_step=step)
+
+        if self._use_wandb:
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            buf.seek(0)
+            img = np.array(Image.open(buf))
+            wandb.log({key: wandb.Image(img)}, step=step)
+
+        plt.close(fig)
+
+    def log_scatter_image(
+        self,
+        key: str,
+        x_values: np.ndarray | torch.Tensor,
+        y_values: np.ndarray | torch.Tensor,
+        xlabel: str = 'x',
+        ylabel: str = 'y',
+        step: int | None = None,
+    ) -> None:
+        """Log a scatter plot of x vs y as an image to tensorboard and/or wandb.
+
+        Args:
+            key (str): The name of the scatter plot image.
+            x_values (np.ndarray or torch.Tensor): x-axis values (1-d).
+            y_values (np.ndarray or torch.Tensor): y-axis values (1-d).
+            xlabel (str): Label for x-axis.
+            ylabel (str): Label for y-axis.
+            step (int or None, optional): Global step. Defaults to current epoch.
+        """
+        if not self._maste_proc:
+            return
+        if step is None:
+            step = self._epoch
+        x_vals = x_values.cpu().numpy() if isinstance(x_values, torch.Tensor) else np.asarray(x_values)
+        y_vals = y_values.cpu().numpy() if isinstance(y_values, torch.Tensor) else np.asarray(y_values)
+        x_vals = np.atleast_1d(x_vals).flatten()
+        y_vals = np.atleast_1d(y_vals).flatten()
+        n = min(len(x_vals), len(y_vals))
+        if n == 0:
+            return
+        x_vals, y_vals = x_vals[:n], y_vals[:n]
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.scatter(x_vals, y_vals, alpha=0.5, s=10)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(f'{key} (step {step})')
+        fig.tight_layout()
+
+        if self._use_tensorboard:
+            self._tensorboard_writer.add_figure(key, fig, global_step=step)
+
+        if self._use_wandb:
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            buf.seek(0)
+            img = np.array(Image.open(buf))
+            wandb.log({key: wandb.Image(img)}, step=step)
+
+        plt.close(fig)
 
     def dump_tabular(self) -> None:
         """Dump the tabular data to the console and the file.
