@@ -369,6 +369,8 @@ class Logger:  # pylint: disable=too-many-instance-attributes
         xlabel: str = 'x',
         ylabel: str = 'y',
         step: int | None = None,
+        c_values: np.ndarray | torch.Tensor | None = None,
+        c_label: str = 'timestep',
     ) -> None:
         """Log a scatter plot of x vs y as an image to tensorboard and/or wandb.
 
@@ -379,6 +381,8 @@ class Logger:  # pylint: disable=too-many-instance-attributes
             xlabel (str): Label for x-axis.
             ylabel (str): Label for y-axis.
             step (int or None, optional): Global step. Defaults to current epoch.
+            c_values (np.ndarray or torch.Tensor or None): Optional values to color points by (1-d).
+            c_label (str): Label for the colorbar when c_values is provided.
         """
         if not self._maste_proc:
             return
@@ -394,7 +398,13 @@ class Logger:  # pylint: disable=too-many-instance-attributes
         x_vals, y_vals = x_vals[:n], y_vals[:n]
 
         fig, ax = plt.subplots(figsize=(6, 4))
-        ax.scatter(x_vals, y_vals, alpha=0.5, s=10)
+        if c_values is not None:
+            c_vals = c_values.cpu().numpy() if isinstance(c_values, torch.Tensor) else np.asarray(c_values)
+            c_vals = np.atleast_1d(c_vals).flatten()[:n]
+            sc = ax.scatter(x_vals, y_vals, c=c_vals, alpha=0.5, s=10, cmap='viridis')
+            plt.colorbar(sc, ax=ax, label=c_label)
+        else:
+            ax.scatter(x_vals, y_vals, alpha=0.5, s=10)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.set_title(f'{key} (step {step})')
