@@ -2,7 +2,8 @@ from omnisafe.envs.core import make, support_envs
 import torch
 import torch.nn.functional as F
 from omnisafe.utils.config import Config
-
+import matplotlib.pyplot as plt
+import wandb
 
 def estimate_true_value(agent, 
                     env_id: str, 
@@ -42,7 +43,7 @@ def estimate_true_value(agent,
             true_rvalues.append(true_rvalue)
             estimate_cvalues.append(estimate_cvalue)
             estimate_rvalues.append(estimate_rvalue)
-            print("Estimation took: ", step)
+            # print("Estimation took: ", step)
 
         c_error = torch.mean(torch.stack(true_cvalues) - torch.stack(estimate_cvalues))
         r_error = torch.mean(torch.stack(true_rvalues) - torch.stack(estimate_rvalues))
@@ -51,7 +52,35 @@ def estimate_true_value(agent,
         true_r = torch.mean(torch.stack(true_rvalues))
         estimate_c = torch.mean(torch.stack(estimate_cvalues))
         estimate_r = torch.mean(torch.stack(estimate_rvalues))
-        print(true_r, estimate_r, r_error)    
+        # --- Scatter plot logging to wandb ---
+        true_c_vals = torch.stack(true_cvalues).detach().cpu().numpy()
+        estimate_c_vals = torch.stack(estimate_cvalues).detach().cpu().numpy()
+        true_r_vals = torch.stack(true_rvalues).detach().cpu().numpy()
+        estimate_r_vals = torch.stack(estimate_rvalues).detach().cpu().numpy()
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+        # C-values scatter
+        axes[0].scatter(true_c_vals, estimate_c_vals, alpha=0.5, s=10, color="steelblue")
+        min_c, max_c = min(true_c_vals.min(), estimate_c_vals.min()), max(true_c_vals.max(), estimate_c_vals.max())
+        axes[0].plot([min_c, max_c], [min_c, max_c], "r--", linewidth=1, label="ideal")
+        axes[0].set_xlabel("True C")
+        axes[0].set_ylabel("Estimated C")
+        axes[0].set_title("C-Values: True vs Estimated")
+        axes[0].legend()
+
+        # R-values scatter
+        axes[1].scatter(true_r_vals, estimate_r_vals, alpha=0.5, s=10, color="darkorange")
+        min_r, max_r = min(true_r_vals.min(), estimate_r_vals.min()), max(true_r_vals.max(), estimate_r_vals.max())
+        axes[1].plot([min_r, max_r], [min_r, max_r], "r--", linewidth=1, label="ideal")
+        axes[1].set_xlabel("True R")
+        axes[1].set_ylabel("Estimated R")
+        axes[1].set_title("R-Values: True vs Estimated")
+        axes[1].legend()
+
+        plt.tight_layout()
+        wandb.log({"scatter/c_and_r_values": wandb.Image(fig)})
+        plt.close(fig)
         return c_error, true_c, estimate_c, r_error, true_r, estimate_r
         #return torch.mean(torch.stack(true_cvalues) - torch.stack(estimate_cvalues)), torch.mean(torch.stack(true_cvalues)), torch.mean(torch.stack(estimate_cvalues))
 

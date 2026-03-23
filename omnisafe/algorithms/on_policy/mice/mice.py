@@ -96,7 +96,7 @@ class MICE(CPO):
                 )
             )
 
-            if self._cfgs.algo_cfgs.test_estimate:
+            if self._cfgs.algo_cfgs.test_estimate and epoch % 50 == 0:
                 error_c, true_value_c, estimate_value_c, error_r, true_value_r, estimate_value_r = utl.estimate_true_value(
                     agent=self._actor_critic,
                     env_id=self._env_id,
@@ -104,7 +104,7 @@ class MICE(CPO):
                     seed=self._seed,
                     cfgs=self._cfgs,
                     discount=self._cfgs.algo_cfgs.cost_gamma,
-                    eval_episodes=1,
+                    eval_episodes=100,
                 )
                 self._logger.store(**{'Eval/EstimationError_c': error_c})
                 self._logger.store(**{'Eval/true_value_c': true_value_c})
