@@ -52,6 +52,7 @@ class MICE(CPO):
             penalty_coefficient=self._cfgs.algo_cfgs.penalty_coef,
             num_envs=self._cfgs.train_cfgs.vector_env_nums,
             device=self._device,
+            constant_cost=self._cfgs.algo_cfgs.constant_cost,
         )
 
         self._RPNet = utl.RandomProjection(self._env.observation_space.shape[0], self._cfgs.model_cfgs.emb_dim).to(

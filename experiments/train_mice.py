@@ -66,19 +66,29 @@ if __name__ == '__main__':
         default=16,
         metavar='THREADS',
         help='number of threads to use for torch',
-    )    
+    )
+    parser.add_argument(
+        '--constant-cost',
+        type=float,
+        default=None,
+        metavar='COST',
+        help='constant intrinsic cost added to every transition (None uses KNN-based intrinsic cost)',
+    )
     args, unparsed_args = parser.parse_known_args()
     keys = [k[2:] for k in unparsed_args[0::2]]
     values = list(unparsed_args[1::2])
     unparsed_args = dict(zip(keys, values))
 
-    seed = args.seed 
+    seed = args.seed
+    constant_cost = args.constant_cost
     opt = vars(args)
-    # Removing the seed argument to avoid anything from breaking
     del opt["seed"]
+    del opt["constant_cost"]
     custom_cfgs = {}
     for k, v in unparsed_args.items():
         update_dict(custom_cfgs, custom_cfgs_to_dict(k, v))
+    if constant_cost is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:constant_cost', str(constant_cost)))
 
     agent = omnisafe.Agent(
         args.algo,

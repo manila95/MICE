@@ -37,6 +37,7 @@ class MICEBuffer(OnPolicyBuffer):
         standardized_adv_r: bool = False,
         standardized_adv_c: bool = False,
         device: torch.device = torch.device('cpu'),
+        constant_cost: Optional[float] = None,
     ):
         super().__init__(
             obs_space,
@@ -59,6 +60,7 @@ class MICEBuffer(OnPolicyBuffer):
         self._beta_list = []
         self._deltas_n_list = []
         self._deltas_n_mc_list = []
+        self.constant_cost = constant_cost
 
     def get(self) -> Dict[str, torch.Tensor]:
         """Get the data in the buffer."""
@@ -152,7 +154,10 @@ class MICEBuffer(OnPolicyBuffer):
         intrinsic_costs: torch.Tensor,
         lr: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
+        
+        if self.constant_cost is not None:
+            intrinsic_costs = torch.full_like(intrinsic_costs, self.constant_cost)
+        
         if self._advantage_estimator == 'gae':
             # TD(0) deltas: one-step TD error
             deltas_n = (
@@ -206,6 +211,7 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
         standardized_adv_c: bool,
         num_envs: int = 1,
         device: torch.device = torch.device('cpu'),
+        constant_cost: Optional[float] = None,
     ):
         self._num_buffers = num_envs
         self._standardized_adv_r = standardized_adv_r
@@ -223,6 +229,7 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
                 advantage_estimator=advantage_estimator,
                 penalty_coefficient=penalty_coefficient,
                 device=device,
+                constant_cost=constant_cost,
             )
             for _ in range(num_envs)
         ]

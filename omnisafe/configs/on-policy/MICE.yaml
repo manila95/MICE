@@ -92,6 +92,8 @@ defaults:
     k_knn: 10
     # if test the cost estimate error
     test_estimate: True
+    # constant intrinsic cost added to every transition (None to use KNN-based intrinsic cost)
+    constant_cost: ~
   # logger configurations
   logger_cfgs:
     # use wandb for logging
