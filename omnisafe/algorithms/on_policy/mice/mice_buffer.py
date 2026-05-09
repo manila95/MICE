@@ -155,40 +155,66 @@ class MICEBuffer(OnPolicyBuffer):
         lr: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         
-        if self.constant_cost is not None:
-            intrinsic_costs = torch.full_like(intrinsic_costs, self.constant_cost)
-        
         if self._advantage_estimator == 'gae':
-            # TD(0) deltas: one-step TD error
-            deltas_n = (
-                costs[:-1] + self.beta * intrinsic_costs + self._gamma * values_c[1:] - values_c[:-1]
-            )
-            self._deltas_n_list.append(deltas_n.detach().flatten())
+            if self.constant_cost is not None:
+                # Ablation: fixed, state-independent intrinsic cost with beta frozen at 1.0.
+                # Without freezing beta, it adapts to absorb the constant (beta*C converges to
+                # the same value regardless of C), making the ablation meaningless.
+                intrinsic_costs = torch.full_like(intrinsic_costs, self.constant_cost)
+                self.data['intrinsic_costs'][self.path_start_idx:self.ptr] = intrinsic_costs
 
-            # Monte Carlo deltas: true return from trajectory - V(s_t)
-            # G_t = sum_{k>=0} gamma^k * (cost_{t+k} + beta*intrinsic_{t+k}) with bootstrap at path end
-            path_rewards = costs[:-1] + self.beta * intrinsic_costs
-            last_v = values_c[-1:].reshape(-1)  # bootstrap value at path end
-            R = torch.cat([path_rewards, last_v])
-            mc_returns = discount_cumsum(R, self._gamma)[:-1]  # G_0, ..., G_{n-1}
-            deltas_n_mc = mc_returns - values_c[:-1]
-            self._deltas_n_mc_list.append(deltas_n_mc.detach().flatten())
+                deltas_n = (
+                    costs[:-1] + intrinsic_costs + self._gamma * values_c[1:] - values_c[:-1]
+                )
+                self._deltas_n_list.append(deltas_n.detach().flatten())
 
-            beta_ = torch.where(
-                intrinsic_costs != 0,
-                self.beta - lr * deltas_n / intrinsic_costs,
-                torch.ones_like(deltas_n) * self.beta,
-            )
-            self._beta_list.append(beta_.detach().flatten())
-            deltas = (
-                costs[:-1] + beta_ * intrinsic_costs + self._gamma * values_c[1:] - values_c[:-1]
-            )
-            ep_disount_ci = discount_cumsum(beta_ * intrinsic_costs, self._gamma)
-            ep_disount_ci[:] = ep_disount_ci[0].clone()
-            self.beta = (1 - self.beta_lr) * self.beta + self.beta_lr * beta_.mean().item() 
-            
-            adv_c = discount_cumsum(deltas, self._gamma * lam)
-            target_value_c = adv_c + values_c[:-1]  # c_t + c_t_intrinsic + \gamma * V(s_t+1)
+                path_rewards = costs[:-1] + intrinsic_costs
+                last_v = values_c[-1:].reshape(-1)
+                R = torch.cat([path_rewards, last_v])
+                mc_returns = discount_cumsum(R, self._gamma)[:-1]
+                deltas_n_mc = mc_returns - values_c[:-1]
+                self._deltas_n_mc_list.append(deltas_n_mc.detach().flatten())
+
+                beta_ = torch.ones_like(deltas_n)  # frozen
+                self._beta_list.append(beta_.detach().flatten())
+
+                ep_disount_ci = discount_cumsum(intrinsic_costs, self._gamma)
+                ep_disount_ci[:] = ep_disount_ci[0].clone()
+
+                adv_c = discount_cumsum(deltas_n, self._gamma * lam)
+                target_value_c = adv_c + values_c[:-1]
+
+            else:
+                # TD(0) deltas: one-step TD error
+                deltas_n = (
+                    costs[:-1] + self.beta * intrinsic_costs + self._gamma * values_c[1:] - values_c[:-1]
+                )
+                self._deltas_n_list.append(deltas_n.detach().flatten())
+
+                # Monte Carlo deltas: true return from trajectory - V(s_t)
+                # G_t = sum_{k>=0} gamma^k * (cost_{t+k} + beta*intrinsic_{t+k}) with bootstrap at path end
+                path_rewards = costs[:-1] + self.beta * intrinsic_costs
+                last_v = values_c[-1:].reshape(-1)  # bootstrap value at path end
+                R = torch.cat([path_rewards, last_v])
+                mc_returns = discount_cumsum(R, self._gamma)[:-1]  # G_0, ..., G_{n-1}
+                deltas_n_mc = mc_returns - values_c[:-1]
+                self._deltas_n_mc_list.append(deltas_n_mc.detach().flatten())
+
+                beta_ = torch.where(
+                    intrinsic_costs != 0,
+                    self.beta - lr * deltas_n / intrinsic_costs,
+                    torch.ones_like(deltas_n) * self.beta,
+                )
+                self._beta_list.append(beta_.detach().flatten())
+                deltas = (
+                    costs[:-1] + beta_ * intrinsic_costs + self._gamma * values_c[1:] - values_c[:-1]
+                )
+                ep_disount_ci = discount_cumsum(beta_ * intrinsic_costs, self._gamma)
+                ep_disount_ci[:] = ep_disount_ci[0].clone()
+                self.beta = (1 - self.beta_lr) * self.beta + self.beta_lr * beta_.mean().item()
+
+                adv_c = discount_cumsum(deltas, self._gamma * lam)
+                target_value_c = adv_c + values_c[:-1]  # c_t + c_t_intrinsic + \gamma * V(s_t+1)
 
         else:
             raise NotImplementedError
