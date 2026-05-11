@@ -145,24 +145,13 @@ class MICEBuffer(OnPolicyBuffer):
         self.data['target_value_c'][path_slice] = target_value_c
 
         self.path_start_idx = self.ptr
-    
-    def _calculate_balancing_intrinsic_adv_and_value_targets(
-        self,
-        values_c: torch.Tensor,
-        costs: torch.Tensor,
-        lam: float,
-        intrinsic_costs: torch.Tensor,
-        lr: float,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
         
+    def _calculate_balancing_intrinsic_adv_and_value_targets(
+        self, values_c, costs, lam, intrinsic_costs, lr
+    ):
         if self._advantage_estimator == 'gae':
             if self.constant_cost is not None:
-                # Ablation: fixed, state-independent intrinsic cost with beta frozen at 1.0.
-                # Without freezing beta, it adapts to absorb the constant (beta*C converges to
-                # the same value regardless of C), making the ablation meaningless.
-                intrinsic_costs = torch.full_like(intrinsic_costs, self.constant_cost)
-                self.data['intrinsic_costs'][self.path_start_idx:self.ptr] = intrinsic_costs
-
+                # β frozen at 1; intrinsic_costs already set correctly in rollout
                 deltas_n = (
                     costs[:-1] + intrinsic_costs + self._gamma * values_c[1:] - values_c[:-1]
                 )
@@ -175,11 +164,12 @@ class MICEBuffer(OnPolicyBuffer):
                 deltas_n_mc = mc_returns - values_c[:-1]
                 self._deltas_n_mc_list.append(deltas_n_mc.detach().flatten())
 
-                beta_ = torch.ones_like(deltas_n)  # frozen
+                beta_ = torch.ones_like(deltas_n)
                 self._beta_list.append(beta_.detach().flatten())
 
-                ep_disount_ci = discount_cumsum(intrinsic_costs, self._gamma)
-                ep_disount_ci[:] = ep_disount_ci[0].clone()
+                # ep_disount_ci = discount_cumsum(intrinsic_costs, self._gamma)
+                # ep_disount_ci[:] = ep_disount_ci[0].clone()
+                ep_disount_ci = torch.full_like(intrinsic_costs, self.constant_cost)
 
                 adv_c = discount_cumsum(deltas_n, self._gamma * lam)
                 target_value_c = adv_c + values_c[:-1]

@@ -69,25 +69,45 @@ class MICEAdapter(OnPolicyAdapter):
                     flashbulb_memory.unsafe_states[idx].append(emb_obs[idx])
                     
             intrinsic_cost = torch.zeros_like(cost)
-            
-            for idx in range(self._env.num_envs):
-                if len(flashbulb_memory.unsafe_states[idx]) > self._cfgs.algo_cfgs.k_knn:
-                    dist = torch.tensor(
-                        [torch.dist(c_state, emb_obs[idx]) for c_state in flashbulb_memory.unsafe_states[idx]], device=obs.device
-                    )
-                    topk_dist, _ = torch.topk(
-                        dist, self._cfgs.algo_cfgs.k_knn, largest=False, sorted=True
-                    )
-                    dist_tensor = topk_dist / torch.mean(topk_dist)
-                    dist_tensor = torch.max(
-                        dist_tensor - self._kernel_cluster_distance, torch.tensor(0.0, device=obs.device)
-                    )
+                
+            # replace the existing KNN block with this:
 
-                    kernel = self._kernel_epsilon / (dist_tensor + self._kernel_epsilon)
-                    ci = torch.sqrt(torch.sum(kernel))
-                    ci = torch.where(torch.isnan(ci), torch.tensor(0.0, device=obs.device), ci)
-
-                    intrinsic_cost[idx] = self._cfgs.algo_cfgs.intrinsic_factor * (self._cfgs.algo_cfgs.cost_gamma**epoch) * ci
+            if self._cfgs.algo_cfgs.constant_cost is not None:
+                ci_val = torch.tensor(
+                    self._cfgs.algo_cfgs.constant_cost, device=obs.device
+                )
+                for idx in range(self._env.num_envs):
+                    intrinsic_cost[idx] = (
+                        self._cfgs.algo_cfgs.intrinsic_factor
+                        * (self._cfgs.algo_cfgs.cost_gamma ** epoch)
+                        * ci_val
+                    )
+            else:
+                for idx in range(self._env.num_envs):
+                    if len(flashbulb_memory.unsafe_states[idx]) > self._cfgs.algo_cfgs.k_knn:
+                        dist = torch.tensor(
+                            [torch.dist(c_state, emb_obs[idx])
+                            for c_state in flashbulb_memory.unsafe_states[idx]],
+                            device=obs.device,
+                        )
+                        topk_dist, _ = torch.topk(
+                            dist, self._cfgs.algo_cfgs.k_knn, largest=False, sorted=True
+                        )
+                        dist_tensor = topk_dist / torch.mean(topk_dist)
+                        dist_tensor = torch.max(
+                            dist_tensor - self._kernel_cluster_distance,
+                            torch.tensor(0.0, device=obs.device),
+                        )
+                        kernel = self._kernel_epsilon / (dist_tensor + self._kernel_epsilon)
+                        ci = torch.sqrt(torch.sum(kernel))
+                        ci = torch.where(
+                            torch.isnan(ci), torch.tensor(0.0, device=obs.device), ci
+                        )
+                        intrinsic_cost[idx] = (
+                            self._cfgs.algo_cfgs.intrinsic_factor
+                            * (self._cfgs.algo_cfgs.cost_gamma ** epoch)
+                            * ci
+                        )
             self._ep_discount_ci += intrinsic_cost
 
             buffer.store(
