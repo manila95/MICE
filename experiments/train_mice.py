@@ -74,6 +74,34 @@ if __name__ == '__main__':
         metavar='COST',
         help='constant intrinsic cost added to every transition (None uses KNN-based intrinsic cost)',
     )
+    parser.add_argument(
+        '--cost-decay-type',
+        type=str,
+        default=None,
+        choices=['exponential', 'step'],
+        help='decay schedule for constant_cost: exponential (C*rate^epoch) or step (C*factor^(epoch//interval))',
+    )
+    parser.add_argument(
+        '--cost-decay-rate',
+        type=float,
+        default=None,
+        metavar='RATE',
+        help='per-epoch decay rate for exponential schedule (e.g. 0.985 → ~1%% at epoch 300)',
+    )
+    parser.add_argument(
+        '--cost-decay-step-interval',
+        type=int,
+        default=None,
+        metavar='INTERVAL',
+        help='number of epochs between decay steps for step schedule',
+    )
+    parser.add_argument(
+        '--cost-decay-factor',
+        type=float,
+        default=None,
+        metavar='FACTOR',
+        help='multiplicative factor applied at each step for step schedule (e.g. 0.4)',
+    )
     args, unparsed_args = parser.parse_known_args()
     keys = [k[2:] for k in unparsed_args[0::2]]
     values = list(unparsed_args[1::2])
@@ -81,14 +109,30 @@ if __name__ == '__main__':
 
     seed = args.seed
     constant_cost = args.constant_cost
+    cost_decay_type = args.cost_decay_type
+    cost_decay_rate = args.cost_decay_rate
+    cost_decay_step_interval = args.cost_decay_step_interval
+    cost_decay_factor = args.cost_decay_factor
     opt = vars(args)
     del opt["seed"]
     del opt["constant_cost"]
+    del opt["cost_decay_type"]
+    del opt["cost_decay_rate"]
+    del opt["cost_decay_step_interval"]
+    del opt["cost_decay_factor"]
     custom_cfgs = {}
     for k, v in unparsed_args.items():
         update_dict(custom_cfgs, custom_cfgs_to_dict(k, v))
     if constant_cost is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:constant_cost', str(constant_cost)))
+    if cost_decay_type is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_decay_type', cost_decay_type))
+    if cost_decay_rate is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_decay_rate', str(cost_decay_rate)))
+    if cost_decay_step_interval is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_decay_step_interval', str(cost_decay_step_interval)))
+    if cost_decay_factor is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_decay_factor', str(cost_decay_factor)))
 
     agent = omnisafe.Agent(
         args.algo,

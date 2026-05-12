@@ -53,6 +53,10 @@ class MICE(CPO):
             num_envs=self._cfgs.train_cfgs.vector_env_nums,
             device=self._device,
             constant_cost=self._cfgs.algo_cfgs.constant_cost,
+            cost_decay_type=self._cfgs.algo_cfgs.cost_decay_type,
+            cost_decay_rate=self._cfgs.algo_cfgs.cost_decay_rate,
+            cost_decay_step_interval=self._cfgs.algo_cfgs.cost_decay_step_interval,
+            cost_decay_factor=self._cfgs.algo_cfgs.cost_decay_factor,
         )
 
         self._RPNet = utl.RandomProjection(self._env.observation_space.shape[0], self._cfgs.model_cfgs.emb_dim).to(
@@ -67,6 +71,8 @@ class MICE(CPO):
         self._logger.register_key('Train/discount_ci')
         self._logger.register_key('Train/intrinsic_factor')
         self._logger.register_key('Train/log_beta')
+        if self._cfgs.algo_cfgs.constant_cost is not None:
+            self._logger.register_key('Train/effective_constant_cost')
         self._logger.register_key('Value/Adv_c')
         self._logger.register_key('Eval/true_value_c')
         self._logger.register_key('Eval/estimate_value_c')
@@ -150,6 +156,8 @@ class MICE(CPO):
                 c_label='timestep',
             )
             self._logger.store({'Train/log_beta': np.log(max(self._epoch_beta, 1e-10))})
+            if self._cfgs.algo_cfgs.constant_cost is not None:
+                self._logger.store({'Train/effective_constant_cost': self._buf.get_effective_constant_cost(epoch)})
             self._logger.store({'Time/Update': time.time() - update_time})
 
             if self._cfgs.model_cfgs.exploration_noise_anneal:

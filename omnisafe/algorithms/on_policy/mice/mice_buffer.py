@@ -38,6 +38,10 @@ class MICEBuffer(OnPolicyBuffer):
         standardized_adv_c: bool = False,
         device: torch.device = torch.device('cpu'),
         constant_cost: Optional[float] = None,
+        cost_decay_type: Optional[str] = None,
+        cost_decay_rate: float = 0.985,
+        cost_decay_step_interval: int = 50,
+        cost_decay_factor: float = 0.4,
     ):
         super().__init__(
             obs_space,
@@ -61,6 +65,23 @@ class MICEBuffer(OnPolicyBuffer):
         self._deltas_n_list = []
         self._deltas_n_mc_list = []
         self.constant_cost = constant_cost
+        self.cost_decay_type = cost_decay_type
+        self.cost_decay_rate = cost_decay_rate
+        self.cost_decay_step_interval = cost_decay_step_interval
+        self.cost_decay_factor = cost_decay_factor
+
+    def _get_effective_constant_cost(self, epoch: int) -> Optional[float]:
+        if self.constant_cost is None:
+            return None
+        if self.cost_decay_type is None:
+            return self.constant_cost
+        elif self.cost_decay_type == 'exponential':
+            return self.constant_cost * (self.cost_decay_rate ** epoch)
+        elif self.cost_decay_type == 'step':
+            steps = epoch // self.cost_decay_step_interval
+            return self.constant_cost * (self.cost_decay_factor ** steps)
+        else:
+            raise ValueError(f"Unknown cost_decay_type: {self.cost_decay_type!r}. Choose 'exponential' or 'step'.")
 
     def get(self) -> Dict[str, torch.Tensor]:
         """Get the data in the buffer."""
@@ -107,6 +128,7 @@ class MICEBuffer(OnPolicyBuffer):
         last_value_r: torch.Tensor = torch.zeros(1),
         last_value_c: torch.Tensor = torch.zeros(1),
         lr: float = 0.001,
+        epoch: int = 0,
     ) -> None:
         """Finish the current path and calculate the advantages of state-action pairs."""
         path_slice = slice(self.path_start_idx, self.ptr)
@@ -114,7 +136,7 @@ class MICEBuffer(OnPolicyBuffer):
             self._device
         )
         last_value_c = last_value_c.to(self._device)
-        
+
         rewards = torch.cat(
             [self.data['reward'][path_slice], last_value_r]
         )
@@ -133,9 +155,9 @@ class MICEBuffer(OnPolicyBuffer):
         )
 
         intrinsic_costs = self.data['intrinsic_costs'][path_slice]
-        
+
         adv_c, target_value_c, ep_discount_ci = self._calculate_balancing_intrinsic_adv_and_value_targets(
-            values_c, costs, lam=self._lam_c, intrinsic_costs=intrinsic_costs, lr=lr
+            values_c, costs, lam=self._lam_c, intrinsic_costs=intrinsic_costs, lr=lr, epoch=epoch
         )
         self.data['ep_discount_ci'][path_slice] = ep_discount_ci
 
@@ -147,11 +169,18 @@ class MICEBuffer(OnPolicyBuffer):
         self.path_start_idx = self.ptr
         
     def _calculate_balancing_intrinsic_adv_and_value_targets(
-        self, values_c, costs, lam, intrinsic_costs, lr
+        self, values_c, costs, lam, intrinsic_costs, lr, epoch: int = 0
     ):
+        effective_constant_cost = self._get_effective_constant_cost(epoch)
+
         if self._advantage_estimator == 'gae':
-            if self.constant_cost is not None:
-                # β frozen at 1; intrinsic_costs already set correctly in rollout
+            if effective_constant_cost is not None:
+                # Ablation: fixed, state-independent intrinsic cost with beta frozen at 1.0.
+                # Without freezing beta, it adapts to absorb the constant (beta*C converges to
+                # the same value regardless of C), making the ablation meaningless.
+                intrinsic_costs = torch.full_like(intrinsic_costs, effective_constant_cost)
+                self.data['intrinsic_costs'][self.path_start_idx:self.ptr] = intrinsic_costs
+
                 deltas_n = (
                     costs[:-1] + intrinsic_costs + self._gamma * values_c[1:] - values_c[:-1]
                 )
@@ -164,12 +193,11 @@ class MICEBuffer(OnPolicyBuffer):
                 deltas_n_mc = mc_returns - values_c[:-1]
                 self._deltas_n_mc_list.append(deltas_n_mc.detach().flatten())
 
-                beta_ = torch.ones_like(deltas_n)
+                beta_ = torch.ones_like(deltas_n)  # frozen at 1.0
                 self._beta_list.append(beta_.detach().flatten())
 
-                # ep_disount_ci = discount_cumsum(intrinsic_costs, self._gamma)
-                # ep_disount_ci[:] = ep_disount_ci[0].clone()
-                ep_disount_ci = torch.full_like(intrinsic_costs, self.constant_cost)
+                ep_disount_ci = discount_cumsum(intrinsic_costs, self._gamma)
+                ep_disount_ci[:] = ep_disount_ci[0].clone()
 
                 adv_c = discount_cumsum(deltas_n, self._gamma * lam)
                 target_value_c = adv_c + values_c[:-1]
@@ -228,6 +256,10 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
         num_envs: int = 1,
         device: torch.device = torch.device('cpu'),
         constant_cost: Optional[float] = None,
+        cost_decay_type: Optional[str] = None,
+        cost_decay_rate: float = 0.985,
+        cost_decay_step_interval: int = 50,
+        cost_decay_factor: float = 0.4,
     ):
         self._num_buffers = num_envs
         self._standardized_adv_r = standardized_adv_r
@@ -246,9 +278,16 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
                 penalty_coefficient=penalty_coefficient,
                 device=device,
                 constant_cost=constant_cost,
+                cost_decay_type=cost_decay_type,
+                cost_decay_rate=cost_decay_rate,
+                cost_decay_step_interval=cost_decay_step_interval,
+                cost_decay_factor=cost_decay_factor,
             )
             for _ in range(num_envs)
         ]
+
+    def get_effective_constant_cost(self, epoch: int) -> Optional[float]:
+        return self.buffers[0]._get_effective_constant_cost(epoch)
 
     def finish_path(
         self,
@@ -256,8 +295,9 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
         last_value_c: torch.Tensor = torch.zeros(1),
         idx: int = 0,
         lr: float = 0.001,
+        epoch: int = 0,
     ) -> None:
         """Finish the path."""
-        self.buffers[idx].finish_path(last_value_r, last_value_c, lr)
+        self.buffers[idx].finish_path(last_value_r, last_value_c, lr, epoch)
 
 

@@ -94,6 +94,15 @@ defaults:
     test_estimate: True
     # constant intrinsic cost added to every transition (None to use KNN-based intrinsic cost)
     constant_cost: ~
+    # decay schedule for constant_cost: None (no decay), 'exponential', or 'step'
+    cost_decay_type: ~
+    # exponential: effective_cost = constant_cost * cost_decay_rate^epoch
+    # half-life ~46 epochs → ~1% of initial value by epoch 300
+    cost_decay_rate: 0.985
+    # step: effective_cost = constant_cost * cost_decay_factor^(epoch // cost_decay_step_interval)
+    # factor=0.4, interval=50 → 6 drops → ~0.4% of initial value by epoch 300
+    cost_decay_step_interval: 50
+    cost_decay_factor: 0.4
   # logger configurations
   logger_cfgs:
     # use wandb for logging

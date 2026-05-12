@@ -160,5 +160,5 @@ class MICEAdapter(OnPolicyAdapter):
                         self._ep_len[idx] = 0.0
                         self._ep_discount_ci[idx] = 0.0
 
-                    buffer.finish_path(last_value_r, last_value_c, idx, self._cfgs.model_cfgs.critic.lr)
+                    buffer.finish_path(last_value_r, last_value_c, idx, self._cfgs.model_cfgs.critic.lr, epoch)
         return flashbulb_memory, self._ep_discount_ci_list
