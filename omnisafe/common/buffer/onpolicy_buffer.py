@@ -119,7 +119,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self.max_size: int = size
 
         assert self._penalty_coefficient >= 0, 'penalty_coefficient must be non-negative!'
-        assert self._advantage_estimator in ['gae', 'gae-rtg', 'vtrace', 'plain']
+        assert self._advantage_estimator in ['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce']
 
     @property
     def standardized_adv_r(self) -> bool:
@@ -329,6 +329,13 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             # A(x, u) = Q(x, u) - V(x) = r(x, u) + gamma V(x+1) - V(x)
             adv = rewards[:-1] + self._gamma * values[1:] - values[:-1]
             target_value = discount_cumsum(rewards, self._gamma)[:-1]
+
+        elif self._advantage_estimator == 'reinforce':
+            # Pure REINFORCE: A_t = G_t (no value baseline subtracted)
+            # G_t is the full bootstrapped discounted return (last_value already appended)
+            returns = discount_cumsum(rewards, self._gamma)[:-1]
+            adv = returns
+            target_value = returns
 
         else:
             raise NotImplementedError
