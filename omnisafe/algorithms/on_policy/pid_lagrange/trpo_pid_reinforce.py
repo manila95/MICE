@@ -14,6 +14,8 @@
 # ==============================================================================
 """TRPO-PID with pure REINFORCE advantage estimation (no value function)."""
 
+from __future__ import annotations
+
 import torch
 
 from omnisafe.algorithms import registry
