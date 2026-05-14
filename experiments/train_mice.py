@@ -56,7 +56,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--torch-threads',
         type=int,
-        default=16,
+        default=4,
         metavar='THREADS',
         help='number of threads to use for torch',
     )
