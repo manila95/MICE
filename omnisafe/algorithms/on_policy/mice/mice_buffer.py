@@ -42,6 +42,7 @@ class MICEBuffer(OnPolicyBuffer):
         cost_decay_rate: float = 0.985,
         cost_decay_step_interval: int = 50,
         cost_decay_factor: float = 0.4,
+        no_intrinsic_in_deltas: bool = False,
     ):
         super().__init__(
             obs_space,
@@ -69,6 +70,7 @@ class MICEBuffer(OnPolicyBuffer):
         self.cost_decay_rate = cost_decay_rate
         self.cost_decay_step_interval = cost_decay_step_interval
         self.cost_decay_factor = cost_decay_factor
+        self.no_intrinsic_in_deltas = no_intrinsic_in_deltas
 
     def _get_effective_constant_cost(self, epoch: int) -> Optional[float]:
         if self.constant_cost is None:
@@ -181,8 +183,9 @@ class MICEBuffer(OnPolicyBuffer):
                 intrinsic_costs = torch.full_like(intrinsic_costs, effective_constant_cost)
                 self.data['intrinsic_costs'][self.path_start_idx:self.ptr] = intrinsic_costs
 
+                _ic = torch.zeros_like(intrinsic_costs) if self.no_intrinsic_in_deltas else intrinsic_costs
                 deltas_n = (
-                    costs[:-1] + intrinsic_costs + self._gamma * values_c[1:] - values_c[:-1]
+                    costs[:-1] + _ic + self._gamma * values_c[1:] - values_c[:-1]
                 )
                 self._deltas_n_list.append(deltas_n.detach().flatten())
 
@@ -204,8 +207,9 @@ class MICEBuffer(OnPolicyBuffer):
 
             else:
                 # TD(0) deltas: one-step TD error
+                _ic = torch.zeros_like(intrinsic_costs) if self.no_intrinsic_in_deltas else intrinsic_costs
                 deltas_n = (
-                    costs[:-1] + self.beta * intrinsic_costs + self._gamma * values_c[1:] - values_c[:-1]
+                    costs[:-1] + _ic + self._gamma * values_c[1:] - values_c[:-1]
                 )
                 self._deltas_n_list.append(deltas_n.detach().flatten())
 
@@ -260,6 +264,7 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
         cost_decay_rate: float = 0.985,
         cost_decay_step_interval: int = 50,
         cost_decay_factor: float = 0.4,
+        no_intrinsic_in_deltas: bool = False,
     ):
         self._num_buffers = num_envs
         self._standardized_adv_r = standardized_adv_r
@@ -282,6 +287,7 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
                 cost_decay_rate=cost_decay_rate,
                 cost_decay_step_interval=cost_decay_step_interval,
                 cost_decay_factor=cost_decay_factor,
+                no_intrinsic_in_deltas=no_intrinsic_in_deltas,
             )
             for _ in range(num_envs)
         ]

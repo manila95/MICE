@@ -102,6 +102,12 @@ if __name__ == '__main__':
         metavar='FACTOR',
         help='multiplicative factor applied at each step for step schedule (e.g. 0.4)',
     )
+    parser.add_argument(
+        '--no-intrinsic-in-deltas',
+        action='store_true',
+        default=False,
+        help='if set, intrinsic costs are zeroed out in the deltas_n TD-error computation',
+    )
     args, unparsed_args = parser.parse_known_args()
     keys = [k[2:] for k in unparsed_args[0::2]]
     values = list(unparsed_args[1::2])
@@ -113,6 +119,7 @@ if __name__ == '__main__':
     cost_decay_rate = args.cost_decay_rate
     cost_decay_step_interval = args.cost_decay_step_interval
     cost_decay_factor = args.cost_decay_factor
+    no_intrinsic_in_deltas = args.no_intrinsic_in_deltas
     opt = vars(args)
     del opt["seed"]
     del opt["constant_cost"]
@@ -120,6 +127,7 @@ if __name__ == '__main__':
     del opt["cost_decay_rate"]
     del opt["cost_decay_step_interval"]
     del opt["cost_decay_factor"]
+    del opt["no_intrinsic_in_deltas"]
     custom_cfgs = {}
     for k, v in unparsed_args.items():
         update_dict(custom_cfgs, custom_cfgs_to_dict(k, v))
@@ -133,6 +141,8 @@ if __name__ == '__main__':
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_decay_step_interval', str(cost_decay_step_interval)))
     if cost_decay_factor is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_decay_factor', str(cost_decay_factor)))
+    if no_intrinsic_in_deltas:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:no_intrinsic_in_deltas', 'True'))
 
     agent = omnisafe.Agent(
         args.algo,

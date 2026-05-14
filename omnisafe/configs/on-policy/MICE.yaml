@@ -103,6 +103,8 @@ defaults:
     # factor=0.4, interval=50 → 6 drops → ~0.4% of initial value by epoch 300
     cost_decay_step_interval: 50
     cost_decay_factor: 0.4
+    # if True, intrinsic_costs are zeroed out in the deltas_n TD-error computation only
+    no_intrinsic_in_deltas: False
   # logger configurations
   logger_cfgs:
     # use wandb for logging

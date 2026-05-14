@@ -57,6 +57,7 @@ class MICE(CPO):
             cost_decay_rate=self._cfgs.algo_cfgs.cost_decay_rate,
             cost_decay_step_interval=self._cfgs.algo_cfgs.cost_decay_step_interval,
             cost_decay_factor=self._cfgs.algo_cfgs.cost_decay_factor,
+            no_intrinsic_in_deltas=self._cfgs.algo_cfgs.no_intrinsic_in_deltas,
         )
 
         self._RPNet = utl.RandomProjection(self._env.observation_space.shape[0], self._cfgs.model_cfgs.emb_dim).to(
