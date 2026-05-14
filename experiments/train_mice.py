@@ -104,9 +104,10 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--no-intrinsic-in-deltas',
-        action='store_true',
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
         default=False,
-        help='if set, intrinsic costs are zeroed out in the deltas_n TD-error computation',
+        metavar='BOOL',
+        help='if true, intrinsic costs are zeroed out in the deltas_n TD-error computation',
     )
     args, unparsed_args = parser.parse_known_args()
     keys = [k[2:] for k in unparsed_args[0::2]]
