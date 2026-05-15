@@ -74,6 +74,12 @@ defaults:
     penalty_coef: 0.0
     # use cost
     use_cost: False
+    # run value function estimation evaluation
+    test_estimate: True
+    # how often (in epochs) to run the evaluation
+    value_eval_freq: 50
+    # number of episodes per evaluation run
+    value_eval_episodes: 100
   # logger configurations
   logger_cfgs:
     # use wandb for logging

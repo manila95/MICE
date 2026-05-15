@@ -32,6 +32,7 @@ from omnisafe.common.buffer import VectorOnPolicyBuffer
 from omnisafe.common.logger import Logger
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
 from omnisafe.utils import distributed
+from omnisafe.utils.value_eval import estimate_true_value
 
 
 @registry.register
@@ -231,6 +232,13 @@ class PolicyGradient(BaseAlgo):
         self._logger.register_key('Time/Epoch')
         self._logger.register_key('Time/FPS')
 
+        self._logger.register_key('Eval/true_value_c')
+        self._logger.register_key('Eval/estimate_value_c')
+        self._logger.register_key('Eval/EstimationError_c')
+        self._logger.register_key('Eval/true_value_r')
+        self._logger.register_key('Eval/estimate_value_r')
+        self._logger.register_key('Eval/EstimationError_r')
+
         # register environment specific keys
         for env_spec_key in self._env.env_spec_keys:
             self.logger.register_key(env_spec_key)
@@ -262,6 +270,30 @@ class PolicyGradient(BaseAlgo):
                 buffer=self._buf,
                 logger=self._logger,
             )
+
+            eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
+            eval_episodes = getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100)
+            if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and epoch % eval_freq == 0:
+                discount = getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma)
+                error_c, true_c, estimate_c, error_r, true_r, estimate_r = estimate_true_value(
+                    agent=self._actor_critic,
+                    env_id=self._env_id,
+                    num_envs=1,
+                    seed=self._seed,
+                    cfgs=self._cfgs,
+                    discount=discount,
+                    eval_episodes=eval_episodes,
+                )
+                self._logger.store(
+                    **{
+                        'Eval/EstimationError_c': error_c,
+                        'Eval/true_value_c': true_c,
+                        'Eval/estimate_value_c': estimate_c,
+                        'Eval/EstimationError_r': error_r,
+                        'Eval/true_value_r': true_r,
+                        'Eval/estimate_value_r': estimate_r,
+                    }
+                )
             self._logger.store({'Time/Rollout': time.time() - rollout_time})
 
             update_time = time.time()

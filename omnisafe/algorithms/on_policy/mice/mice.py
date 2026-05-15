@@ -21,6 +21,7 @@ from omnisafe.utils.tools import (
 from omnisafe.algorithms.on_policy.mice.mice_rollout import MICEAdapter
 from omnisafe.algorithms.on_policy.mice.mice_buffer import FlashBulbMemory, MICEVectorBuffer
 import omnisafe.algorithms.on_policy.mice.utils as utl
+from omnisafe.utils.value_eval import estimate_true_value
 
 
 @registry.register
@@ -75,12 +76,6 @@ class MICE(CPO):
         if self._cfgs.algo_cfgs.constant_cost is not None:
             self._logger.register_key('Train/effective_constant_cost')
         self._logger.register_key('Value/Adv_c')
-        self._logger.register_key('Eval/true_value_c')
-        self._logger.register_key('Eval/estimate_value_c')
-        self._logger.register_key('Eval/EstimationError_c')
-        self._logger.register_key('Eval/true_value_r')
-        self._logger.register_key('Eval/estimate_value_r')
-        self._logger.register_key('Eval/EstimationError_r')
 
     def learn(self) -> Tuple[Union[int, float], ...]:
         start_time = time.time()
@@ -104,15 +99,17 @@ class MICE(CPO):
                 )
             )
 
-            if self._cfgs.algo_cfgs.test_estimate and epoch % 50 == 0:
-                error_c, true_value_c, estimate_value_c, error_r, true_value_r, estimate_value_r = utl.estimate_true_value(
+            eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
+            eval_episodes = getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100)
+            if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and epoch % eval_freq == 0:
+                error_c, true_value_c, estimate_value_c, error_r, true_value_r, estimate_value_r = estimate_true_value(
                     agent=self._actor_critic,
                     env_id=self._env_id,
                     num_envs=1,
                     seed=self._seed,
                     cfgs=self._cfgs,
                     discount=self._cfgs.algo_cfgs.cost_gamma,
-                    eval_episodes=100,
+                    eval_episodes=eval_episodes,
                 )
                 self._logger.store(**{'Eval/EstimationError_c': error_c})
                 self._logger.store(**{'Eval/true_value_c': true_value_c})
