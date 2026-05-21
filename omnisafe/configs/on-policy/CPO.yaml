@@ -84,6 +84,8 @@ defaults:
     cost_limit: 25
     # The sub-sampling rate of the observation
     fvp_sample_freq: 1
+    # eval frequency for the first 100 epochs (higher cadence for early monitoring)
+    early_eval_freq: 5
   # logger configurations
   logger_cfgs:
     # use wandb for logging

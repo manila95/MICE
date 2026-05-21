@@ -93,6 +93,8 @@ defaults:
     # The reward when the agent is unsafe
     unsafe_reward: -1.0
   # logger configurations
+    # eval frequency for the first 100 epochs (higher cadence for early monitoring)
+    early_eval_freq: 5
   logger_cfgs:
     # use wandb for logging
     use_wandb: True

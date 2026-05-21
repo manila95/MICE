@@ -105,6 +105,8 @@ defaults:
     cost_decay_factor: 0.4
     # if True, intrinsic_costs are zeroed out in the deltas_n TD-error computation only
     no_intrinsic_in_deltas: False
+    # eval frequency for the first 100 epochs (higher cadence for early monitoring)
+    early_eval_freq: 5
   # logger configurations
   logger_cfgs:
     # use wandb for logging

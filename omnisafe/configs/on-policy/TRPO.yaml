@@ -83,6 +83,8 @@ defaults:
     # The sub-sampling rate of the observation
     fvp_sample_freq: 1
   # logger configurations
+    # eval frequency for the first 100 epochs (higher cadence for early monitoring)
+    early_eval_freq: 5
   logger_cfgs:
     # use wandb for logging
     use_wandb: True
