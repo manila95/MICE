@@ -272,8 +272,10 @@ class PolicyGradient(BaseAlgo):
             )
 
             eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
+            early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
+            effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
             eval_episodes = getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100)
-            if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and epoch % eval_freq == 0:
+            if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and epoch % effective_eval_freq == 0:
                 discount = getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma)
                 error_c, true_c, estimate_c, error_r, true_r, estimate_r = estimate_true_value(
                     agent=self._actor_critic,

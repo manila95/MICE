@@ -103,6 +103,20 @@ if __name__ == '__main__':
         help='multiplicative factor applied at each step for step schedule (e.g. 0.4)',
     )
     parser.add_argument(
+        '--steps-per-epoch',
+        type=int,
+        default=None,
+        metavar='STEPS',
+        help='number of environment steps per epoch (overrides the value in the algo config yaml)',
+    )
+    parser.add_argument(
+        '--early-eval-freq',
+        type=int,
+        default=None,
+        metavar='FREQ',
+        help='eval frequency (in epochs) for the first 100 epochs (default: 5)',
+    )
+    parser.add_argument(
         '--no-intrinsic-in-deltas',
         type=lambda x: x.lower() in ('true', '1', 'yes'),
         default=False,
@@ -129,6 +143,8 @@ if __name__ == '__main__':
     cost_decay_factor = args.cost_decay_factor
     no_intrinsic_in_deltas = args.no_intrinsic_in_deltas
     cost_limit = args.cost_limit
+    steps_per_epoch = args.steps_per_epoch
+    early_eval_freq = args.early_eval_freq
     opt = vars(args)
     del opt["seed"]
     del opt["constant_cost"]
@@ -138,6 +154,8 @@ if __name__ == '__main__':
     del opt["cost_decay_factor"]
     del opt["no_intrinsic_in_deltas"]
     del opt["cost_limit"]
+    del opt["steps_per_epoch"]
+    del opt["early_eval_freq"]
     custom_cfgs = {}
     for k, v in unparsed_args.items():
         update_dict(custom_cfgs, custom_cfgs_to_dict(k, v))
@@ -155,6 +173,10 @@ if __name__ == '__main__':
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:no_intrinsic_in_deltas', 'True'))
     if cost_limit is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_limit', str(cost_limit)))
+    if steps_per_epoch is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:steps_per_epoch', str(steps_per_epoch)))
+    if early_eval_freq is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:early_eval_freq', str(early_eval_freq)))
 
     agent = omnisafe.Agent(
         args.algo,
