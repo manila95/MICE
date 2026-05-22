@@ -80,6 +80,7 @@ class MICE(CPO):
     def learn(self) -> Tuple[Union[int, float], ...]:
         start_time = time.time()
         self._logger.log('INFO: Start training')
+        total_cost: float = 0.0
 
         for epoch in range(self._cfgs.train_cfgs.epochs):
             epoch_time = time.time()
@@ -123,6 +124,8 @@ class MICE(CPO):
 
             update_time = time.time()
             self._update()
+            total_cost += self._env._epoch_cost_sum
+            self._logger.store({'Metrics/TotalCost': total_cost})
             # self._logger.log_histogram('plots/beta_', self._epoch_beta_, step=epoch + 1)
             self._logger.log_histogram_image('plots/beta_', self._epoch_beta_, step=epoch + 1)
             self._logger.log_scatter_image(

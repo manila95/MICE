@@ -53,6 +53,7 @@ class OnPolicyAdapter(OnlineAdapter):
     ) -> None:
         """Initialize an instance of :class:`OnPolicyAdapter`."""
         super().__init__(env_id, num_envs, seed, cfgs)
+        self._epoch_cost_sum: float = 0.0
         self._reset_log()
 
     def rollout(  # pylint: disable=too-many-locals
@@ -76,6 +77,7 @@ class OnPolicyAdapter(OnlineAdapter):
             logger (Logger): Logger, to log ``EpRet``, ``EpCost``, ``EpLen``.
         """
         self._reset_log()
+        self._epoch_cost_sum = 0.0
 
         obs, _ = self.reset()
         for step in track(
@@ -155,6 +157,7 @@ class OnPolicyAdapter(OnlineAdapter):
         self._ep_ret += info.get('original_reward', reward).cpu()
         self._ep_cost += info.get('original_cost', cost).cpu()
         self._ep_len += 1
+        self._epoch_cost_sum += info.get('original_cost', cost).sum().item()
 
     def _log_metrics(self, logger: Logger, idx: int) -> None:
         """Log metrics, including ``EpRet``, ``EpCost``, ``EpLen``.

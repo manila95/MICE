@@ -232,6 +232,8 @@ class PolicyGradient(BaseAlgo):
         self._logger.register_key('Time/Epoch')
         self._logger.register_key('Time/FPS')
 
+        self._logger.register_key('Metrics/TotalCost')
+
         self._logger.register_key('Eval/true_value_c')
         self._logger.register_key('Eval/estimate_value_c')
         self._logger.register_key('Eval/EstimationError_c')
@@ -259,6 +261,7 @@ class PolicyGradient(BaseAlgo):
         """
         start_time = time.time()
         self._logger.log('INFO: Start training')
+        total_cost: float = 0.0
 
         for epoch in range(self._cfgs.train_cfgs.epochs):
             epoch_time = time.time()
@@ -300,6 +303,8 @@ class PolicyGradient(BaseAlgo):
 
             update_time = time.time()
             self._update()
+            total_cost += self._env._epoch_cost_sum
+            self._logger.store({'Metrics/TotalCost': total_cost})
             self._logger.store({'Time/Update': time.time() - update_time})
 
             if self._cfgs.model_cfgs.exploration_noise_anneal:

@@ -44,6 +44,7 @@ class MICEAdapter(OnPolicyAdapter):
         epoch,
     ) -> None:
         self._reset_log()
+        self._epoch_cost_sum = 0.0
 
         obs, _ = self.reset()
         self._ep_discount_ci = self._ep_discount_ci.to(obs.device)
