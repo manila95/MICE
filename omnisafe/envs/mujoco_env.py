@@ -72,8 +72,20 @@ class MujocoEnv(CMDP):
         """
         super().__init__(env_id)
         self._env_id = env_id
-        if num_envs == 1:
-            # set healthy_reward=0.0 for removing the safety constraint in reward
+        self._num_envs = num_envs
+        self._device = torch.device(device)
+
+        if num_envs > 1:
+            self._env = gymnasium.vector.make(env_id, num_envs=num_envs, **kwargs)
+            assert isinstance(self._env.single_action_space, Box), 'Only support Box action space.'
+            assert isinstance(
+                self._env.single_observation_space,
+                Box,
+            ), 'Only support Box observation space.'
+            self._action_space = self._env.single_action_space
+            self._observation_space = self._env.single_observation_space
+            self.need_auto_reset_wrapper = False
+        else:
             self._env = gymnasium.make(id=env_id, autoreset=False, **kwargs)
             assert isinstance(self._env.action_space, Box), 'Only support Box action space.'
             assert isinstance(
@@ -82,12 +94,8 @@ class MujocoEnv(CMDP):
             ), 'Only support Box observation space.'
             self._action_space = self._env.action_space
             self._observation_space = self._env.observation_space
-        else:
-            raise NotImplementedError('Only support num_envs=1 now.')
-        self._device = torch.device(device)
 
-        self._num_envs = num_envs
-        self._metadata = self._env.metadata
+        self._metadata = getattr(self._env, 'metadata', {})
 
     def step(
         self,
@@ -145,6 +153,8 @@ class MujocoEnv(CMDP):
     @property
     def max_episode_steps(self) -> int:
         """The max steps per episode."""
+        if self._num_envs > 1:
+            return gymnasium.spec(self._env_id).max_episode_steps  # type: ignore
         return self._env.spec.max_episode_steps  # type: ignore
 
     def reset(
