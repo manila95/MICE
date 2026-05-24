@@ -117,6 +117,13 @@ if __name__ == '__main__':
         help='eval frequency (in epochs) for the first 100 epochs (default: 5)',
     )
     parser.add_argument(
+        '--lidar-bins',
+        type=int,
+        default=None,
+        metavar='BINS',
+        help='number of lidar angular bins (overrides lidar_conf.num_bins, default: 16)',
+    )
+    parser.add_argument(
         '--no-intrinsic-in-deltas',
         type=lambda x: x.lower() in ('true', '1', 'yes'),
         default=False,
@@ -145,6 +152,7 @@ if __name__ == '__main__':
     cost_limit = args.cost_limit
     steps_per_epoch = args.steps_per_epoch
     early_eval_freq = args.early_eval_freq
+    lidar_bins = args.lidar_bins
     opt = vars(args)
     del opt["seed"]
     del opt["constant_cost"]
@@ -156,6 +164,7 @@ if __name__ == '__main__':
     del opt["cost_limit"]
     del opt["steps_per_epoch"]
     del opt["early_eval_freq"]
+    del opt["lidar_bins"]
     custom_cfgs = {}
     for k, v in unparsed_args.items():
         update_dict(custom_cfgs, custom_cfgs_to_dict(k, v))
@@ -177,6 +186,8 @@ if __name__ == '__main__':
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:steps_per_epoch', str(steps_per_epoch)))
     if early_eval_freq is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:early_eval_freq', str(early_eval_freq)))
+    if lidar_bins is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('env_cfgs:lidar_num_bins', str(lidar_bins)))
 
     agent = omnisafe.Agent(
         args.algo,

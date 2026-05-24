@@ -135,8 +135,17 @@ class SafetyGymnasiumEnv(CMDP):
         self._num_envs = num_envs
         self._device = torch.device(device)
 
+        # Pop before passing to safety_gymnasium — it doesn't know this kwarg.
+        lidar_num_bins = kwargs.pop('lidar_num_bins', None)
+
         if num_envs > 1:
+            if lidar_num_bins is not None:
+                # AsyncVectorEnv runs envs in subprocesses so tasks aren't
+                # directly accessible.  Force sync so we can patch in-process.
+                kwargs.setdefault('asynchronous', False)
             self._env = safety_gymnasium.vector.make(env_id=env_id, num_envs=num_envs, **kwargs)
+            if lidar_num_bins is not None:
+                self._patch_lidar_num_bins(lidar_num_bins)
             assert isinstance(self._env.single_action_space, Box), 'Only support Box action space.'
             assert isinstance(
                 self._env.single_observation_space,
@@ -148,6 +157,8 @@ class SafetyGymnasiumEnv(CMDP):
             self.need_time_limit_wrapper = True
             self.need_auto_reset_wrapper = True
             self._env = safety_gymnasium.make(id=env_id, autoreset=False, **kwargs)
+            if lidar_num_bins is not None:
+                self._patch_lidar_num_bins(lidar_num_bins)
             assert isinstance(self._env.action_space, Box), 'Only support Box action space.'
             assert isinstance(
                 self._env.observation_space,
@@ -156,6 +167,34 @@ class SafetyGymnasiumEnv(CMDP):
             self._action_space = self._env.action_space
             self._observation_space = self._env.observation_space
         self._metadata = self._env.metadata
+
+    def _patch_lidar_num_bins(self, num_bins: int) -> None:
+        """Set lidar_conf.num_bins on every underlying task and rebuild obs spaces.
+
+        safety_gymnasium initialises lidar_conf after _parse() runs, so
+        num_bins cannot be set via the config dict at construction time.
+        We patch here, after the env exists but before _observation_space is
+        read, so everything downstream sees the correct shape.
+        """
+        if hasattr(self._env, 'envs'):
+            # Vectorised: SafetySyncVectorEnv — patch every sub-env.
+            for builder in self._env.envs:
+                task = builder.unwrapped.task
+                task.lidar_conf.num_bins = num_bins
+                task.build_observation_space()
+            # Refresh single_observation_space and the pre-allocated stacked
+            # observation buffer (allocated at SyncVectorEnv init with the old shape).
+            new_single = self._env.envs[0].observation_space
+            self._env.single_observation_space = new_single
+            self._env.observations = np.zeros(
+                (len(self._env.envs),) + new_single.shape,
+                dtype=new_single.dtype,
+            )
+        else:
+            # Single env: Builder (possibly wrapped by TimeLimit / AutoReset).
+            task = self._env.unwrapped.task
+            task.lidar_conf.num_bins = num_bins
+            task.build_observation_space()
 
     def step(
         self,

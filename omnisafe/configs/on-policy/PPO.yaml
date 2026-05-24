@@ -121,6 +121,8 @@ defaults:
       # learning rate
       lr: 0.0003
 
+  env_cfgs:
+    lidar_num_bins: ~
 ShadowHandCatchOver2UnderarmSafeFinger:
   # training configurations
   train_cfgs:

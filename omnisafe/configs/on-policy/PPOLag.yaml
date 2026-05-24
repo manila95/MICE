@@ -131,8 +131,8 @@ defaults:
     # Type of lagrangian optimizer
     lambda_optimizer: "Adam"
   # environment specific configurations
-  env_cfgs: {}
-
+  env_cfgs:
+    lidar_num_bins: ~
 ShadowHandCatchOver2UnderarmSafeFinger:
   # training configurations
   train_cfgs:

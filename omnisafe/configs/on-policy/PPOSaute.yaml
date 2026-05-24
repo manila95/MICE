@@ -129,6 +129,8 @@ defaults:
       # learning rate
       lr: 0.0003
 
+  env_cfgs:
+    lidar_num_bins: ~
 SafetyCarCircle1-v0:
   # algorithm configurations
   algo_cfgs:

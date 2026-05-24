@@ -16,7 +16,10 @@ def estimate_true_value(agent, env_id, num_envs, seed, cfgs, discount, eval_epis
     Returns:
         (c_error, true_c, estimate_c, r_error, true_r, estimate_r)
     """
-    eval_env = make(env_id, num_envs=num_envs, device=cfgs.train_cfgs.device)
+    env_cfgs = {}
+    if hasattr(cfgs, 'env_cfgs') and cfgs.env_cfgs is not None:
+        env_cfgs = cfgs.env_cfgs.todict()
+    eval_env = make(env_id, num_envs=num_envs, device=cfgs.train_cfgs.device, **env_cfgs)
 
     true_cvalues, true_rvalues = [], []
     estimate_rvalues, estimate_cvalues = [], []

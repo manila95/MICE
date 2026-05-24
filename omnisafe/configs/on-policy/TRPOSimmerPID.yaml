@@ -147,6 +147,8 @@ defaults:
     # The polyak coefficient of the target
     polyak: 0.995
 
+  env_cfgs:
+    lidar_num_bins: ~
 SafetyCarCircle1-v0:
   # algorithm configurations
   algo_cfgs:

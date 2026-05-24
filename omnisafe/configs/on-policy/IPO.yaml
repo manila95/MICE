@@ -136,3 +136,5 @@ defaults:
     lambda_lr: 0.035
     # Type of lagrangian optimizer
     lambda_optimizer: "Adam"
+  env_cfgs:
+    lidar_num_bins: ~

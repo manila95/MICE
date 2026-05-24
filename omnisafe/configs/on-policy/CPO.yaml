@@ -129,6 +129,8 @@ defaults:
       # learning rate
       lr: 0.001
 
+  env_cfgs:
+    lidar_num_bins: ~
 SafeMetaDrive:
   # training configurations
   train_cfgs:

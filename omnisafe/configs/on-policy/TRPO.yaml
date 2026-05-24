@@ -126,3 +126,5 @@ defaults:
       activation: tanh
       # learning rate
       lr: 0.001
+  env_cfgs:
+    lidar_num_bins: ~

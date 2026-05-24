@@ -157,3 +157,5 @@ defaults:
     penalty_max: 100.0
     # Initial value of lagrangian multiplier
     lagrangian_multiplier_init: 0.001
+  env_cfgs:
+    lidar_num_bins: ~
