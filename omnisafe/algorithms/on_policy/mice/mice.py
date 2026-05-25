@@ -104,11 +104,12 @@ class MICE(CPO):
             early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
             effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
             eval_episodes = getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100)
+            eval_num_envs = getattr(self._cfgs.algo_cfgs, 'value_eval_num_envs', 5)
             if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and epoch % effective_eval_freq == 0:
                 estimate_true_value(
                     agent=self._actor_critic,
                     env_id=self._env_id,
-                    num_envs=1,
+                    num_envs=eval_num_envs,
                     seed=self._seed,
                     cfgs=self._cfgs,
                     discount=self._cfgs.algo_cfgs.cost_gamma,

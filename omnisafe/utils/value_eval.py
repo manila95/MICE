@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import torch
+from rich.progress import Progress
 
 from omnisafe.envs.core import make
 
@@ -10,42 +11,65 @@ from omnisafe.envs.core import make
 def estimate_true_value(agent, env_id, num_envs, seed, cfgs, discount, eval_episodes=100, epoch=None):
     """Estimate true V(s) vs. critic estimate by rolling out full episodes.
 
-    For each episode: sample an initial state, record the critic's estimate,
-    then run the policy to episode end computing the actual discounted return.
+    Runs `num_envs` parallel environments, collecting `eval_episodes` total
+    completed episodes. For each episode: records the critic's estimate at the
+    initial state, then computes the actual discounted return via rollout.
 
     Returns:
-        (c_error, true_c, estimate_c, r_error, true_r, estimate_r)
+        (c_error, true_c, estimate_c, corr_c, r_error, true_r, estimate_r, corr_r)
     """
     env_cfgs = {}
     if hasattr(cfgs, 'env_cfgs') and cfgs.env_cfgs is not None:
         env_cfgs = cfgs.env_cfgs.todict()
     eval_env = make(env_id, num_envs=num_envs, device=cfgs.train_cfgs.device, **env_cfgs)
+    device = torch.device(cfgs.train_cfgs.device)
+
+    obs, _ = eval_env.reset()  # (num_envs, obs_dim)
+    act, init_est_r, init_est_c, _ = agent.step(obs)  # values: (num_envs,)
+
+    running_r = torch.zeros(num_envs, device=device)
+    running_c = torch.zeros(num_envs, device=device)
+    step_counts = torch.zeros(num_envs, device=device)
 
     true_cvalues, true_rvalues = [], []
     estimate_rvalues, estimate_cvalues = [], []
+    episodes_done = 0
 
-    for _ in range(eval_episodes):
-        obs0, _ = eval_env.reset()
-        _, estimate_rvalue, estimate_cvalue, _ = agent.step(obs0)
-
-        obs = obs0
-        true_cvalue = 0.0
-        true_rvalue = 0.0
-        step = 0
-        while True:
-            act, _, _, _ = agent.step(obs)
+    with Progress() as progress:
+        task = progress.add_task('Evaluating value function...', total=eval_episodes)
+        while episodes_done < eval_episodes:
             next_obs, r, c, terminated, truncated, _ = eval_env.step(act)
-            true_cvalue += c * (discount ** step)
-            true_rvalue += r * (discount ** step)
-            step += 1
-            obs = next_obs
-            if terminated or truncated:
-                break
 
-        true_cvalues.append(true_cvalue)
-        true_rvalues.append(true_rvalue)
-        estimate_cvalues.append(estimate_cvalue)
-        estimate_rvalues.append(estimate_rvalue)
+            discount_factors = discount ** step_counts
+            running_r += r.squeeze(-1) * discount_factors
+            running_c += c.squeeze(-1) * discount_factors
+            step_counts += 1
+
+            done = (terminated.bool() | truncated.bool()).squeeze(-1)  # (num_envs,)
+
+            newly_done = 0
+            for i in done.nonzero(as_tuple=False).flatten().tolist():
+                if episodes_done < eval_episodes:
+                    true_rvalues.append(running_r[i].clone())
+                    true_cvalues.append(running_c[i].clone())
+                    estimate_rvalues.append(init_est_r[i].clone())
+                    estimate_cvalues.append(init_est_c[i].clone())
+                    episodes_done += 1
+                    newly_done += 1
+                running_r[i] = 0.0
+                running_c[i] = 0.0
+                step_counts[i] = 0.0
+
+            progress.update(task, advance=newly_done)
+
+            obs = next_obs
+            # One agent.step call: gets action for next step AND new init estimates for just-reset envs
+            act, new_est_r, new_est_c, _ = agent.step(obs)
+            if done.any():
+                init_est_r = torch.where(done, new_est_r, init_est_r)
+                init_est_c = torch.where(done, new_est_c, init_est_c)
+
+    eval_env.close()
 
     true_cvalues_t = torch.stack(true_cvalues)
     true_rvalues_t = torch.stack(true_rvalues)
