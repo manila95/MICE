@@ -7,7 +7,7 @@ import torch
 from omnisafe.envs.core import make
 
 
-def estimate_true_value(agent, env_id, num_envs, seed, cfgs, discount, eval_episodes=100):
+def estimate_true_value(agent, env_id, num_envs, seed, cfgs, discount, eval_episodes=100, epoch=None):
     """Estimate true V(s) vs. critic estimate by rolling out full episodes.
 
     For each episode: sample an initial state, record the critic's estimate,
@@ -47,21 +47,29 @@ def estimate_true_value(agent, env_id, num_envs, seed, cfgs, discount, eval_epis
         estimate_cvalues.append(estimate_cvalue)
         estimate_rvalues.append(estimate_rvalue)
 
-    c_error = torch.mean(torch.stack(true_cvalues) - torch.stack(estimate_cvalues))
-    r_error = torch.mean(torch.stack(true_rvalues) - torch.stack(estimate_rvalues))
-    true_c = torch.mean(torch.stack(true_cvalues))
-    true_r = torch.mean(torch.stack(true_rvalues))
-    estimate_c = torch.mean(torch.stack(estimate_cvalues))
-    estimate_r = torch.mean(torch.stack(estimate_rvalues))
+    true_cvalues_t = torch.stack(true_cvalues)
+    true_rvalues_t = torch.stack(true_rvalues)
+    estimate_cvalues_t = torch.stack(estimate_cvalues)
+    estimate_rvalues_t = torch.stack(estimate_rvalues)
+
+    c_error = torch.mean(true_cvalues_t - estimate_cvalues_t)
+    r_error = torch.mean(true_rvalues_t - estimate_rvalues_t)
+    true_c = torch.mean(true_cvalues_t)
+    true_r = torch.mean(true_rvalues_t)
+    estimate_c = torch.mean(estimate_cvalues_t)
+    estimate_r = torch.mean(estimate_rvalues_t)
+
+    corr_c = torch.corrcoef(torch.stack([true_cvalues_t, estimate_cvalues_t]))[0, 1]
+    corr_r = torch.corrcoef(torch.stack([true_rvalues_t, estimate_rvalues_t]))[0, 1]
 
     if cfgs.logger_cfgs.use_wandb:
         import matplotlib.pyplot as plt
         import wandb
 
-        true_c_vals = torch.stack(true_cvalues).detach().cpu().numpy()
-        est_c_vals = torch.stack(estimate_cvalues).detach().cpu().numpy()
-        true_r_vals = torch.stack(true_rvalues).detach().cpu().numpy()
-        est_r_vals = torch.stack(estimate_rvalues).detach().cpu().numpy()
+        true_c_vals = true_cvalues_t.detach().cpu().numpy()
+        est_c_vals = estimate_cvalues_t.detach().cpu().numpy()
+        true_r_vals = true_rvalues_t.detach().cpu().numpy()
+        est_r_vals = estimate_rvalues_t.detach().cpu().numpy()
 
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
         for ax, tx, ex, label, color in [
@@ -77,7 +85,17 @@ def estimate_true_value(agent, env_id, num_envs, seed, cfgs, discount, eval_epis
             ax.legend()
 
         plt.tight_layout()
-        wandb.log({'scatter/c_and_r_values': wandb.Image(fig)})
+        wandb.log({
+            'scatter/c_and_r_values': wandb.Image(fig),
+            'Eval/Correlation_c': corr_c.item(),
+            'Eval/Correlation_r': corr_r.item(),
+            'Eval/EstimationError_c': c_error.item(),
+            'Eval/true_value_c': true_c.item(),
+            'Eval/estimate_value_c': estimate_c.item(),
+            'Eval/EstimationError_r': r_error.item(),
+            'Eval/true_value_r': true_r.item(),
+            'Eval/estimate_value_r': estimate_r.item(),
+        }, step=epoch)
         plt.close(fig)
 
-    return c_error, true_c, estimate_c, r_error, true_r, estimate_r
+    return c_error, true_c, estimate_c, corr_c, r_error, true_r, estimate_r, corr_r

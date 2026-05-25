@@ -234,13 +234,6 @@ class PolicyGradient(BaseAlgo):
 
         self._logger.register_key('Metrics/TotalCost')
 
-        self._logger.register_key('Eval/true_value_c')
-        self._logger.register_key('Eval/estimate_value_c')
-        self._logger.register_key('Eval/EstimationError_c')
-        self._logger.register_key('Eval/true_value_r')
-        self._logger.register_key('Eval/estimate_value_r')
-        self._logger.register_key('Eval/EstimationError_r')
-
         # register environment specific keys
         for env_spec_key in self._env.env_spec_keys:
             self.logger.register_key(env_spec_key)
@@ -280,7 +273,7 @@ class PolicyGradient(BaseAlgo):
             eval_episodes = getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100)
             if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and epoch % effective_eval_freq == 0:
                 discount = getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma)
-                error_c, true_c, estimate_c, error_r, true_r, estimate_r = estimate_true_value(
+                estimate_true_value(
                     agent=self._actor_critic,
                     env_id=self._env_id,
                     num_envs=1,
@@ -288,16 +281,7 @@ class PolicyGradient(BaseAlgo):
                     cfgs=self._cfgs,
                     discount=discount,
                     eval_episodes=eval_episodes,
-                )
-                self._logger.store(
-                    **{
-                        'Eval/EstimationError_c': error_c,
-                        'Eval/true_value_c': true_c,
-                        'Eval/estimate_value_c': estimate_c,
-                        'Eval/EstimationError_r': error_r,
-                        'Eval/true_value_r': true_r,
-                        'Eval/estimate_value_r': estimate_r,
-                    }
+                    epoch=epoch,
                 )
             self._logger.store({'Time/Rollout': time.time() - rollout_time})
 

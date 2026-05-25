@@ -105,7 +105,7 @@ class MICE(CPO):
             effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
             eval_episodes = getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100)
             if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and epoch % effective_eval_freq == 0:
-                error_c, true_value_c, estimate_value_c, error_r, true_value_r, estimate_value_r = estimate_true_value(
+                estimate_true_value(
                     agent=self._actor_critic,
                     env_id=self._env_id,
                     num_envs=1,
@@ -113,13 +113,8 @@ class MICE(CPO):
                     cfgs=self._cfgs,
                     discount=self._cfgs.algo_cfgs.cost_gamma,
                     eval_episodes=eval_episodes,
+                    epoch=epoch,
                 )
-                self._logger.store(**{'Eval/EstimationError_c': error_c})
-                self._logger.store(**{'Eval/true_value_c': true_value_c})
-                self._logger.store(**{'Eval/estimate_value_c': estimate_value_c})
-                self._logger.store(**{'Eval/EstimationError_r': error_r})
-                self._logger.store(**{'Eval/true_value_r': true_value_r})
-                self._logger.store(**{'Eval/estimate_value_r': estimate_value_r})
             self._logger.store({'Time/Rollout': time.time() - rollout_time})
 
             update_time = time.time()
