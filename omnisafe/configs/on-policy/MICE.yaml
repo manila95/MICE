@@ -107,6 +107,7 @@ defaults:
     no_intrinsic_in_deltas: False
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5
+    value_eval_freq: 50
   # logger configurations
   logger_cfgs:
     # use wandb for logging
