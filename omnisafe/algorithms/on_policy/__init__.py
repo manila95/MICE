@@ -35,7 +35,7 @@ from omnisafe.algorithms.on_policy.penalty_function import IPO, P3O
 from omnisafe.algorithms.on_policy.pid_lagrange import CPPOPID, TRPOPID, TRPOPIDReinforce
 from omnisafe.algorithms.on_policy.primal import OnCRPO
 from omnisafe.algorithms.on_policy.saute import PPOSaute, TRPOSaute
-from omnisafe.algorithms.on_policy.second_order import CPO, PCPO
+from omnisafe.algorithms.on_policy.second_order import CPO, CPOReinforce, PCPO
 from omnisafe.algorithms.on_policy.simmer import PPOSimmerPID, TRPOSimmerPID
 
 

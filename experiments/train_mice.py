@@ -49,7 +49,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--vector-env-nums',
         type=int,
-        default=10,
+        default=5,
         metavar='VECTOR-ENV',
         help='number of vector envs to use for training',
     )
@@ -138,6 +138,13 @@ if __name__ == '__main__':
         help='constraint cost limit (overrides the value in the algo config yaml)',
     )
     parser.add_argument(
+        '--target-kl',
+        type=float,
+        default=None,
+        metavar='TARGET_KL',
+        help='KL divergence trust-region size (overrides the value in the algo config yaml)',
+    )
+    parser.add_argument(
         '--lagrangian-multiplier-init',
         type=float,
         default=None,
@@ -157,6 +164,7 @@ if __name__ == '__main__':
     cost_decay_factor = args.cost_decay_factor
     no_intrinsic_in_deltas = args.no_intrinsic_in_deltas
     cost_limit = args.cost_limit
+    target_kl = args.target_kl
     lagrangian_multiplier_init = args.lagrangian_multiplier_init
     steps_per_epoch = args.steps_per_epoch
     early_eval_freq = args.early_eval_freq
@@ -170,6 +178,7 @@ if __name__ == '__main__':
     del opt["cost_decay_factor"]
     del opt["no_intrinsic_in_deltas"]
     del opt["cost_limit"]
+    del opt["target_kl"]
     del opt["lagrangian_multiplier_init"]
     del opt["steps_per_epoch"]
     del opt["early_eval_freq"]
@@ -189,6 +198,8 @@ if __name__ == '__main__':
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_decay_factor', str(cost_decay_factor)))
     if no_intrinsic_in_deltas:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:no_intrinsic_in_deltas', 'True'))
+    if target_kl is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:target_kl', str(target_kl)))
     if cost_limit is not None:
         try:
             update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_limit', str(cost_limit)))

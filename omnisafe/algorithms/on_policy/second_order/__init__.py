@@ -15,10 +15,12 @@
 """Second-order algorithms."""
 
 from omnisafe.algorithms.on_policy.second_order.cpo import CPO
+from omnisafe.algorithms.on_policy.second_order.cpo_reinforce import CPOReinforce
 from omnisafe.algorithms.on_policy.second_order.pcpo import PCPO
 
 
 __all__ = [
     'CPO',
+    'CPOReinforce',
     'PCPO',
 ]
