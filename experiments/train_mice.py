@@ -137,6 +137,13 @@ if __name__ == '__main__':
         metavar='COST_LIMIT',
         help='constraint cost limit (overrides the value in the algo config yaml)',
     )
+    parser.add_argument(
+        '--lagrangian-multiplier-init',
+        type=float,
+        default=None,
+        metavar='LAMBDA_INIT',
+        help='initial value of the Lagrange multiplier (for Lagrangian algorithms)',
+    )
     args, unparsed_args = parser.parse_known_args()
     keys = [k[2:] for k in unparsed_args[0::2]]
     values = list(unparsed_args[1::2])
@@ -150,6 +157,7 @@ if __name__ == '__main__':
     cost_decay_factor = args.cost_decay_factor
     no_intrinsic_in_deltas = args.no_intrinsic_in_deltas
     cost_limit = args.cost_limit
+    lagrangian_multiplier_init = args.lagrangian_multiplier_init
     steps_per_epoch = args.steps_per_epoch
     early_eval_freq = args.early_eval_freq
     lidar_bins = args.lidar_bins
@@ -162,6 +170,7 @@ if __name__ == '__main__':
     del opt["cost_decay_factor"]
     del opt["no_intrinsic_in_deltas"]
     del opt["cost_limit"]
+    del opt["lagrangian_multiplier_init"]
     del opt["steps_per_epoch"]
     del opt["early_eval_freq"]
     del opt["lidar_bins"]
@@ -181,7 +190,12 @@ if __name__ == '__main__':
     if no_intrinsic_in_deltas:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:no_intrinsic_in_deltas', 'True'))
     if cost_limit is not None:
-        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_limit', str(cost_limit)))
+        try:
+            update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_limit', str(cost_limit)))
+        except:
+            update_dict(custom_cfgs, custom_cfgs_to_dict('lagrange_cfgs:cost_limit', str(cost_limit)), allow_new_key=True)
+    if lagrangian_multiplier_init is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('lagrange_cfgs:lagrangian_multiplier_init', str(lagrangian_multiplier_init)))
     if steps_per_epoch is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:steps_per_epoch', str(steps_per_epoch)))
     if early_eval_freq is not None:
@@ -196,4 +210,8 @@ if __name__ == '__main__':
         train_terminal_cfgs=vars(args),
         custom_cfgs=custom_cfgs,
     )
+    import json
+    print('\n=== Resolved config ===')
+    print(json.dumps(agent.cfgs.todict(), indent=2, default=str))
+    print('=======================\n')
     agent.learn()
