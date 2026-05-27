@@ -151,6 +151,13 @@ if __name__ == '__main__':
         metavar='LAMBDA_INIT',
         help='initial value of the Lagrange multiplier (for Lagrangian algorithms)',
     )
+    parser.add_argument(
+        '--pid-kp',
+        type=float,
+        default=None,
+        metavar='KP',
+        help='proportional gain of the PID Lagrangian controller',
+    )
     args, unparsed_args = parser.parse_known_args()
     keys = [k[2:] for k in unparsed_args[0::2]]
     values = list(unparsed_args[1::2])
@@ -166,6 +173,7 @@ if __name__ == '__main__':
     cost_limit = args.cost_limit
     target_kl = args.target_kl
     lagrangian_multiplier_init = args.lagrangian_multiplier_init
+    pid_kp = args.pid_kp
     steps_per_epoch = args.steps_per_epoch
     early_eval_freq = args.early_eval_freq
     lidar_bins = args.lidar_bins
@@ -180,6 +188,7 @@ if __name__ == '__main__':
     del opt["cost_limit"]
     del opt["target_kl"]
     del opt["lagrangian_multiplier_init"]
+    del opt["pid_kp"]
     del opt["steps_per_epoch"]
     del opt["early_eval_freq"]
     del opt["lidar_bins"]
@@ -207,6 +216,8 @@ if __name__ == '__main__':
             update_dict(custom_cfgs, custom_cfgs_to_dict('lagrange_cfgs:cost_limit', str(cost_limit)), allow_new_key=True)
     if lagrangian_multiplier_init is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('lagrange_cfgs:lagrangian_multiplier_init', str(lagrangian_multiplier_init)))
+    if pid_kp is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('lagrange_cfgs:pid_kp', str(pid_kp)))
     if steps_per_epoch is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:steps_per_epoch', str(steps_per_epoch)))
     if early_eval_freq is not None:
