@@ -138,6 +138,20 @@ if __name__ == '__main__':
         help='constraint cost limit (overrides the value in the algo config yaml)',
     )
     parser.add_argument(
+        '--gamma',
+        type=float,
+        default=None,
+        metavar='GAMMA',
+        help='discount factor for the reward critic (defaults to algo_cfgs.gamma in yaml)',
+    )
+    parser.add_argument(
+        '--cost-gamma',
+        type=float,
+        default=None,
+        metavar='COST_GAMMA',
+        help='discount factor for the cost critic (defaults to algo_cfgs.gamma if not set)',
+    )
+    parser.add_argument(
         '--target-kl',
         type=float,
         default=None,
@@ -178,6 +192,8 @@ if __name__ == '__main__':
     cost_decay_factor = args.cost_decay_factor
     no_intrinsic_in_deltas = args.no_intrinsic_in_deltas
     cost_limit = args.cost_limit
+    gamma = args.gamma
+    cost_gamma = args.cost_gamma
     target_kl = args.target_kl
     lagrangian_multiplier_init = args.lagrangian_multiplier_init
     pid_kp = args.pid_kp
@@ -194,6 +210,8 @@ if __name__ == '__main__':
     del opt["cost_decay_factor"]
     del opt["no_intrinsic_in_deltas"]
     del opt["cost_limit"]
+    del opt["gamma"]
+    del opt["cost_gamma"]
     del opt["target_kl"]
     del opt["lagrangian_multiplier_init"]
     del opt["pid_kp"]
@@ -223,6 +241,13 @@ if __name__ == '__main__':
             update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_limit', str(cost_limit)))
         except:
             update_dict(custom_cfgs, custom_cfgs_to_dict('lagrange_cfgs:cost_limit', str(cost_limit)), allow_new_key=True)
+    if gamma is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:gamma', str(gamma)))
+    if cost_gamma is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_gamma', str(cost_gamma)))
+    elif gamma is not None:
+        # if only --gamma was set, mirror it to cost_gamma unless explicitly overridden
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_gamma', str(gamma)))
     if lagrangian_multiplier_init is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('lagrange_cfgs:lagrangian_multiplier_init', str(lagrangian_multiplier_init)))
     if pid_kp is not None:

@@ -110,6 +110,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self.data['logp'] = torch.zeros((size,), dtype=torch.float32, device=device)
 
         self._gamma: float = gamma
+        self._cost_gamma: float = gamma  # overridden by subclasses / callers that set cost_gamma
         self._lam: float = lam
         self._lam_c: float = lam_c
         self._penalty_coefficient: float = penalty_coefficient
@@ -193,6 +194,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             values_c,
             costs,
             lam=self._lam_c,
+            gamma=self._cost_gamma,
         )
 
         self.data['adv_r'][path_slice] = adv_r
@@ -242,6 +244,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         values: torch.Tensor,
         rewards: torch.Tensor,
         lam: float,
+        gamma: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         r"""Compute the estimated advantage.
 
@@ -296,18 +299,19 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         Raises:
             NotImplementedError: If the advantage estimator is not supported.
         """  # pylint: disable=line-too-long
+        g = gamma if gamma is not None else self._gamma
         if self._advantage_estimator == 'gae':
             # GAE formula: A_t = \sum_{k=0}^{n-1} (lam*gamma)^k delta_{t+k}
-            deltas = rewards[:-1] + self._gamma * values[1:] - values[:-1]
-            adv = discount_cumsum(deltas, self._gamma * lam)
+            deltas = rewards[:-1] + g * values[1:] - values[:-1]
+            adv = discount_cumsum(deltas, g * lam)
             target_value = adv + values[:-1]
 
         elif self._advantage_estimator == 'gae-rtg':
             # GAE formula: A_t = \sum_{k=0}^{n-1} (lam*gamma)^k delta_{t+k}
-            deltas = rewards[:-1] + self._gamma * values[1:] - values[:-1]
-            adv = discount_cumsum(deltas, self._gamma * lam)
+            deltas = rewards[:-1] + g * values[1:] - values[:-1]
+            adv = discount_cumsum(deltas, g * lam)
             # compute rewards-to-go, to be targets for the value function update
-            target_value = discount_cumsum(rewards, self._gamma)[:-1]
+            target_value = discount_cumsum(rewards, g)[:-1]
 
         elif self._advantage_estimator == 'vtrace':
             #  v_s = V(x_s) + \sum^{T-1}_{t=s} \gamma^{t-s}
@@ -320,20 +324,20 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
                 values=values,
                 rewards=rewards,
                 behavior_action_probs=action_probs,
-                gamma=self._gamma,
+                gamma=g,
                 rho_bar=1.0,
                 c_bar=1.0,
             )
 
         elif self._advantage_estimator == 'plain':
             # A(x, u) = Q(x, u) - V(x) = r(x, u) + gamma V(x+1) - V(x)
-            adv = rewards[:-1] + self._gamma * values[1:] - values[:-1]
-            target_value = discount_cumsum(rewards, self._gamma)[:-1]
+            adv = rewards[:-1] + g * values[1:] - values[:-1]
+            target_value = discount_cumsum(rewards, g)[:-1]
 
         elif self._advantage_estimator == 'reinforce':
             # Pure REINFORCE: A_t = G_t (no value baseline subtracted)
             # G_t is the full bootstrapped discounted return (last_value already appended)
-            returns = discount_cumsum(rewards, self._gamma)[:-1]
+            returns = discount_cumsum(rewards, g)[:-1]
             adv = returns
             target_value = returns
 
