@@ -77,6 +77,10 @@ defaults:
     penalty_coef: 0.0
     # use cost
     use_cost: True
+    # use REINFORCE (raw MC return, no value baseline) for reward advantage
+    reinforce_reward: True
+    # use REINFORCE (raw MC return, no value baseline) for cost advantage
+    reinforce_cost: True
     # evaluate true vs estimated values every N epochs (0 = disabled)
     value_eval_freq: 50
     # number of episodes per value evaluation

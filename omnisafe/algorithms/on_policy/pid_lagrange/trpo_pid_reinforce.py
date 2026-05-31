@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""TRPO-PID with pure REINFORCE advantage estimation (no value function)."""
+"""TRPO-PID with configurable per-signal REINFORCE advantage estimation."""
 
 from __future__ import annotations
 
@@ -23,14 +23,20 @@ from omnisafe.algorithms.on_policy.pid_lagrange.trpo_pid import TRPOPID
 from omnisafe.common.buffer import VectorOnPolicyBuffer
 
 
-class _ReinforceVectorBuffer(VectorOnPolicyBuffer):
-    """VectorOnPolicyBuffer that zeroes bootstrap values at path end.
+class _SelectiveReinforceBuffer(VectorOnPolicyBuffer):
+    """VectorOnPolicyBuffer that selectively zeroes bootstrap values per signal.
 
-    In pure REINFORCE the return G_t = Σγ^k r_{t+k} is computed from observed
-    rewards only.  Passing zero for last_value means truncated trajectories are
-    treated as if they terminated — no value-function estimate bleeds into the
-    return computation.
+    For each signal (reward / cost) marked as REINFORCE, the bootstrap value is
+    forced to zero so the return G_t = Σγ^k r_{t+k} is computed purely from
+    observed rewards/costs, with no critic estimate bleeding in for truncated
+    trajectories.  Signals not marked as REINFORCE pass through the real critic
+    bootstrap value unchanged.
     """
+
+    def __init__(self, *args, reinforce_reward: bool = True, reinforce_cost: bool = True, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._reinforce_reward = reinforce_reward
+        self._reinforce_cost = reinforce_cost
 
     def finish_path(
         self,
@@ -39,38 +45,40 @@ class _ReinforceVectorBuffer(VectorOnPolicyBuffer):
         idx: int = 0,
     ) -> None:
         self.buffers[idx].finish_path(
-            last_value_r=torch.zeros(1),
-            last_value_c=torch.zeros(1),
+            last_value_r=torch.zeros(1) if self._reinforce_reward else last_value_r,
+            last_value_c=torch.zeros(1) if self._reinforce_cost else last_value_c,
         )
 
 
 @registry.register
 class TRPOPIDReinforce(TRPOPID):
-    """TRPO-PID with pure REINFORCE advantage estimation.
+    """TRPO-PID with configurable per-signal REINFORCE advantage estimation.
 
-    Uses raw discounted returns (rewards-to-go / costs-to-go) with no value
-    function baseline:
+    Controlled by two ``algo_cfgs`` flags:
 
-    .. math::
+    - ``reinforce_reward`` (default ``True``): use raw discounted return
+      ``G_t^R = Σγ^k r_{t+k}`` for the reward signal with no value baseline.
+    - ``reinforce_cost`` (default ``True``): same for the cost signal.
 
-        A_t^R = G_t^R = \\sum_{k=0}^{T-t} \\gamma^k r_{t+k}, \\quad
-        A_t^C = G_t^C = \\sum_{k=0}^{T-t} \\gamma^k c_{t+k}
+    When a flag is ``True`` the corresponding critic is not trained and no
+    bootstrap value is used at trajectory boundaries.  When ``False``, the
+    critic is trained normally (via the parent :class:`TRPOPID` update) and the
+    learned value function bootstraps truncated trajectories — equivalent to
+    standard TRPO-PID for that signal.
 
-    Two differences from :class:`TRPOPID`:
-
-    1. **No bootstrap** — :meth:`finish_path` always uses zero as the terminal
-       value, so no value network is queried when a trajectory is truncated.
-    2. **No critic training** — :meth:`_update_reward_critic` and
-       :meth:`_update_cost_critic` are no-ops; the critic networks are kept in
-       the architecture but their weights are never updated.
-
-    The PID-Lagrange update and the trust-region policy step are unchanged.
+    Note: when disabling REINFORCE for a signal (flag ``False``), also change
+    ``adv_estimation_method`` from ``reinforce`` to ``gae`` (or another
+    estimator) so the value baseline is actually used in the advantage
+    computation.
     """
 
     def _init(self) -> None:
         super()._init()  # initialises PIDLagrangian + standard VectorOnPolicyBuffer
-        # Replace the buffer with the zero-bootstrap variant
-        self._buf = _ReinforceVectorBuffer(
+        reinforce_reward = getattr(self._cfgs.algo_cfgs, 'reinforce_reward', True)
+        reinforce_cost = getattr(self._cfgs.algo_cfgs, 'reinforce_cost', True)
+        self._reinforce_reward = reinforce_reward
+        self._reinforce_cost = reinforce_cost
+        self._buf = _SelectiveReinforceBuffer(
             obs_space=self._env.observation_space,
             act_space=self._env.action_space,
             size=self._steps_per_epoch,
@@ -83,6 +91,8 @@ class TRPOPIDReinforce(TRPOPID):
             penalty_coefficient=self._cfgs.algo_cfgs.penalty_coef,
             num_envs=self._cfgs.train_cfgs.vector_env_nums,
             device=self._device,
+            reinforce_reward=reinforce_reward,
+            reinforce_cost=reinforce_cost,
         )
 
     def _update_reward_critic(
@@ -90,11 +100,17 @@ class TRPOPIDReinforce(TRPOPID):
         obs: torch.Tensor,
         target_value_r: torch.Tensor,
     ) -> None:
-        """No-op: pure REINFORCE does not train the reward critic."""
+        if not self._reinforce_reward:
+            super()._update_reward_critic(obs, target_value_r)
 
     def _update_cost_critic(
         self,
         obs: torch.Tensor,
         target_value_c: torch.Tensor,
     ) -> None:
-        """No-op: pure REINFORCE does not train the cost critic."""
+        if not self._reinforce_cost:
+            super()._update_cost_critic(obs, target_value_c)
+
+
+# Backward-compatible alias so existing imports (e.g. CPOReinforce) still work.
+_ReinforceVectorBuffer = _SelectiveReinforceBuffer
