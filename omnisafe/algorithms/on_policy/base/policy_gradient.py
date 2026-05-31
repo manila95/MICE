@@ -273,14 +273,14 @@ class PolicyGradient(BaseAlgo):
             eval_episodes = getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100)
             eval_num_envs = getattr(self._cfgs.algo_cfgs, 'value_eval_num_envs', 5)
             if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and epoch % effective_eval_freq == 0:
-                discount = getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma)
                 estimate_true_value(
                     agent=self._actor_critic,
                     env_id=self._env_id,
                     num_envs=eval_num_envs,
                     seed=self._seed,
                     cfgs=self._cfgs,
-                    discount=discount,
+                    discount_r=self._cfgs.algo_cfgs.gamma,
+                    discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma),
                     eval_episodes=eval_episodes,
                     epoch=epoch,
                 )

@@ -5,12 +5,13 @@ from omnisafe.utils.config import Config
 import matplotlib.pyplot as plt
 import wandb
 
-def estimate_true_value(agent, 
-                    env_id: str, 
-                    num_envs: int, 
-                    seed: int, 
-                    cfgs: Config, 
-                    discount: float, 
+def estimate_true_value(agent,
+                    env_id: str,
+                    num_envs: int,
+                    seed: int,
+                    cfgs: Config,
+                    discount_r: float,
+                    discount_c: float,
                     eval_episodes=10):
         """Estimates true Q-value via launching given policy from sampled state until
         the end of an episode. """
@@ -32,8 +33,8 @@ def estimate_true_value(agent,
             while True:
                 act, _, _, _ = agent.step(obs)
                 next_obs, r, c, termniated, truncated, info = eval_env.step(act)
-                true_cvalue += c * (discount ** step)
-                true_rvalue += r * (discount ** step)
+                true_cvalue += c * (discount_c ** step)
+                true_rvalue += r * (discount_r ** step)
                 step += 1
                 obs = next_obs
 

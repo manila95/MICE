@@ -113,7 +113,8 @@ class MICE(CPO):
                     num_envs=eval_num_envs,
                     seed=self._seed,
                     cfgs=self._cfgs,
-                    discount=self._cfgs.algo_cfgs.cost_gamma,
+                    discount_r=self._cfgs.algo_cfgs.gamma,
+                    discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma),
                     eval_episodes=eval_episodes,
                     epoch=epoch,
                 )

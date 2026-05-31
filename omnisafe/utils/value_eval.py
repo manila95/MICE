@@ -8,7 +8,7 @@ from rich.progress import Progress
 from omnisafe.envs.core import make
 
 
-def estimate_true_value(agent, env_id, num_envs, seed, cfgs, discount, eval_episodes=100, epoch=None):
+def estimate_true_value(agent, env_id, num_envs, seed, cfgs, discount_r, discount_c, eval_episodes=100, epoch=None):
     """Estimate true V(s) vs. critic estimate by rolling out full episodes.
 
     Runs `num_envs` parallel environments, collecting `eval_episodes` total
@@ -69,8 +69,8 @@ def estimate_true_value(agent, env_id, num_envs, seed, cfgs, discount, eval_epis
                     step_true_r = [0.0] * T
                     step_true_c = [0.0] * T
                     for t in range(T - 1, -1, -1):
-                        G_r = hist[t][2] + discount * G_r
-                        G_c = hist[t][3] + discount * G_c
+                        G_r = hist[t][2] + discount_r * G_r
+                        G_c = hist[t][3] + discount_c * G_c
                         step_true_r[t] = G_r
                         step_true_c[t] = G_c
 
