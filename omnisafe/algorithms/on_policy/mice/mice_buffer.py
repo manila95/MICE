@@ -268,6 +268,7 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
         cost_decay_step_interval: int = 50,
         cost_decay_factor: float = 0.4,
         no_intrinsic_in_deltas: bool = False,
+        cost_gamma: Optional[float] = None,
     ):
         self._num_buffers = num_envs
         self._standardized_adv_r = standardized_adv_r
@@ -291,6 +292,7 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
                 cost_decay_step_interval=cost_decay_step_interval,
                 cost_decay_factor=cost_decay_factor,
                 no_intrinsic_in_deltas=no_intrinsic_in_deltas,
+                cost_gamma=cost_gamma,
             )
             for _ in range(num_envs)
         ]

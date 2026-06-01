@@ -91,6 +91,7 @@ class TRPOPIDReinforce(TRPOPID):
             penalty_coefficient=self._cfgs.algo_cfgs.penalty_coef,
             num_envs=self._cfgs.train_cfgs.vector_env_nums,
             device=self._device,
+            cost_gamma=getattr(self._cfgs.algo_cfgs, 'cost_gamma', None),
             reinforce_reward=reinforce_reward,
             reinforce_cost=reinforce_cost,
         )

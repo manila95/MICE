@@ -94,6 +94,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         standardized_adv_r: bool = False,
         standardized_adv_c: bool = False,
         device: torch.device = DEVICE_CPU,
+        cost_gamma: float | None = None,
     ) -> None:
         """Initialize an instance of :class:`OnPolicyBuffer`."""
         super().__init__(obs_space, act_space, size, device)
@@ -110,7 +111,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self.data['logp'] = torch.zeros((size,), dtype=torch.float32, device=device)
 
         self._gamma: float = gamma
-        self._cost_gamma: float = gamma  # overridden by subclasses / callers that set cost_gamma
+        self._cost_gamma: float = cost_gamma if cost_gamma is not None else gamma
         self._lam: float = lam
         self._lam_c: float = lam_c
         self._penalty_coefficient: float = penalty_coefficient
