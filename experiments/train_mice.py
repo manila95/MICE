@@ -179,6 +179,20 @@ if __name__ == '__main__':
         metavar='BOOL',
         help='if false, use value-function bootstrap for reward (TRPOPIDReinforce only)',
     )
+    parser.add_argument(
+        '--lam',
+        type=float,
+        default=None,
+        metavar='LAM',
+        help='GAE lambda for reward advantage (on-policy algorithms)',
+    )
+    parser.add_argument(
+        '--lam-c',
+        type=float,
+        default=None,
+        metavar='LAM_C',
+        help='GAE lambda for cost advantage (on-policy algorithms)',
+    )
     args, unparsed_args = parser.parse_known_args()
     keys = [k[2:] for k in unparsed_args[0::2]]
     values = list(unparsed_args[1::2])
@@ -198,6 +212,8 @@ if __name__ == '__main__':
     lagrangian_multiplier_init = args.lagrangian_multiplier_init
     pid_kp = args.pid_kp
     reinforce_reward = args.reinforce_reward
+    lam = args.lam
+    lam_c = args.lam_c
     steps_per_epoch = args.steps_per_epoch
     early_eval_freq = args.early_eval_freq
     lidar_bins = args.lidar_bins
@@ -216,6 +232,8 @@ if __name__ == '__main__':
     del opt["lagrangian_multiplier_init"]
     del opt["pid_kp"]
     del opt["reinforce_reward"]
+    del opt["lam"]
+    del opt["lam_c"]
     del opt["steps_per_epoch"]
     del opt["early_eval_freq"]
     del opt["lidar_bins"]
@@ -254,6 +272,12 @@ if __name__ == '__main__':
         update_dict(custom_cfgs, custom_cfgs_to_dict('lagrange_cfgs:pid_kp', str(pid_kp)))
     if reinforce_reward is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:reinforce_reward', str(reinforce_reward)))
+    if lam is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:lam', str(lam)))
+    if lam_c is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:lam_c', str(lam_c)))
+    elif lam is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:lam_c', str(lam)))
     if steps_per_epoch is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:steps_per_epoch', str(steps_per_epoch)))
     if early_eval_freq is not None:
