@@ -228,3 +228,11 @@ class NaturalPG(PolicyGradient):
                 'Value/Adv': adv_r.mean().item(),
             },
         )
+
+        self._log_critic_diagnostics(
+            data['obs'],
+            data['target_value_r'],
+            data['target_value_c'],
+            data['discounted_ret'],
+            data['discounted_cost_ret'],
+        )

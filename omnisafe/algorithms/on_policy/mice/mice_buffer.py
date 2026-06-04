@@ -106,6 +106,8 @@ class MICEBuffer(OnPolicyBuffer):
             'adv_r': self.data['adv_r'],
             'logp': self.data['logp'],
             'discounted_ret': self.data['discounted_ret'],
+            'discounted_cost_ret': self.data['discounted_cost_ret'],
+            'value_r': self.data['value_r'],
             'adv_c': self.data['adv_c'],
             'target_value_c': self.data['target_value_c'],
             'cost': self.data['cost'],
@@ -149,10 +151,9 @@ class MICEBuffer(OnPolicyBuffer):
         costs = torch.cat([self.data['cost'][path_slice], last_value_c])
         values_c = torch.cat([self.data['value_c'][path_slice], last_value_c])
 
-        discounted_ret = discount_cumsum(rewards, self._gamma)[
-            :-1
-        ]
+        discounted_ret = discount_cumsum(rewards, self._gamma)[:-1]
         self.data['discounted_ret'][path_slice] = discounted_ret
+        self.data['discounted_cost_ret'][path_slice] = discount_cumsum(costs, self._cost_gamma)[:-1]
         rewards -= self._penalty_coefficient * costs
 
         adv_r, target_value_r = self._calculate_adv_and_value_targets(

@@ -121,6 +121,7 @@ class MICE(CPO):
             self._logger.store({'Time/Rollout': time.time() - rollout_time})
 
             update_time = time.time()
+            self._current_epoch = epoch
             self._update()
             total_cost += self._env._epoch_cost_sum
             self._logger.store({'Metrics/TotalCost': total_cost})
@@ -251,6 +252,13 @@ class MICE(CPO):
                 'Value/Adv': adv_r.mean().item(),
                 'Value/Adv_c': adv_c.mean().item(),
             }
+        )
+        self._log_critic_diagnostics(
+            data['obs'],
+            data['target_value_r'],
+            data['target_value_c'],
+            data['discounted_ret'],
+            data['discounted_cost_ret'],
         )
 
     # pylint: disable=invalid-name, too-many-arguments, too-many-locals

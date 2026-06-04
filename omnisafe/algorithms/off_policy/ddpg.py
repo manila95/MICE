@@ -19,6 +19,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from tqdm import tqdm
+
 import torch
 from torch import nn
 from torch.nn.utils.clip_grad import clip_grad_norm_
@@ -274,10 +276,13 @@ class DDPG(BaseAlgo):
             update_time = 0.0
             epoch_time = time.time()
 
-            for sample_step in range(
-                epoch * self._samples_per_epoch,
-                (epoch + 1) * self._samples_per_epoch,
-            ):
+            pbar = tqdm(
+                range(epoch * self._samples_per_epoch, (epoch + 1) * self._samples_per_epoch),
+                desc=f'Epoch {epoch}',
+                unit='step',
+                leave=False,
+            )
+            for sample_step in pbar:
                 step = sample_step * self._update_cycle * self._cfgs.train_cfgs.vector_env_nums
 
                 rollout_start = time.time()
@@ -304,6 +309,12 @@ class DDPG(BaseAlgo):
                     self._log_when_not_update()
                 update_time += time.time() - update_start
 
+                pbar.set_postfix(
+                    rollout=f'{rollout_time:.1f}s',
+                    update=f'{update_time:.1f}s',
+                    phase='warmup' if step <= self._cfgs.algo_cfgs.start_learning_steps else 'train',
+                )
+
             eval_start = time.time()
             self._env.eval_policy(
                 episode=self._cfgs.train_cfgs.eval_episodes,
@@ -311,6 +322,7 @@ class DDPG(BaseAlgo):
                 logger=self._logger,
             )
             eval_time = time.time() - eval_start
+            print(f'Epoch {epoch} done — rollout: {rollout_time:.1f}s  update: {update_time:.1f}s  eval: {eval_time:.1f}s')
 
             self._logger.store({'Time/Update': update_time})
             self._logger.store({'Time/Rollout': rollout_time})

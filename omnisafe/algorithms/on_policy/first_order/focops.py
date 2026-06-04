@@ -228,3 +228,11 @@ class FOCOPS(PolicyGradient):
                 'Metrics/LagrangeMultiplier': self._lagrange.lagrangian_multiplier,
             },
         )
+
+        self._log_critic_diagnostics(
+            data['obs'],
+            data['target_value_r'],
+            data['target_value_c'],
+            data['discounted_ret'],
+            data['discounted_cost_ret'],
+        )

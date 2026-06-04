@@ -103,6 +103,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self._standardized_adv_c: bool = standardized_adv_c
         self.data['adv_r'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['discounted_ret'] = torch.zeros((size,), dtype=torch.float32, device=device)
+        self.data['discounted_cost_ret'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['value_r'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['target_value_r'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['adv_c'] = torch.zeros((size,), dtype=torch.float32, device=device)
@@ -184,6 +185,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
 
         discountred_ret = discount_cumsum(rewards, self._gamma)[:-1]
         self.data['discounted_ret'][path_slice] = discountred_ret
+        self.data['discounted_cost_ret'][path_slice] = discount_cumsum(costs, self._cost_gamma)[:-1]
         rewards -= self._penalty_coefficient * costs
 
         adv_r, target_value_r = self._calculate_adv_and_value_targets(
@@ -227,6 +229,9 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             'adv_r': self.data['adv_r'],
             'logp': self.data['logp'],
             'discounted_ret': self.data['discounted_ret'],
+            'discounted_cost_ret': self.data['discounted_cost_ret'],
+            'value_r': self.data['value_r'],
+            'value_c': self.data['value_c'],
             'adv_c': self.data['adv_c'],
             'target_value_c': self.data['target_value_c'],
         }
