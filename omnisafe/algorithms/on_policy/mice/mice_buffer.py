@@ -44,6 +44,7 @@ class MICEBuffer(OnPolicyBuffer):
         cost_decay_factor: float = 0.4,
         no_intrinsic_in_deltas: bool = False,
         cost_gamma: Optional[float] = None,
+        cost_advantage_estimator: Optional[str] = None,
     ):
         super().__init__(
             obs_space,
@@ -57,9 +58,9 @@ class MICEBuffer(OnPolicyBuffer):
             standardized_adv_r,
             standardized_adv_c,
             device,
+            cost_gamma=cost_gamma,
+            cost_advantage_estimator=cost_advantage_estimator,
         )
-        if cost_gamma is not None:
-            self._cost_gamma = cost_gamma
         self.data['intrinsic_costs'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['ep_discount_ci'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['time_step'] = torch.zeros((size,), dtype=torch.float32, device=device)
@@ -270,6 +271,7 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
         cost_decay_factor: float = 0.4,
         no_intrinsic_in_deltas: bool = False,
         cost_gamma: Optional[float] = None,
+        cost_advantage_estimator: Optional[str] = None,
     ):
         self._num_buffers = num_envs
         self._standardized_adv_r = standardized_adv_r
@@ -294,6 +296,7 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
                 cost_decay_factor=cost_decay_factor,
                 no_intrinsic_in_deltas=no_intrinsic_in_deltas,
                 cost_gamma=cost_gamma,
+                cost_advantage_estimator=cost_advantage_estimator,
             )
             for _ in range(num_envs)
         ]

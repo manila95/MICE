@@ -69,6 +69,7 @@ defaults:
     clip: 0.2
     # advantage estimation method: reinforce uses A_t = G_t (raw MC return, no value baseline)
     adv_estimation_method: reinforce
+    cost_adv_estimation_method: ~
     # standardize reward advantage
     standardized_rew_adv: True
     # standardize cost advantage

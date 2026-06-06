@@ -199,7 +199,15 @@ if __name__ == '__main__':
         default=None,
         metavar='METHOD',
         choices=['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce'],
-        help='Advantage estimation method (gae, gae-rtg, vtrace, plain, reinforce)',
+        help='Advantage estimation method for reward (gae, gae-rtg, vtrace, plain, reinforce)',
+    )
+    parser.add_argument(
+        '--cost-adv-estimation-method',
+        type=str,
+        default=None,
+        metavar='METHOD',
+        choices=['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce'],
+        help='Advantage estimation method for cost; defaults to --adv-estimation-method if unset',
     )
     args, unparsed_args = parser.parse_known_args()
     keys = [k[2:] for k in unparsed_args[0::2]]
@@ -223,6 +231,7 @@ if __name__ == '__main__':
     lam = args.lam
     lam_c = args.lam_c
     adv_estimation_method = args.adv_estimation_method
+    cost_adv_estimation_method = args.cost_adv_estimation_method
     steps_per_epoch = args.steps_per_epoch
     early_eval_freq = args.early_eval_freq
     lidar_bins = args.lidar_bins
@@ -244,6 +253,7 @@ if __name__ == '__main__':
     del opt["lam"]
     del opt["lam_c"]
     del opt["adv_estimation_method"]
+    del opt["cost_adv_estimation_method"]
     del opt["steps_per_epoch"]
     del opt["early_eval_freq"]
     del opt["lidar_bins"]
@@ -290,6 +300,10 @@ if __name__ == '__main__':
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:lam_c', str(lam)))
     if adv_estimation_method is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:adv_estimation_method', adv_estimation_method))
+    if cost_adv_estimation_method is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_adv_estimation_method', cost_adv_estimation_method))
+    elif adv_estimation_method is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_adv_estimation_method', adv_estimation_method))
     if steps_per_epoch is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:steps_per_epoch', str(steps_per_epoch)))
     if early_eval_freq is not None:

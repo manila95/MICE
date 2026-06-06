@@ -68,6 +68,7 @@ defaults:
     clip: 0.2
     # advantage estimation method, options: gae, retrace
     adv_estimation_method: gae
+    cost_adv_estimation_method: ~
     # standardize reward advantage
     standardized_rew_adv: True
     # standardize cost advantage
