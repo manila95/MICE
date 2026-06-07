@@ -5,26 +5,21 @@ from __future__ import annotations
 import torch
 from rich.progress import Progress
 
-from omnisafe.envs.core import make
 
-
-def estimate_true_value(agent, env_id, num_envs, seed, cfgs, discount_r, discount_c, eval_episodes=100, epoch=None):
+def estimate_true_value(agent, env, cfgs, discount_r, discount_c, eval_episodes=100, epoch=None):
     """Estimate true V(s) vs. critic estimate by rolling out full episodes.
 
-    Runs `num_envs` parallel environments, collecting `eval_episodes` total
-    completed episodes.
+    Uses the provided (already-wrapped) environment directly so that observation
+    and reward normalizers are identical to those seen during training.
 
     Two evaluation regimes:
     - Eval_s0: initial state of each episode — V(s_0) vs. G_0.
     - Eval_all: every visited state — V(s_t) vs. G_t (MC return from step t).
     """
-    env_cfgs = {}
-    if hasattr(cfgs, 'env_cfgs') and cfgs.env_cfgs is not None:
-        env_cfgs = cfgs.env_cfgs.todict()
-    eval_env = make(env_id, num_envs=num_envs, device=cfgs.train_cfgs.device, **env_cfgs)
     device = torch.device(cfgs.train_cfgs.device)
+    num_envs = env.num_envs
 
-    obs, _ = eval_env.reset()
+    obs, _ = env.reset()
     act, cur_est_r, cur_est_c, _ = agent.step(obs)
 
     # Per-env episode history: each entry is (est_r, est_c, reward, cost) at step t
@@ -42,7 +37,7 @@ def estimate_true_value(agent, env_id, num_envs, seed, cfgs, discount_r, discoun
     with Progress() as progress:
         task = progress.add_task('Evaluating value function...', total=eval_episodes)
         while episodes_done < eval_episodes:
-            next_obs, r, c, terminated, truncated, _ = eval_env.step(act)
+            next_obs, r, c, terminated, truncated, _ = env.step(act)
 
             r_sq = r.squeeze(-1)
             c_sq = c.squeeze(-1)
@@ -96,8 +91,6 @@ def estimate_true_value(agent, env_id, num_envs, seed, cfgs, discount_r, discoun
 
             obs = next_obs
             act, cur_est_r, cur_est_c, _ = agent.step(obs)
-
-    eval_env.close()
 
     def _to_tensor(lst):
         return torch.tensor(lst, device=device, dtype=torch.float32)

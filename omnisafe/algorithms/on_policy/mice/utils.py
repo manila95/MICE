@@ -1,4 +1,3 @@
-from omnisafe.envs.core import make, support_envs
 import torch
 import torch.nn.functional as F
 from omnisafe.utils.config import Config
@@ -6,22 +5,18 @@ import matplotlib.pyplot as plt
 import wandb
 
 def estimate_true_value(agent,
-                    env_id: str,
-                    num_envs: int,
-                    seed: int,
+                    env,
                     cfgs: Config,
                     discount_r: float,
                     discount_c: float,
                     eval_episodes=10):
         """Estimates true Q-value via launching given policy from sampled state until
-        the end of an episode. """
+        the end of an episode. Uses the provided (already-wrapped) environment directly."""
 
-        eval_env = make(env_id, num_envs=num_envs, device=cfgs.train_cfgs.device)
-        
         true_cvalues, true_rvalues = [], []
         estimate_rvalues, estimate_cvalues = [], []
         for _ in range(eval_episodes):
-            obs0, _ = eval_env.reset()
+            obs0, _ = env.reset()
 
             _, estimate_rvalue, estimate_cvalue, _ = agent.step(obs0)
 
@@ -32,7 +27,7 @@ def estimate_true_value(agent,
             step = 0
             while True:
                 act, _, _, _ = agent.step(obs)
-                next_obs, r, c, termniated, truncated, info = eval_env.step(act)
+                next_obs, r, c, termniated, truncated, info = env.step(act)
                 true_cvalue += c * (discount_c ** step)
                 true_rvalue += r * (discount_r ** step)
                 step += 1
