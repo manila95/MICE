@@ -131,6 +131,13 @@ if __name__ == '__main__':
         help='if true, intrinsic costs are zeroed out in the deltas_n TD-error computation',
     )
     parser.add_argument(
+        '--recompute-adv',
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=False,
+        metavar='BOOL',
+        help='if true, recompute advantages from updated critic before actor update',
+    )
+    parser.add_argument(
         '--cost-limit',
         type=float,
         default=None,
@@ -221,6 +228,7 @@ if __name__ == '__main__':
     cost_decay_step_interval = args.cost_decay_step_interval
     cost_decay_factor = args.cost_decay_factor
     no_intrinsic_in_deltas = args.no_intrinsic_in_deltas
+    recompute_adv = args.recompute_adv
     cost_limit = args.cost_limit
     gamma = args.gamma
     cost_gamma = args.cost_gamma
@@ -243,6 +251,7 @@ if __name__ == '__main__':
     del opt["cost_decay_step_interval"]
     del opt["cost_decay_factor"]
     del opt["no_intrinsic_in_deltas"]
+    del opt["recompute_adv"]
     del opt["cost_limit"]
     del opt["gamma"]
     del opt["cost_gamma"]
@@ -272,6 +281,8 @@ if __name__ == '__main__':
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_decay_factor', str(cost_decay_factor)))
     if no_intrinsic_in_deltas:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:no_intrinsic_in_deltas', 'True'))
+    if recompute_adv:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:recompute_adv', 'True'))
     if target_kl is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:target_kl', str(target_kl)))
     if cost_limit is not None:

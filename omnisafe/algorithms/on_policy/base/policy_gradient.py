@@ -386,45 +386,90 @@ class PolicyGradient(BaseAlgo):
         original_obs = obs
         old_distribution = self._actor_critic.actor(obs)
 
-        dataloader = DataLoader(
-            dataset=TensorDataset(obs, act, logp, target_value_r, target_value_c, adv_r, adv_c),
-            batch_size=self._cfgs.algo_cfgs.batch_size,
-            shuffle=True,
-        )
-
         update_counts = 0
         final_kl = 0.0
 
-        for i in track(range(self._cfgs.algo_cfgs.update_iters), description='Updating...'):
-            for (
-                obs,
-                act,
-                logp,
-                target_value_r,
-                target_value_c,
-                adv_r,
-                adv_c,
-            ) in dataloader:
-                self._update_reward_critic(obs, target_value_r)
-                if self._cfgs.algo_cfgs.use_cost:
-                    self._update_cost_critic(obs, target_value_c)
-                self._update_actor(obs, act, logp, adv_r, adv_c)
-
-            new_distribution = self._actor_critic.actor(original_obs)
-
-            kl = (
-                torch.distributions.kl.kl_divergence(old_distribution, new_distribution)
-                .sum(-1, keepdim=True)
-                .mean()
+        if getattr(self._cfgs.algo_cfgs, 'recompute_adv', False):
+            # Critic-only pass (all iterations), then recompute advantages, then actor pass.
+            critic_dataloader = DataLoader(
+                dataset=TensorDataset(obs, target_value_r, target_value_c),
+                batch_size=self._cfgs.algo_cfgs.batch_size,
+                shuffle=True,
             )
-            kl = distributed.dist_avg(kl)
+            for _ in track(range(self._cfgs.algo_cfgs.update_iters), description='Updating critics...'):
+                for obs_b, tvr_b, tvc_b in critic_dataloader:
+                    self._update_reward_critic(obs_b, tvr_b)
+                    if self._cfgs.algo_cfgs.use_cost:
+                        self._update_cost_critic(obs_b, tvc_b)
 
-            final_kl = kl.item()
-            update_counts += 1
+            with torch.no_grad():
+                new_value_r = self._actor_critic.reward_critic(original_obs)[0].flatten()
+                adv_r = target_value_r - new_value_r
+                if self._cfgs.algo_cfgs.standardized_rew_adv:
+                    adv_r = (adv_r - adv_r.mean()) / (adv_r.std() + 1e-8)
+                if self._cfgs.algo_cfgs.use_cost:
+                    new_value_c = self._actor_critic.cost_critic(original_obs)[0].flatten()
+                    adv_c = target_value_c - new_value_c
+                    if self._cfgs.algo_cfgs.standardized_cost_adv:
+                        adv_c = adv_c - adv_c.mean()
 
-            if self._cfgs.algo_cfgs.kl_early_stop and kl.item() > self._cfgs.algo_cfgs.target_kl:
-                self._logger.log(f'Early stopping at iter {i + 1} due to reaching max kl')
-                break
+            actor_dataloader = DataLoader(
+                dataset=TensorDataset(obs, act, logp, adv_r, adv_c),
+                batch_size=self._cfgs.algo_cfgs.batch_size,
+                shuffle=True,
+            )
+            for i in track(range(self._cfgs.algo_cfgs.update_iters), description='Updating actor...'):
+                for obs_b, act_b, logp_b, advr_b, advc_b in actor_dataloader:
+                    self._update_actor(obs_b, act_b, logp_b, advr_b, advc_b)
+
+                new_distribution = self._actor_critic.actor(original_obs)
+                kl = (
+                    torch.distributions.kl.kl_divergence(old_distribution, new_distribution)
+                    .sum(-1, keepdim=True)
+                    .mean()
+                )
+                kl = distributed.dist_avg(kl)
+                final_kl = kl.item()
+                update_counts += 1
+                if self._cfgs.algo_cfgs.kl_early_stop and kl.item() > self._cfgs.algo_cfgs.target_kl:
+                    self._logger.log(f'Early stopping at iter {i + 1} due to reaching max kl')
+                    break
+        else:
+            dataloader = DataLoader(
+                dataset=TensorDataset(obs, act, logp, target_value_r, target_value_c, adv_r, adv_c),
+                batch_size=self._cfgs.algo_cfgs.batch_size,
+                shuffle=True,
+            )
+            for i in track(range(self._cfgs.algo_cfgs.update_iters), description='Updating...'):
+                for (
+                    obs,
+                    act,
+                    logp,
+                    target_value_r,
+                    target_value_c,
+                    adv_r,
+                    adv_c,
+                ) in dataloader:
+                    self._update_reward_critic(obs, target_value_r)
+                    if self._cfgs.algo_cfgs.use_cost:
+                        self._update_cost_critic(obs, target_value_c)
+                    self._update_actor(obs, act, logp, adv_r, adv_c)
+
+                new_distribution = self._actor_critic.actor(original_obs)
+
+                kl = (
+                    torch.distributions.kl.kl_divergence(old_distribution, new_distribution)
+                    .sum(-1, keepdim=True)
+                    .mean()
+                )
+                kl = distributed.dist_avg(kl)
+
+                final_kl = kl.item()
+                update_counts += 1
+
+                if self._cfgs.algo_cfgs.kl_early_stop and kl.item() > self._cfgs.algo_cfgs.target_kl:
+                    self._logger.log(f'Early stopping at iter {i + 1} due to reaching max kl')
+                    break
 
         self._logger.store(
             {

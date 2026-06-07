@@ -34,6 +34,7 @@ defaults:
     steps_per_epoch: 20000
     # number of iterations to update the policy
     update_iters: 40
+    recompute_adv: False
     # batch size for each iteration
     batch_size: 64
     # target kl divergence

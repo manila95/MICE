@@ -226,7 +226,6 @@ class MICE(CPO):
         self._epoch_deltas_n_mc = data['deltas_n_mc']
         self._epoch_intrinsic_costs = data['intrinsic_costs']
         self._epoch_time_step = data['time_step']
-        self._update_actor(obs, act, logp, adv_r, adv_c, intrinsic_costs, balancing_ep_dicount_ci)
 
         dataloader = DataLoader(
             dataset=TensorDataset(obs, target_value_r, target_value_c),
@@ -236,13 +235,27 @@ class MICE(CPO):
 
         for _ in range(self._cfgs.algo_cfgs.update_iters):
             for (
-                obs,
-                target_value_r,
-                target_value_c,
+                obs_b,
+                target_value_r_b,
+                target_value_c_b,
             ) in dataloader:
-                self._update_reward_critic(obs, target_value_r)
+                self._update_reward_critic(obs_b, target_value_r_b)
                 if self._cfgs.algo_cfgs.use_cost:
-                    self._update_cost_critic(obs, target_value_c)
+                    self._update_cost_critic(obs_b, target_value_c_b)
+
+        if getattr(self._cfgs.algo_cfgs, 'recompute_adv', False):
+            with torch.no_grad():
+                new_value_r = self._actor_critic.reward_critic(data['obs'])[0].flatten()
+                adv_r = data['target_value_r'] - new_value_r
+                if self._cfgs.algo_cfgs.standardized_rew_adv:
+                    adv_r = (adv_r - adv_r.mean()) / (adv_r.std() + 1e-8)
+                if self._cfgs.algo_cfgs.use_cost:
+                    new_value_c = self._actor_critic.cost_critic(data['obs'])[0].flatten()
+                    adv_c = data['target_value_c'] - new_value_c
+                    if self._cfgs.algo_cfgs.standardized_cost_adv:
+                        adv_c = adv_c - adv_c.mean()
+
+        self._update_actor(obs, act, logp, adv_r, adv_c, intrinsic_costs, balancing_ep_dicount_ci)
 
         self._logger.store(
             **{

@@ -93,6 +93,8 @@ defaults:
     k_knn: 10
     # if test the cost estimate error
     test_estimate: True
+    # recompute advantages from updated critic before actor update
+    recompute_adv: False
     # constant intrinsic cost added to every transition (None to use KNN-based intrinsic cost)
     constant_cost: ~
     # decay schedule for constant_cost: None (no decay), 'exponential', or 'step'
