@@ -184,14 +184,17 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         path_slice = slice(self.path_start_idx, self.ptr)
         last_value_r = last_value_r.to(self._device)
         last_value_c = last_value_c.to(self._device)
+
+        self.data['discounted_ret'][path_slice] = discount_cumsum(
+            self.data['reward'][path_slice], self._gamma
+        )
+        self.data['discounted_cost_ret'][path_slice] = discount_cumsum(
+            self.data['cost'][path_slice], self._cost_gamma
+        )
         rewards = torch.cat([self.data['reward'][path_slice], last_value_r])
         values_r = torch.cat([self.data['value_r'][path_slice], last_value_r])
         costs = torch.cat([self.data['cost'][path_slice], last_value_c])
         values_c = torch.cat([self.data['value_c'][path_slice], last_value_c])
-
-        discountred_ret = discount_cumsum(rewards, self._gamma)[:-1]
-        self.data['discounted_ret'][path_slice] = discountred_ret
-        self.data['discounted_cost_ret'][path_slice] = discount_cumsum(costs, self._cost_gamma)[:-1]
         rewards -= self._penalty_coefficient * costs
 
         adv_r, target_value_r = self._calculate_adv_and_value_targets(
