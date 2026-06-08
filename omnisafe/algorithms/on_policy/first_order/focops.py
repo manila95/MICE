@@ -235,4 +235,6 @@ class FOCOPS(PolicyGradient):
             data['target_value_c'],
             data['discounted_ret'],
             data['discounted_cost_ret'],
+            preupdate_pred_r=data['value_r'].flatten(),
+            preupdate_pred_c=data['value_c'].flatten(),
         )

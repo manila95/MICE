@@ -222,16 +222,18 @@ class PolicyGradient(BaseAlgo):
         # log information about critic
         self._logger.register_key('Loss/Loss_reward_critic', delta=True)
         self._logger.register_key('Value/reward')
-        self._logger.register_key('Value/RewardCriticCorr')
-        self._logger.register_key('Value/RewardPredTrueCorr')
+        for stage in ('BeforeUpdate', 'AfterUpdate'):
+            self._logger.register_key(f'Value/{stage}/RewardCriticCorr')
+            self._logger.register_key(f'Value/{stage}/RewardPredTrueCorr')
         self._logger.register_key('Value/RewardTargetTrueCorr')
 
         if self._cfgs.algo_cfgs.use_cost:
             # log information about cost critic
             self._logger.register_key('Loss/Loss_cost_critic', delta=True)
             self._logger.register_key('Value/cost')
-            self._logger.register_key('Value/CostCriticCorr')
-            self._logger.register_key('Value/CostPredTrueCorr')
+            for stage in ('BeforeUpdate', 'AfterUpdate'):
+                self._logger.register_key(f'Value/{stage}/CostCriticCorr')
+                self._logger.register_key(f'Value/{stage}/CostPredTrueCorr')
             self._logger.register_key('Value/CostTargetTrueCorr')
 
         self._logger.register_key('Time/Total')
@@ -440,6 +442,8 @@ class PolicyGradient(BaseAlgo):
             data['target_value_c'],
             data['discounted_ret'],
             data['discounted_cost_ret'],
+            preupdate_pred_r=data['value_r'].flatten(),
+            preupdate_pred_c=data['value_c'].flatten(),
         )
 
     def _log_critic_diagnostics(
@@ -449,16 +453,14 @@ class PolicyGradient(BaseAlgo):
         target_value_c: torch.Tensor,
         discounted_ret: torch.Tensor,
         discounted_cost_ret: torch.Tensor,
+        preupdate_pred_r: torch.Tensor | None = None,
+        preupdate_pred_c: torch.Tensor | None = None,
     ) -> None:
-        """Log scatter plots and Pearson correlation of predicted vs target value functions.
+        """Log scatter plots and Pearson correlations for both BeforeUpdate and AfterUpdate stages.
 
-        Called once per epoch after all critic update iterations complete, using the full
-        epoch buffer so the scatter reflects the distribution the critic was trained on.
-
-        Three scatter plots per signal:
-          - pred vs target (colored by true return)
-          - pred vs true return
-          - target vs true return
+        ``preupdate_pred_r``/``preupdate_pred_c`` should be ``data['value_r/c'].flatten()``
+        (critic predictions collected during rollout, before any gradient step).  The AfterUpdate
+        predictions are always re-queried from the live network.
         """
         epoch = getattr(self, '_current_epoch', 0)
         eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
@@ -467,39 +469,22 @@ class PolicyGradient(BaseAlgo):
         if epoch % effective_eval_freq != 0:
             return
 
-        with torch.no_grad():
-            pred_r = self._actor_critic.reward_critic(obs)[0].flatten()
-
         target_r = target_value_r.flatten()
         true_r = discounted_ret.flatten()
 
-        corr_pred_target_r = torch.corrcoef(torch.stack([pred_r, target_r]))[0, 1].item()
-        corr_pred_true_r = torch.corrcoef(torch.stack([pred_r, true_r]))[0, 1].item()
-        corr_target_true_r = torch.corrcoef(torch.stack([target_r, true_r]))[0, 1].item()
-        self._logger.store({
-            'Value/RewardCriticCorr': corr_pred_target_r,
-            'Value/RewardPredTrueCorr': corr_pred_true_r,
-            'Value/RewardTargetTrueCorr': corr_target_true_r,
-        })
+        with torch.no_grad():
+            post_pred_r = self._actor_critic.reward_critic(obs)[0].flatten()
 
-        n = pred_r.shape[0]
-        idx = torch.randperm(n, device=pred_r.device)[:min(n, 2000)]
-        self._logger.log_scatter_image(
-            'Value/RewardCriticScatter',
-            x_values=target_r[idx],
-            y_values=pred_r[idx],
-            xlabel='Target V_r',
-            ylabel='Predicted V_r',
-            c_values=true_r[idx],
-            c_label='True G_r',
-        )
-        self._logger.log_scatter_image(
-            'Value/RewardPredTrueScatter',
-            x_values=true_r[idx],
-            y_values=pred_r[idx],
-            xlabel='True G_r',
-            ylabel='Predicted V_r',
-        )
+        n = post_pred_r.shape[0]
+        idx = torch.randperm(n, device=post_pred_r.device)[:min(n, 2000)]
+
+        stages_r = []
+        if preupdate_pred_r is not None:
+            stages_r.append(('BeforeUpdate', preupdate_pred_r.flatten()))
+        stages_r.append(('AfterUpdate', post_pred_r))
+
+        corr_target_true_r = torch.corrcoef(torch.stack([target_r, true_r]))[0, 1].item()
+        self._logger.store({'Value/RewardTargetTrueCorr': corr_target_true_r})
         self._logger.log_scatter_image(
             'Value/RewardTargetTrueScatter',
             x_values=true_r[idx],
@@ -508,38 +493,44 @@ class PolicyGradient(BaseAlgo):
             ylabel='Target V_r',
         )
 
-        if self._cfgs.algo_cfgs.use_cost:
-            with torch.no_grad():
-                pred_c = self._actor_critic.cost_critic(obs)[0].flatten()
+        for label, pred_r in stages_r:
+            corr_pred_target_r = torch.corrcoef(torch.stack([pred_r, target_r]))[0, 1].item()
+            corr_pred_true_r = torch.corrcoef(torch.stack([pred_r, true_r]))[0, 1].item()
+            self._logger.store({
+                f'Value/{label}/RewardCriticCorr': corr_pred_target_r,
+                f'Value/{label}/RewardPredTrueCorr': corr_pred_true_r,
+            })
+            self._logger.log_scatter_image(
+                f'Value/{label}/RewardCriticScatter',
+                x_values=target_r[idx],
+                y_values=pred_r[idx],
+                xlabel='Target V_r',
+                ylabel='Predicted V_r',
+                c_values=true_r[idx],
+                c_label='True G_r',
+            )
+            self._logger.log_scatter_image(
+                f'Value/{label}/RewardPredTrueScatter',
+                x_values=true_r[idx],
+                y_values=pred_r[idx],
+                xlabel='True G_r',
+                ylabel='Predicted V_r',
+            )
 
+        if self._cfgs.algo_cfgs.use_cost:
             target_c = target_value_c.flatten()
             true_c = discounted_cost_ret.flatten()
 
-            corr_pred_target_c = torch.corrcoef(torch.stack([pred_c, target_c]))[0, 1].item()
-            corr_pred_true_c = torch.corrcoef(torch.stack([pred_c, true_c]))[0, 1].item()
-            corr_target_true_c = torch.corrcoef(torch.stack([target_c, true_c]))[0, 1].item()
-            self._logger.store({
-                'Value/CostCriticCorr': corr_pred_target_c,
-                'Value/CostPredTrueCorr': corr_pred_true_c,
-                'Value/CostTargetTrueCorr': corr_target_true_c,
-            })
+            with torch.no_grad():
+                post_pred_c = self._actor_critic.cost_critic(obs)[0].flatten()
 
-            self._logger.log_scatter_image(
-                'Value/CostCriticScatter',
-                x_values=target_c[idx],
-                y_values=pred_c[idx],
-                xlabel='Target V_c',
-                ylabel='Predicted V_c',
-                c_values=true_c[idx],
-                c_label='True G_c',
-            )
-            self._logger.log_scatter_image(
-                'Value/CostPredTrueScatter',
-                x_values=true_c[idx],
-                y_values=pred_c[idx],
-                xlabel='True G_c',
-                ylabel='Predicted V_c',
-            )
+            stages_c = []
+            if preupdate_pred_c is not None:
+                stages_c.append(('BeforeUpdate', preupdate_pred_c.flatten()))
+            stages_c.append(('AfterUpdate', post_pred_c))
+
+            corr_target_true_c = torch.corrcoef(torch.stack([target_c, true_c]))[0, 1].item()
+            self._logger.store({'Value/CostTargetTrueCorr': corr_target_true_c})
             self._logger.log_scatter_image(
                 'Value/CostTargetTrueScatter',
                 x_values=true_c[idx],
@@ -547,6 +538,30 @@ class PolicyGradient(BaseAlgo):
                 xlabel='True G_c',
                 ylabel='Target V_c',
             )
+
+            for label, pred_c in stages_c:
+                corr_pred_target_c = torch.corrcoef(torch.stack([pred_c, target_c]))[0, 1].item()
+                corr_pred_true_c = torch.corrcoef(torch.stack([pred_c, true_c]))[0, 1].item()
+                self._logger.store({
+                    f'Value/{label}/CostCriticCorr': corr_pred_target_c,
+                    f'Value/{label}/CostPredTrueCorr': corr_pred_true_c,
+                })
+                self._logger.log_scatter_image(
+                    f'Value/{label}/CostCriticScatter',
+                    x_values=target_c[idx],
+                    y_values=pred_c[idx],
+                    xlabel='Target V_c',
+                    ylabel='Predicted V_c',
+                    c_values=true_c[idx],
+                    c_label='True G_c',
+                )
+                self._logger.log_scatter_image(
+                    f'Value/{label}/CostPredTrueScatter',
+                    x_values=true_c[idx],
+                    y_values=pred_c[idx],
+                    xlabel='True G_c',
+                    ylabel='Predicted V_c',
+                )
 
     def _update_reward_critic(self, obs: torch.Tensor, target_value_r: torch.Tensor) -> None:
         r"""Update value network under a double for loop.
