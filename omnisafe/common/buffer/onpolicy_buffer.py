@@ -358,6 +358,17 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             returns = discount_cumsum(rewards, g)[:-1]
             adv = returns
             target_value = returns
+        
+        elif estimator == "td_zero":
+            # TD(0): A_t = r_t + gamma * V(s_{t+1}) - V(s_t)
+            adv = rewards[:-1] + g * values[1:] - values[:-1]
+            target_value = rewards[:-1] + g * values[1:]
+
+        elif estimator == "td_zero_gae":
+            # TD(0): A_t = r_t + gamma * V(s_{t+1}) - V(s_t)
+            deltas = rewards[:-1] + g * values[1:] - values[:-1]
+            adv = discount_cumsum(deltas, g * lam)
+            target_value = rewards[:-1] + g * values[1:]
 
         else:
             raise NotImplementedError
