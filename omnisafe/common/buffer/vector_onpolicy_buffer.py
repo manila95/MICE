@@ -114,6 +114,19 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
         """
         self.buffers[idx].finish_path(last_value_r, last_value_c)
 
+    def get_episode_slices(self) -> list[tuple[int, int]]:
+        """Return (start, end) index pairs for every episode in the concatenated buffer.
+
+        Must be called after :meth:`get` so that each sub-buffer's ``_last_episode_slices``
+        is populated.
+        """
+        slices: list[tuple[int, int]] = []
+        for i, buf in enumerate(self.buffers):
+            offset = i * buf.max_size
+            for s, e in buf._last_episode_slices:
+                slices.append((s + offset, e + offset))
+        return slices
+
     def get(self) -> dict[str, torch.Tensor]:
         """Get the data in the buffer.
 

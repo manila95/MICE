@@ -155,14 +155,16 @@ class FOCOPS(PolicyGradient):
         self._lagrange.update_lagrange_multiplier(Jc)
 
         data = self._buf.get()
+        train_data, val_data = self._make_train_val_split(data)
+
         obs, act, logp, target_value_r, target_value_c, adv_r, adv_c = (
-            data['obs'],
-            data['act'],
-            data['logp'],
-            data['target_value_r'],
-            data['target_value_c'],
-            data['adv_r'],
-            data['adv_c'],
+            train_data['obs'],
+            train_data['act'],
+            train_data['logp'],
+            train_data['target_value_r'],
+            train_data['target_value_c'],
+            train_data['adv_r'],
+            train_data['adv_c'],
         )
         original_obs = obs
         with torch.no_grad():
@@ -229,12 +231,4 @@ class FOCOPS(PolicyGradient):
             },
         )
 
-        self._log_critic_diagnostics(
-            data['obs'],
-            data['target_value_r'],
-            data['target_value_c'],
-            data['discounted_ret'],
-            data['discounted_cost_ret'],
-            preupdate_pred_r=data['value_r'].flatten(),
-            preupdate_pred_c=data['value_c'].flatten(),
-        )
+        self._log_critic_diagnostics_splits(train_data, val_data)

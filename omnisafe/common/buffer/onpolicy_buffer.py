@@ -124,6 +124,8 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self.ptr: int = 0
         self.path_start_idx: int = 0
         self.max_size: int = size
+        self._episode_slices: list[tuple[int, int]] = []
+        self._last_episode_slices: list[tuple[int, int]] = []
 
         _valid = ['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce', 'td_zero', 'td_zero_gae']
         assert self._penalty_coefficient >= 0, 'penalty_coefficient must be non-negative!'
@@ -215,6 +217,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self.data['adv_c'][path_slice] = adv_c
         self.data['target_value_c'][path_slice] = target_value_c
 
+        self._episode_slices.append((self.path_start_idx, self.ptr))
         self.path_start_idx = self.ptr
 
     def get(self) -> dict[str, torch.Tensor]:
@@ -230,6 +233,8 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         Returns:
             The data stored and calculated in the buffer.
         """
+        self._last_episode_slices = list(self._episode_slices)
+        self._episode_slices = []
         self.ptr, self.path_start_idx = 0, 0
 
         data = {

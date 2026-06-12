@@ -222,19 +222,23 @@ class PolicyGradient(BaseAlgo):
         # log information about critic
         self._logger.register_key('Loss/Loss_reward_critic', delta=True)
         self._logger.register_key('Value/reward')
-        for stage in ('BeforeUpdate', 'AfterUpdate'):
-            self._logger.register_key(f'Value/{stage}/RewardCriticCorr')
-            self._logger.register_key(f'Value/{stage}/RewardPredTrueCorr')
-        self._logger.register_key('Value/RewardTargetTrueCorr')
+        _n_val = getattr(self._cfgs.algo_cfgs, 'n_val_episodes', 0)
+        _splits = ('Train', 'Val') if _n_val > 0 else ('Train',)
+        for split in _splits:
+            for stage in ('BeforeUpdate', 'AfterUpdate'):
+                self._logger.register_key(f'Value/{split}/{stage}/RewardCriticCorr')
+                self._logger.register_key(f'Value/{split}/{stage}/RewardPredTrueCorr')
+            self._logger.register_key(f'Value/{split}/RewardTargetTrueCorr')
 
         if self._cfgs.algo_cfgs.use_cost:
             # log information about cost critic
             self._logger.register_key('Loss/Loss_cost_critic', delta=True)
             self._logger.register_key('Value/cost')
-            for stage in ('BeforeUpdate', 'AfterUpdate'):
-                self._logger.register_key(f'Value/{stage}/CostCriticCorr')
-                self._logger.register_key(f'Value/{stage}/CostPredTrueCorr')
-            self._logger.register_key('Value/CostTargetTrueCorr')
+            for split in _splits:
+                for stage in ('BeforeUpdate', 'AfterUpdate'):
+                    self._logger.register_key(f'Value/{split}/{stage}/CostCriticCorr')
+                    self._logger.register_key(f'Value/{split}/{stage}/CostPredTrueCorr')
+                self._logger.register_key(f'Value/{split}/CostTargetTrueCorr')
 
         self._logger.register_key('Time/Total')
         self._logger.register_key('Time/Rollout')
@@ -375,14 +379,16 @@ class PolicyGradient(BaseAlgo):
         #. Repeat steps 2, 3, 4 until the KL divergence violates the limit.
         """
         data = self._buf.get()
+        train_data, val_data = self._make_train_val_split(data)
+
         obs, act, logp, target_value_r, target_value_c, adv_r, adv_c = (
-            data['obs'],
-            data['act'],
-            data['logp'],
-            data['target_value_r'],
-            data['target_value_c'],
-            data['adv_r'],
-            data['adv_c'],
+            train_data['obs'],
+            train_data['act'],
+            train_data['logp'],
+            train_data['target_value_r'],
+            train_data['target_value_c'],
+            train_data['adv_r'],
+            train_data['adv_c'],
         )
 
         original_obs = obs
@@ -436,15 +442,71 @@ class PolicyGradient(BaseAlgo):
             },
         )
 
-        self._log_critic_diagnostics(
-            original_obs,
-            data['target_value_r'],
-            data['target_value_c'],
-            data['discounted_ret'],
-            data['discounted_cost_ret'],
-            preupdate_pred_r=data['value_r'].flatten(),
-            preupdate_pred_c=data['value_c'].flatten(),
+        self._log_critic_diagnostics_splits(train_data, val_data)
+
+    def _make_train_val_split(
+        self, data: dict,
+    ) -> tuple[dict, dict | None]:
+        """Split buffer data into train/val subsets by episode.
+
+        Returns ``(train_data, val_data)``.  ``val_data`` is ``None`` when
+        ``n_val_episodes == 0`` (default), preserving the existing behaviour.
+        """
+        n_val = getattr(self._cfgs.algo_cfgs, 'n_val_episodes', 0)
+        if n_val <= 0:
+            return data, None
+
+        episode_slices = self._buf.get_episode_slices()
+        n_total = len(episode_slices)
+        n_val = min(n_val, n_total - 1)  # always keep at least 1 episode for training
+
+        val_ep_idx = set(
+            torch.randperm(n_total)[:n_val].tolist()
         )
+        n = data['obs'].shape[0]
+        device = data['obs'].device
+        train_mask = torch.ones(n, dtype=torch.bool, device=device)
+        val_mask = torch.zeros(n, dtype=torch.bool, device=device)
+        for i, (s, e) in enumerate(episode_slices):
+            if i in val_ep_idx:
+                train_mask[s:e] = False
+                val_mask[s:e] = True
+
+        def _apply(mask: torch.Tensor) -> dict:
+            return {
+                k: v[mask] if isinstance(v, torch.Tensor) and v.shape[0] == n else v
+                for k, v in data.items()
+            }
+
+        return _apply(train_mask), _apply(val_mask)
+
+    def _log_critic_diagnostics_splits(
+        self,
+        train_data: dict,
+        val_data: dict | None,
+    ) -> None:
+        """Call ``_log_critic_diagnostics`` for Train and optionally Val splits."""
+        self._log_critic_diagnostics(
+            train_data['obs'],
+            train_data['target_value_r'],
+            train_data['target_value_c'],
+            train_data['discounted_ret'],
+            train_data['discounted_cost_ret'],
+            preupdate_pred_r=train_data['value_r'].flatten(),
+            preupdate_pred_c=train_data['value_c'].flatten(),
+            split='Train',
+        )
+        if val_data is not None:
+            self._log_critic_diagnostics(
+                val_data['obs'],
+                val_data['target_value_r'],
+                val_data['target_value_c'],
+                val_data['discounted_ret'],
+                val_data['discounted_cost_ret'],
+                preupdate_pred_r=val_data['value_r'].flatten(),
+                preupdate_pred_c=val_data['value_c'].flatten(),
+                split='Val',
+            )
 
     def _log_critic_diagnostics(
         self,
@@ -455,6 +517,7 @@ class PolicyGradient(BaseAlgo):
         discounted_cost_ret: torch.Tensor,
         preupdate_pred_r: torch.Tensor | None = None,
         preupdate_pred_c: torch.Tensor | None = None,
+        split: str = 'Train',
     ) -> None:
         """Log scatter plots and Pearson correlations for both BeforeUpdate and AfterUpdate stages.
 
@@ -484,9 +547,9 @@ class PolicyGradient(BaseAlgo):
         stages_r.append(('AfterUpdate', post_pred_r))
 
         corr_target_true_r = torch.corrcoef(torch.stack([target_r, true_r]))[0, 1].item()
-        self._logger.store({'Value/RewardTargetTrueCorr': corr_target_true_r})
+        self._logger.store({f'Value/{split}/RewardTargetTrueCorr': corr_target_true_r})
         self._logger.log_scatter_image(
-            'Value/RewardTargetTrueScatter',
+            f'Value/{split}/RewardTargetTrueScatter',
             x_values=true_r[idx],
             y_values=target_r[idx],
             xlabel='True G_r',
@@ -497,11 +560,11 @@ class PolicyGradient(BaseAlgo):
             corr_pred_target_r = torch.corrcoef(torch.stack([pred_r, target_r]))[0, 1].item()
             corr_pred_true_r = torch.corrcoef(torch.stack([pred_r, true_r]))[0, 1].item()
             self._logger.store({
-                f'Value/{label}/RewardCriticCorr': corr_pred_target_r,
-                f'Value/{label}/RewardPredTrueCorr': corr_pred_true_r,
+                f'Value/{split}/{label}/RewardCriticCorr': corr_pred_target_r,
+                f'Value/{split}/{label}/RewardPredTrueCorr': corr_pred_true_r,
             })
             self._logger.log_scatter_image(
-                f'Value/{label}/RewardCriticScatter',
+                f'Value/{split}/{label}/RewardCriticScatter',
                 x_values=target_r[idx],
                 y_values=pred_r[idx],
                 xlabel='Target V_r',
@@ -510,7 +573,7 @@ class PolicyGradient(BaseAlgo):
                 c_label='True G_r',
             )
             self._logger.log_scatter_image(
-                f'Value/{label}/RewardPredTrueScatter',
+                f'Value/{split}/{label}/RewardPredTrueScatter',
                 x_values=true_r[idx],
                 y_values=pred_r[idx],
                 xlabel='True G_r',
@@ -530,9 +593,9 @@ class PolicyGradient(BaseAlgo):
             stages_c.append(('AfterUpdate', post_pred_c))
 
             corr_target_true_c = torch.corrcoef(torch.stack([target_c, true_c]))[0, 1].item()
-            self._logger.store({'Value/CostTargetTrueCorr': corr_target_true_c})
+            self._logger.store({f'Value/{split}/CostTargetTrueCorr': corr_target_true_c})
             self._logger.log_scatter_image(
-                'Value/CostTargetTrueScatter',
+                f'Value/{split}/CostTargetTrueScatter',
                 x_values=true_c[idx],
                 y_values=target_c[idx],
                 xlabel='True G_c',
@@ -543,11 +606,11 @@ class PolicyGradient(BaseAlgo):
                 corr_pred_target_c = torch.corrcoef(torch.stack([pred_c, target_c]))[0, 1].item()
                 corr_pred_true_c = torch.corrcoef(torch.stack([pred_c, true_c]))[0, 1].item()
                 self._logger.store({
-                    f'Value/{label}/CostCriticCorr': corr_pred_target_c,
-                    f'Value/{label}/CostPredTrueCorr': corr_pred_true_c,
+                    f'Value/{split}/{label}/CostCriticCorr': corr_pred_target_c,
+                    f'Value/{split}/{label}/CostPredTrueCorr': corr_pred_true_c,
                 })
                 self._logger.log_scatter_image(
-                    f'Value/{label}/CostCriticScatter',
+                    f'Value/{split}/{label}/CostCriticScatter',
                     x_values=target_c[idx],
                     y_values=pred_c[idx],
                     xlabel='Target V_c',
@@ -556,7 +619,7 @@ class PolicyGradient(BaseAlgo):
                     c_label='True G_c',
                 )
                 self._logger.log_scatter_image(
-                    f'Value/{label}/CostPredTrueScatter',
+                    f'Value/{split}/{label}/CostPredTrueScatter',
                     x_values=true_c[idx],
                     y_values=pred_c[idx],
                     xlabel='True G_c',

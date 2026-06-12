@@ -91,6 +91,8 @@ class MICEBuffer(OnPolicyBuffer):
 
     def get(self) -> Dict[str, torch.Tensor]:
         """Get the data in the buffer."""
+        self._last_episode_slices = list(self._episode_slices)
+        self._episode_slices = []
         self.ptr, self.path_start_idx = 0, 0
 
         beta_flat = torch.cat(self._beta_list, dim=0) if self._beta_list else torch.tensor([self.beta], device=self._device, dtype=torch.float32)
@@ -173,8 +175,9 @@ class MICEBuffer(OnPolicyBuffer):
         self.data['adv_c'][path_slice] = adv_c
         self.data['target_value_c'][path_slice] = target_value_c
 
+        self._episode_slices.append((self.path_start_idx, self.ptr))
         self.path_start_idx = self.ptr
-        
+
     def _calculate_balancing_intrinsic_adv_and_value_targets(
         self, values_c, costs, lam, intrinsic_costs, lr, epoch: int = 0
     ):

@@ -199,6 +199,8 @@ class MICE(CPO):
 
     def _update(self) -> None:
         data = self._buf.get()
+        train_data, val_data = self._make_train_val_split(data)
+
         (
             obs,
             act,
@@ -210,22 +212,22 @@ class MICE(CPO):
             intrinsic_costs,
             balancing_ep_dicount_ci,
         ) = (
-            data['obs'],
-            data['act'],
-            data['logp'],
-            data['target_value_r'],
-            data['target_value_c'],
-            data['adv_r'],
-            data['adv_c'],
-            data['intrinsic_costs'],
-            data['ep_discount_ci'],
+            train_data['obs'],
+            train_data['act'],
+            train_data['logp'],
+            train_data['target_value_r'],
+            train_data['target_value_c'],
+            train_data['adv_r'],
+            train_data['adv_c'],
+            train_data['intrinsic_costs'],
+            train_data['ep_discount_ci'],
         )
-        self._epoch_beta_ = data['beta_']
+        self._epoch_beta_ = train_data['beta_']
         self._epoch_beta = data['beta'].mean().item()
-        self._epoch_deltas_n = data['deltas_n']
-        self._epoch_deltas_n_mc = data['deltas_n_mc']
-        self._epoch_intrinsic_costs = data['intrinsic_costs']
-        self._epoch_time_step = data['time_step']
+        self._epoch_deltas_n = train_data['deltas_n']
+        self._epoch_deltas_n_mc = train_data['deltas_n_mc']
+        self._epoch_intrinsic_costs = train_data['intrinsic_costs']
+        self._epoch_time_step = train_data['time_step']
         self._update_actor(obs, act, logp, adv_r, adv_c, intrinsic_costs, balancing_ep_dicount_ci)
 
         dataloader = DataLoader(
@@ -251,15 +253,7 @@ class MICE(CPO):
                 'Value/Adv_c': adv_c.mean().item(),
             }
         )
-        self._log_critic_diagnostics(
-            data['obs'],
-            data['target_value_r'],
-            data['target_value_c'],
-            data['discounted_ret'],
-            data['discounted_cost_ret'],
-            preupdate_pred_r=data['value_r'].flatten(),
-            preupdate_pred_c=data['value_c'].flatten(),
-        )
+        self._log_critic_diagnostics_splits(train_data, val_data)
 
     # pylint: disable=invalid-name, too-many-arguments, too-many-locals
     def _update_actor(

@@ -194,6 +194,13 @@ if __name__ == '__main__':
         help='GAE lambda for cost advantage (on-policy algorithms)',
     )
     parser.add_argument(
+        '--n-val-episodes',
+        type=int,
+        default=None,
+        metavar='N',
+        help='number of episodes per epoch held out for critic calibration validation (0 = no split)',
+    )
+    parser.add_argument(
         '--adv-estimation-method',
         type=str,
         default=None,
@@ -232,6 +239,7 @@ if __name__ == '__main__':
     lam_c = args.lam_c
     adv_estimation_method = args.adv_estimation_method
     cost_adv_estimation_method = args.cost_adv_estimation_method
+    n_val_episodes = args.n_val_episodes
     steps_per_epoch = args.steps_per_epoch
     early_eval_freq = args.early_eval_freq
     lidar_bins = args.lidar_bins
@@ -254,6 +262,7 @@ if __name__ == '__main__':
     del opt["lam_c"]
     del opt["adv_estimation_method"]
     del opt["cost_adv_estimation_method"]
+    del opt["n_val_episodes"]
     del opt["steps_per_epoch"]
     del opt["early_eval_freq"]
     del opt["lidar_bins"]
@@ -304,6 +313,8 @@ if __name__ == '__main__':
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_adv_estimation_method', cost_adv_estimation_method))
     elif adv_estimation_method is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_adv_estimation_method', adv_estimation_method))
+    if n_val_episodes is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:n_val_episodes', str(n_val_episodes)))
     if steps_per_epoch is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:steps_per_epoch', str(steps_per_epoch)))
     if early_eval_freq is not None:

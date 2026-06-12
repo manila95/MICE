@@ -382,6 +382,10 @@ def __check_algo_configs(configs: Config, algo_type: str) -> None:
             'td_zero',
             'td_zero_gae',
         ], "adv_estimation_method must be string, and it values must be ['gae','gae-rtg','vtrace','plain','reinforce','td_zero','td_zero_gae']"
+        if hasattr(configs, 'n_val_episodes'):
+            assert (
+                isinstance(configs.n_val_episodes, int) and configs.n_val_episodes >= 0
+            ), 'n_val_episodes must be a non-negative int'
         assert isinstance(configs.standardized_rew_adv, bool) and isinstance(
             configs.standardized_cost_adv,
             bool,
