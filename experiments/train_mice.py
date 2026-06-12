@@ -198,7 +198,7 @@ if __name__ == '__main__':
         type=str,
         default=None,
         metavar='METHOD',
-        choices=['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce'],
+        choices=['td_zero', 'td_zero_gae', 'gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce'],
         help='Advantage estimation method for reward (gae, gae-rtg, vtrace, plain, reinforce)',
     )
     parser.add_argument(
@@ -206,7 +206,7 @@ if __name__ == '__main__':
         type=str,
         default=None,
         metavar='METHOD',
-        choices=['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce'],
+        choices=['td_zero', 'td_zero_gae', 'gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce'],
         help='Advantage estimation method for cost; defaults to --adv-estimation-method if unset',
     )
     args, unparsed_args = parser.parse_known_args()

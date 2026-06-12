@@ -125,7 +125,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self.path_start_idx: int = 0
         self.max_size: int = size
 
-        _valid = ['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce']
+        _valid = ['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce', 'td_zero', 'td_zero_gae']
         assert self._penalty_coefficient >= 0, 'penalty_coefficient must be non-negative!'
         assert self._advantage_estimator in _valid
         assert self._cost_advantage_estimator in _valid

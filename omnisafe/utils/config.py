@@ -379,7 +379,9 @@ def __check_algo_configs(configs: Config, algo_type: str) -> None:
             'vtrace',
             'plain',
             'reinforce',
-        ], "adv_estimation_method must be string, and it values must be ['gae','gae-rtg','vtrace','plain','reinforce']"
+            'td_zero',
+            'td_zero_gae',
+        ], "adv_estimation_method must be string, and it values must be ['gae','gae-rtg','vtrace','plain','reinforce','td_zero','td_zero_gae']"
         assert isinstance(configs.standardized_rew_adv, bool) and isinstance(
             configs.standardized_cost_adv,
             bool,
