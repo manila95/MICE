@@ -217,9 +217,26 @@ if __name__ == '__main__':
         help='Advantage estimation method for cost; defaults to --adv-estimation-method if unset',
     )
     args, unparsed_args = parser.parse_known_args()
-    keys = [k[2:].replace('.', ':') for k in unparsed_args[0::2]]
-    values = list(unparsed_args[1::2])
-    unparsed_args = dict(zip(keys, values))
+    # Handle both '--key value' and '--key=value' (wandb sweep format).
+    # Keys may use '.' or ':' as hierarchy separator, and '-' or '_' between words.
+    _cfg_overrides: dict[str, str] = {}
+    _i = 0
+    while _i < len(unparsed_args):
+        tok = unparsed_args[_i]
+        if tok.startswith('--'):
+            if '=' in tok:
+                k, v = tok[2:].split('=', 1)
+                _i += 1
+            elif _i + 1 < len(unparsed_args) and not unparsed_args[_i + 1].startswith('--'):
+                k, v = tok[2:], unparsed_args[_i + 1]
+                _i += 2
+            else:
+                _i += 1
+                continue
+            _cfg_overrides[k.replace('.', ':').replace('-', '_')] = v
+        else:
+            _i += 1
+    unparsed_args = _cfg_overrides
 
     seed = args.seed
     constant_cost = args.constant_cost
