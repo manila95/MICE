@@ -219,7 +219,7 @@ if __name__ == '__main__':
     args, unparsed_args = parser.parse_known_args()
     # Handle both '--key value' and '--key=value' (wandb sweep format).
     # Keys may use '.' or ':' as hierarchy separator, and '-' or '_' between words.
-    _cfg_overrides: dict[str, str] = {}
+    _cfg_overrides = {}
     _i = 0
     while _i < len(unparsed_args):
         tok = unparsed_args[_i]
