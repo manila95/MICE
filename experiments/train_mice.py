@@ -217,7 +217,7 @@ if __name__ == '__main__':
         help='Advantage estimation method for cost; defaults to --adv-estimation-method if unset',
     )
     args, unparsed_args = parser.parse_known_args()
-    keys = [k[2:] for k in unparsed_args[0::2]]
+    keys = [k[2:].replace('.', ':') for k in unparsed_args[0::2]]
     values = list(unparsed_args[1::2])
     unparsed_args = dict(zip(keys, values))
 
