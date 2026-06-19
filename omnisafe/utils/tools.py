@@ -173,8 +173,11 @@ def custom_cfgs_to_dict(key_list: str, value: Any) -> dict[str, Any]:
         value = True
     elif value == 'False':
         value = False
-    elif '.' in value:
-        value = float(value)
+    elif '.' in value or 'e' in value.lower():
+        try:
+            value = float(value)
+        except ValueError:
+            value = str(value)
     elif value.isdigit():
         value = int(value)
     elif value.startswith('[') and value.endswith(']'):
