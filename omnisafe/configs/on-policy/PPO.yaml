@@ -70,6 +70,8 @@ defaults:
     adv_estimation_method: gae
     cost_adv_estimation_method: ~
     n_val_episodes: 0
+    # Huber threshold for distributional critic quantile loss
+    dist_kappa: 1.0
     # standardize reward advantage
     standardized_rew_adv: True
     # standardize cost advantage
@@ -123,6 +125,10 @@ defaults:
       activation: tanh
       # learning rate
       lr: 0.0003
+      # use distributional (quantile-regression) value critic
+      distributional: false
+      # number of return quantiles
+      n_quantiles: 50
 
   env_cfgs:
     lidar_num_bins: ~
@@ -166,6 +172,10 @@ ShadowHandCatchOver2UnderarmSafeFinger:
       hidden_sizes: [1024, 1024, 512]
       # learning rate
       lr: 0.0006
+      # use distributional (quantile-regression) value critic
+      distributional: false
+      # number of return quantiles
+      n_quantiles: 50
 
 ShadowHandOverSafeFinger:
   # training configurations
@@ -203,6 +213,10 @@ ShadowHandOverSafeFinger:
       hidden_sizes: [1024, 1024, 512]
       # learning rate
       lr: 0.0006
+      # use distributional (quantile-regression) value critic
+      distributional: false
+      # number of return quantiles
+      n_quantiles: 50
 
 ShadowHandCatchOver2UnderarmSafeJoint:
   # training configurations
@@ -244,6 +258,10 @@ ShadowHandCatchOver2UnderarmSafeJoint:
       hidden_sizes: [1024, 1024, 512]
       # learning rate
       lr: 0.0006
+      # use distributional (quantile-regression) value critic
+      distributional: false
+      # number of return quantiles
+      n_quantiles: 50
 
 ShadowHandOverSafeJoint:
   # training configurations
@@ -281,6 +299,10 @@ ShadowHandOverSafeJoint:
       hidden_sizes: [1024, 1024, 512]
       # learning rate
       lr: 0.0006
+      # use distributional (quantile-regression) value critic
+      distributional: false
+      # number of return quantiles
+      n_quantiles: 50
 
 SafeMetaDrive:
   # training configurations
@@ -325,6 +347,10 @@ SafeMetaDrive:
       hidden_sizes: [256, 256]
       # learning rate
       lr: 0.00005
+      # use distributional (quantile-regression) value critic
+      distributional: false
+      # number of return quantiles
+      n_quantiles: 50
   # environment specific configurations
   env_cfgs:
   # safe meta drive configurations. More details refer to https://github.com/decisionforce/EGPO

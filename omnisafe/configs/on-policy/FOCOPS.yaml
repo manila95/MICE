@@ -74,6 +74,8 @@ defaults:
     adv_estimation_method: gae
     cost_adv_estimation_method: ~
     n_val_episodes: 0
+    # Huber threshold for distributional critic quantile loss
+    dist_kappa: 1.0
     # standardize reward advantage
     standardized_rew_adv: True
     # standardize cost advantage
@@ -127,6 +129,10 @@ defaults:
       activation: tanh
       # learning rate
       lr: 0.0003
+      # use distributional (quantile-regression) value critic
+      distributional: false
+      # number of return quantiles
+      n_quantiles: 50
   # lagrangian configurations
   lagrange_cfgs:
     # Tolerance of constraint violation

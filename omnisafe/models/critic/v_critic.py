@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Implementation of VCritic."""
+"""Implementation of VCritic and DistributionalVCritic."""
 
 from __future__ import annotations
 
@@ -90,3 +90,74 @@ class VCritic(Critic):
         for critic in self.net_lst:
             res.append(torch.squeeze(critic(obs), -1))
         return res
+
+
+class DistributionalVCritic(Critic):
+    """Quantile-regression distributional value critic.
+
+    Instead of predicting E[V(s)], outputs N quantile values q_1,...,q_N at fixed quantile
+    levels τ_i = (2i-1)/(2N).  The interface is identical to VCritic — ``forward`` returns
+    ``[mean_over_quantiles]`` so the rest of the training pipeline (advantage computation, GAE,
+    value targets, diagnostics) is unaffected.  The distributional information is exposed via
+    ``quantiles(obs)`` and used only in the critic loss (``_quantile_huber_loss``).
+
+    Args:
+        obs_space: Observation space.
+        act_space: Action space.
+        hidden_sizes: MLP hidden layer sizes.
+        activation: Activation function name.
+        weight_initialization_mode: Weight init scheme.
+        num_critics: Number of ensemble members (typically 1).
+        n_quantiles: Number of quantiles N (default 50).
+    """
+
+    def __init__(
+        self,
+        obs_space: OmnisafeSpace,
+        act_space: OmnisafeSpace,
+        hidden_sizes: list[int],
+        activation: Activation = 'relu',
+        weight_initialization_mode: InitFunction = 'kaiming_uniform',
+        num_critics: int = 1,
+        n_quantiles: int = 50,
+    ) -> None:
+        """Initialize an instance of :class:`DistributionalVCritic`."""
+        super().__init__(
+            obs_space,
+            act_space,
+            hidden_sizes,
+            activation,
+            weight_initialization_mode,
+            num_critics,
+            use_obs_encoder=False,
+        )
+        self.n_quantiles: int = n_quantiles
+        # Fixed quantile levels: midpoints of N equal-probability intervals
+        tau = (2.0 * torch.arange(1, n_quantiles + 1) - 1.0) / (2.0 * n_quantiles)
+        self.register_buffer('tau', tau)  # shape (N,)
+
+        self.net_lst: list[nn.Module] = []
+        for idx in range(self._num_critics):
+            net = build_mlp_network(
+                sizes=[self._obs_dim, *self._hidden_sizes, n_quantiles],
+                activation=self._activation,
+                weight_initialization_mode=self._weight_initialization_mode,
+            )
+            self.net_lst.append(net)
+            self.add_module(f'critic_{idx}', net)
+
+    def forward(self, obs: torch.Tensor) -> list[torch.Tensor]:
+        """Return list of per-ensemble mean values, shape (batch,) each — same as VCritic."""
+        res = []
+        for net in self.net_lst:
+            q = net(obs)  # (batch, N)
+            res.append(q.mean(dim=-1))  # (batch,)
+        return res
+
+    def quantiles(self, obs: torch.Tensor) -> torch.Tensor:
+        """Return all quantile predictions from the first ensemble member.
+
+        Returns:
+            Tensor of shape (batch, N).
+        """
+        return self.net_lst[0](obs)

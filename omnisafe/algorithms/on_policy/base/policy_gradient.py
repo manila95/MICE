@@ -31,6 +31,7 @@ from omnisafe.algorithms.base_algo import BaseAlgo
 from omnisafe.common.buffer import VectorOnPolicyBuffer
 from omnisafe.common.logger import Logger
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
+from omnisafe.models.critic.v_critic import DistributionalVCritic
 from omnisafe.utils import distributed
 from omnisafe.utils.value_eval import estimate_true_value
 
@@ -626,82 +627,100 @@ class PolicyGradient(BaseAlgo):
                     ylabel='Predicted V_c',
                 )
 
+    @staticmethod
+    def _quantile_huber_loss(
+        quantiles: torch.Tensor,
+        target: torch.Tensor,
+        tau: torch.Tensor,
+        kappa: float = 1.0,
+    ) -> torch.Tensor:
+        """Quantile-regression Huber loss (QR-Huber) for the distributional critic.
+
+        Trains quantile q_i toward the scalar target using an asymmetric Huber loss weighted by
+        |τ_i - I(target < q_i)|.  All N quantiles are trained toward the same scalar target; the
+        different τ weightings cause q_i to converge to the τ_i-th percentile of the empirical
+        target distribution observed across minibatches.
+
+        Args:
+            quantiles: (B, N) predicted quantile values.
+            target: (B,) scalar TD / MC target per sample.
+            tau: (N,) fixed quantile levels in (0, 1).
+            kappa: Huber threshold (default 1.0).
+
+        Returns:
+            Scalar loss.
+        """
+        u = target.unsqueeze(-1) - quantiles  # (B, N)
+        huber = torch.where(
+            u.abs() <= kappa,
+            0.5 * u.pow(2),
+            kappa * (u.abs() - 0.5 * kappa),
+        ) / kappa
+        weight = (tau - (u.detach() < 0).float()).abs()  # (B, N)
+        return (weight * huber).mean()
+
     def _update_reward_critic(self, obs: torch.Tensor, target_value_r: torch.Tensor) -> None:
-        r"""Update value network under a double for loop.
+        r"""Update the reward value network.
 
-        The loss function is ``MSE loss``, which is defined in ``torch.nn.MSELoss``.
-        Specifically, the loss function is defined as:
-
-        .. math::
-
-            L = \frac{1}{N} \sum_{i=1}^N (\hat{V} - V)^2
-
-        where :math:`\hat{V}` is the predicted cost and :math:`V` is the target cost.
-
-        #. Compute the loss function.
-        #. Add the ``critic norm`` to the loss function if ``use_critic_norm`` is ``True``.
-        #. Clip the gradient if ``use_max_grad_norm`` is ``True``.
-        #. Update the network by loss function.
+        Uses MSE loss for a standard VCritic, or quantile-regression Huber loss when a
+        DistributionalVCritic is active (``model_cfgs.critic.distributional: true``).
 
         Args:
             obs (torch.Tensor): The ``observation`` sampled from buffer.
             target_value_r (torch.Tensor): The ``target_value_r`` sampled from buffer.
         """
+        critic = self._actor_critic.reward_critic
         self._actor_critic.reward_critic_optimizer.zero_grad()
-        loss = nn.functional.mse_loss(self._actor_critic.reward_critic(obs)[0], target_value_r)
+        if isinstance(critic, DistributionalVCritic):
+            kappa = getattr(self._cfgs.algo_cfgs, 'dist_kappa', 1.0)
+            loss = self._quantile_huber_loss(
+                critic.quantiles(obs), target_value_r, critic.tau, kappa,
+            )
+        else:
+            loss = nn.functional.mse_loss(critic(obs)[0], target_value_r)
 
         if self._cfgs.algo_cfgs.use_critic_norm:
-            for param in self._actor_critic.reward_critic.parameters():
+            for param in critic.parameters():
                 loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coef
 
         loss.backward()
 
         if self._cfgs.algo_cfgs.use_max_grad_norm:
-            clip_grad_norm_(
-                self._actor_critic.reward_critic.parameters(),
-                self._cfgs.algo_cfgs.max_grad_norm,
-            )
-        distributed.avg_grads(self._actor_critic.reward_critic)
+            clip_grad_norm_(critic.parameters(), self._cfgs.algo_cfgs.max_grad_norm)
+        distributed.avg_grads(critic)
         self._actor_critic.reward_critic_optimizer.step()
 
         self._logger.store({'Loss/Loss_reward_critic': loss.mean().item()})
 
     def _update_cost_critic(self, obs: torch.Tensor, target_value_c: torch.Tensor) -> None:
-        r"""Update value network under a double for loop.
+        r"""Update the cost value network.
 
-        The loss function is ``MSE loss``, which is defined in ``torch.nn.MSELoss``.
-        Specifically, the loss function is defined as:
-
-        .. math::
-
-            L = \frac{1}{N} \sum_{i=1}^N (\hat{V} - V)^2
-
-        where :math:`\hat{V}` is the predicted cost and :math:`V` is the target cost.
-
-        #. Compute the loss function.
-        #. Add the ``critic norm`` to the loss function if ``use_critic_norm`` is ``True``.
-        #. Clip the gradient if ``use_max_grad_norm`` is ``True``.
-        #. Update the network by loss function.
+        Uses MSE loss for a standard VCritic, or quantile-regression Huber loss when a
+        DistributionalVCritic is active (``model_cfgs.critic.distributional: true``).
 
         Args:
             obs (torch.Tensor): The ``observation`` sampled from buffer.
             target_value_c (torch.Tensor): The ``target_value_c`` sampled from buffer.
         """
+        critic = self._actor_critic.cost_critic
         self._actor_critic.cost_critic_optimizer.zero_grad()
-        loss = nn.functional.mse_loss(self._actor_critic.cost_critic(obs)[0], target_value_c)
+        if isinstance(critic, DistributionalVCritic):
+            kappa = getattr(self._cfgs.algo_cfgs, 'dist_kappa', 1.0)
+            loss = self._quantile_huber_loss(
+                critic.quantiles(obs), target_value_c, critic.tau, kappa,
+            )
+        else:
+            loss = nn.functional.mse_loss(critic(obs)[0], target_value_c)
 
         if self._cfgs.algo_cfgs.use_critic_norm:
-            for param in self._actor_critic.cost_critic.parameters():
+            for param in critic.parameters():
                 loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coef
 
         loss.backward()
 
         if self._cfgs.algo_cfgs.use_max_grad_norm:
-            clip_grad_norm_(
-                self._actor_critic.cost_critic.parameters(),
-                self._cfgs.algo_cfgs.max_grad_norm,
-            )
-        distributed.avg_grads(self._actor_critic.cost_critic)
+            clip_grad_norm_(critic.parameters(), self._cfgs.algo_cfgs.max_grad_norm)
+        distributed.avg_grads(critic)
         self._actor_critic.cost_critic_optimizer.step()
 
         self._logger.store({'Loss/Loss_cost_critic': loss.mean().item()})

@@ -76,6 +76,8 @@ class ActorCritic(nn.Module):
         ).build_actor(
             actor_type=model_cfgs.actor_type,
         )
+        _dist = getattr(model_cfgs.critic, 'distributional', False)
+        _n_q = getattr(model_cfgs.critic, 'n_quantiles', 50)
         self.reward_critic: Critic = CriticBuilder(
             obs_space=obs_space,
             act_space=act_space,
@@ -84,7 +86,7 @@ class ActorCritic(nn.Module):
             weight_initialization_mode=model_cfgs.weight_initialization_mode,
             num_critics=1,
             use_obs_encoder=False,
-        ).build_critic(critic_type='v')
+        ).build_critic(critic_type='v_dist' if _dist else 'v', n_quantiles=_n_q)
         self.add_module('actor', self.actor)
         self.add_module('reward_critic', self.reward_critic)
 

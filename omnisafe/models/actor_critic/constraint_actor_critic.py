@@ -63,6 +63,8 @@ class ConstraintActorCritic(ActorCritic):
     ) -> None:
         """Initialize an instance of :class:`ConstraintActorCritic`."""
         super().__init__(obs_space, act_space, model_cfgs, epochs)
+        _dist = getattr(model_cfgs.critic, 'distributional', False)
+        _n_q = getattr(model_cfgs.critic, 'n_quantiles', 50)
         self.cost_critic: Critic = CriticBuilder(
             obs_space=obs_space,
             act_space=act_space,
@@ -71,7 +73,7 @@ class ConstraintActorCritic(ActorCritic):
             weight_initialization_mode=model_cfgs.weight_initialization_mode,
             num_critics=1,
             use_obs_encoder=False,
-        ).build_critic('v')
+        ).build_critic('v_dist' if _dist else 'v', n_quantiles=_n_q)
         self.add_module('cost_critic', self.cost_critic)
 
         if model_cfgs.critic.lr is not None:
