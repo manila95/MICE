@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 from torch import optim
 
-from omnisafe.models.actor_critic.actor_critic import ActorCritic
+from omnisafe.models.actor_critic.actor_critic import ActorCritic, _resolve_critic_type
 from omnisafe.models.base import Critic
 from omnisafe.models.critic.critic_builder import CriticBuilder
 from omnisafe.typing import OmnisafeSpace
@@ -63,17 +63,29 @@ class ConstraintActorCritic(ActorCritic):
     ) -> None:
         """Initialize an instance of :class:`ConstraintActorCritic`."""
         super().__init__(obs_space, act_space, model_cfgs, epochs)
-        _dist = getattr(model_cfgs.critic, 'distributional', False)
-        _n_q = getattr(model_cfgs.critic, 'n_quantiles', 50)
+        _critic_type = _resolve_critic_type(model_cfgs.critic)
+        _n_q   = getattr(model_cfgs.critic, 'n_quantiles', 50)
+        _n_tqc = getattr(model_cfgs.critic, 'tqc_n_critics', 2)
+        _n_top = getattr(model_cfgs.critic, 'tqc_n_top_to_drop', 2)
+        _emb   = getattr(model_cfgs.critic, 'iqn_embed_dim', 64)
+        _ncos  = getattr(model_cfgs.critic, 'iqn_n_cos', 64)
+        _eval  = getattr(model_cfgs.critic, 'iqn_n_tau_eval', 32)
         self.cost_critic: Critic = CriticBuilder(
             obs_space=obs_space,
             act_space=act_space,
             hidden_sizes=model_cfgs.critic.hidden_sizes,
             activation=model_cfgs.critic.activation,
             weight_initialization_mode=model_cfgs.weight_initialization_mode,
-            num_critics=1,
+            num_critics=_n_tqc if _critic_type == 'v_tqc' else 1,
             use_obs_encoder=False,
-        ).build_critic('v_dist' if _dist else 'v', n_quantiles=_n_q)
+        ).build_critic(
+            critic_type=_critic_type,
+            n_quantiles=_n_q,
+            n_top_quantiles_to_drop=_n_top,
+            iqn_embed_dim=_emb,
+            iqn_n_cos=_ncos,
+            iqn_n_tau_eval=_eval,
+        )
         self.add_module('cost_critic', self.cost_critic)
 
         if model_cfgs.critic.lr is not None:

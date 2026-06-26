@@ -129,6 +129,12 @@ defaults:
       distributional: false
       # number of return quantiles
       n_quantiles: 50
+      dist_type: qr
+      tqc_n_critics: 2
+      tqc_n_top_to_drop: 2
+      iqn_embed_dim: 64
+      iqn_n_cos: 64
+      iqn_n_tau_eval: 32
 
   env_cfgs:
     lidar_num_bins: ~
@@ -176,6 +182,12 @@ ShadowHandCatchOver2UnderarmSafeFinger:
       distributional: false
       # number of return quantiles
       n_quantiles: 50
+      dist_type: qr
+      tqc_n_critics: 2
+      tqc_n_top_to_drop: 2
+      iqn_embed_dim: 64
+      iqn_n_cos: 64
+      iqn_n_tau_eval: 32
 
 ShadowHandOverSafeFinger:
   # training configurations
@@ -217,6 +229,12 @@ ShadowHandOverSafeFinger:
       distributional: false
       # number of return quantiles
       n_quantiles: 50
+      dist_type: qr
+      tqc_n_critics: 2
+      tqc_n_top_to_drop: 2
+      iqn_embed_dim: 64
+      iqn_n_cos: 64
+      iqn_n_tau_eval: 32
 
 ShadowHandCatchOver2UnderarmSafeJoint:
   # training configurations
@@ -262,6 +280,12 @@ ShadowHandCatchOver2UnderarmSafeJoint:
       distributional: false
       # number of return quantiles
       n_quantiles: 50
+      dist_type: qr
+      tqc_n_critics: 2
+      tqc_n_top_to_drop: 2
+      iqn_embed_dim: 64
+      iqn_n_cos: 64
+      iqn_n_tau_eval: 32
 
 ShadowHandOverSafeJoint:
   # training configurations
@@ -303,6 +327,12 @@ ShadowHandOverSafeJoint:
       distributional: false
       # number of return quantiles
       n_quantiles: 50
+      dist_type: qr
+      tqc_n_critics: 2
+      tqc_n_top_to_drop: 2
+      iqn_embed_dim: 64
+      iqn_n_cos: 64
+      iqn_n_tau_eval: 32
 
 SafeMetaDrive:
   # training configurations
@@ -351,6 +381,12 @@ SafeMetaDrive:
       distributional: false
       # number of return quantiles
       n_quantiles: 50
+      dist_type: qr
+      tqc_n_critics: 2
+      tqc_n_top_to_drop: 2
+      iqn_embed_dim: 64
+      iqn_n_cos: 64
+      iqn_n_tau_eval: 32
   # environment specific configurations
   env_cfgs:
   # safe meta drive configurations. More details refer to https://github.com/decisionforce/EGPO

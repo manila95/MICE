@@ -31,7 +31,7 @@ from omnisafe.algorithms.base_algo import BaseAlgo
 from omnisafe.common.buffer import VectorOnPolicyBuffer
 from omnisafe.common.logger import Logger
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
-from omnisafe.models.critic.v_critic import DistributionalVCritic
+from omnisafe.models.critic.v_critic import DistributionalVCritic, IQNVCritic
 from omnisafe.utils import distributed
 from omnisafe.utils.value_eval import estimate_true_value
 
@@ -240,6 +240,18 @@ class PolicyGradient(BaseAlgo):
                     self._logger.register_key(f'Value/{split}/{stage}/CostCriticCorr')
                     self._logger.register_key(f'Value/{split}/{stage}/CostPredTrueCorr')
                 self._logger.register_key(f'Value/{split}/CostTargetTrueCorr')
+
+        _is_dist_r = isinstance(
+            self._actor_critic.reward_critic, (DistributionalVCritic, IQNVCritic)
+        )
+        _is_dist_c = self._cfgs.algo_cfgs.use_cost and isinstance(
+            self._actor_critic.cost_critic, (DistributionalVCritic, IQNVCritic)
+        )
+        for split in _splits:
+            if _is_dist_r:
+                self._logger.register_key(f'Value/{split}/AfterUpdate/RewardCriticStd')
+            if _is_dist_c:
+                self._logger.register_key(f'Value/{split}/AfterUpdate/CostCriticStd')
 
         self._logger.register_key('Time/Total')
         self._logger.register_key('Time/Rollout')
@@ -536,8 +548,14 @@ class PolicyGradient(BaseAlgo):
         target_r = target_value_r.flatten()
         true_r = discounted_ret.flatten()
 
+        reward_critic = self._actor_critic.reward_critic
         with torch.no_grad():
-            post_pred_r = self._actor_critic.reward_critic(obs)[0].flatten()
+            post_pred_r = reward_critic(obs)[0].flatten()
+            if isinstance(reward_critic, (DistributionalVCritic, IQNVCritic)):
+                q_r, _ = reward_critic.quantiles(obs)
+                _post_std_r: float | None = q_r.std(dim=-1).mean().item()
+            else:
+                _post_std_r = None
 
         n = post_pred_r.shape[0]
         idx = torch.randperm(n, device=post_pred_r.device)[:min(n, 2000)]
@@ -581,12 +599,21 @@ class PolicyGradient(BaseAlgo):
                 ylabel='Predicted V_r',
             )
 
+        if _post_std_r is not None:
+            self._logger.store({f'Value/{split}/AfterUpdate/RewardCriticStd': _post_std_r})
+
         if self._cfgs.algo_cfgs.use_cost:
             target_c = target_value_c.flatten()
             true_c = discounted_cost_ret.flatten()
 
+            cost_critic = self._actor_critic.cost_critic
             with torch.no_grad():
-                post_pred_c = self._actor_critic.cost_critic(obs)[0].flatten()
+                post_pred_c = cost_critic(obs)[0].flatten()
+                if isinstance(cost_critic, (DistributionalVCritic, IQNVCritic)):
+                    q_c, _ = cost_critic.quantiles(obs)
+                    _post_std_c: float | None = q_c.std(dim=-1).mean().item()
+                else:
+                    _post_std_c = None
 
             stages_c = []
             if preupdate_pred_c is not None:
@@ -626,6 +653,9 @@ class PolicyGradient(BaseAlgo):
                     xlabel='True G_c',
                     ylabel='Predicted V_c',
                 )
+
+            if _post_std_c is not None:
+                self._logger.store({f'Value/{split}/AfterUpdate/CostCriticStd': _post_std_c})
 
     @staticmethod
     def _quantile_huber_loss(
@@ -671,11 +701,10 @@ class PolicyGradient(BaseAlgo):
         """
         critic = self._actor_critic.reward_critic
         self._actor_critic.reward_critic_optimizer.zero_grad()
-        if isinstance(critic, DistributionalVCritic):
+        if isinstance(critic, (DistributionalVCritic, IQNVCritic)):
             kappa = getattr(self._cfgs.algo_cfgs, 'dist_kappa', 1.0)
-            loss = self._quantile_huber_loss(
-                critic.quantiles(obs), target_value_r, critic.tau, kappa,
-            )
+            q, tau = critic.quantiles(obs)
+            loss = self._quantile_huber_loss(q, target_value_r, tau, kappa)
         else:
             loss = nn.functional.mse_loss(critic(obs)[0], target_value_r)
 
@@ -704,11 +733,10 @@ class PolicyGradient(BaseAlgo):
         """
         critic = self._actor_critic.cost_critic
         self._actor_critic.cost_critic_optimizer.zero_grad()
-        if isinstance(critic, DistributionalVCritic):
+        if isinstance(critic, (DistributionalVCritic, IQNVCritic)):
             kappa = getattr(self._cfgs.algo_cfgs, 'dist_kappa', 1.0)
-            loss = self._quantile_huber_loss(
-                critic.quantiles(obs), target_value_c, critic.tau, kappa,
-            )
+            q, tau = critic.quantiles(obs)
+            loss = self._quantile_huber_loss(q, target_value_c, tau, kappa)
         else:
             loss = nn.functional.mse_loss(critic(obs)[0], target_value_c)
 

@@ -137,6 +137,12 @@ defaults:
       distributional: false
       # number of return quantiles
       n_quantiles: 50
+      dist_type: qr
+      tqc_n_critics: 2
+      tqc_n_top_to_drop: 2
+      iqn_embed_dim: 64
+      iqn_n_cos: 64
+      iqn_n_tau_eval: 32
 
   env_cfgs:
     lidar_num_bins: ~
@@ -184,6 +190,12 @@ SafeMetaDrive:
       distributional: false
       # number of return quantiles
       n_quantiles: 50
+      dist_type: qr
+      tqc_n_critics: 2
+      tqc_n_top_to_drop: 2
+      iqn_embed_dim: 64
+      iqn_n_cos: 64
+      iqn_n_tau_eval: 32
   # environment specific configurations
   env_cfgs:
   # safe meta drive configurations. More details refer to https://github.com/decisionforce/EGPO

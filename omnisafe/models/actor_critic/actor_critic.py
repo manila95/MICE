@@ -29,6 +29,14 @@ from omnisafe.utils.config import ModelConfig
 from omnisafe.utils.schedule import PiecewiseSchedule, Schedule
 
 
+def _resolve_critic_type(critic_cfg) -> str:
+    """Return the critic_type string based on model_cfgs.critic settings."""
+    if not getattr(critic_cfg, 'distributional', False):
+        return 'v'
+    dist_type = getattr(critic_cfg, 'dist_type', 'qr')
+    return {'qr': 'v_qr', 'tqc': 'v_tqc', 'iqn': 'v_iqn'}.get(dist_type, 'v_qr')
+
+
 class ActorCritic(nn.Module):
     """Class for ActorCritic.
 
@@ -76,17 +84,29 @@ class ActorCritic(nn.Module):
         ).build_actor(
             actor_type=model_cfgs.actor_type,
         )
-        _dist = getattr(model_cfgs.critic, 'distributional', False)
-        _n_q = getattr(model_cfgs.critic, 'n_quantiles', 50)
+        _critic_type = _resolve_critic_type(model_cfgs.critic)
+        _n_q   = getattr(model_cfgs.critic, 'n_quantiles', 50)
+        _n_tqc = getattr(model_cfgs.critic, 'tqc_n_critics', 2)
+        _n_top = getattr(model_cfgs.critic, 'tqc_n_top_to_drop', 2)
+        _emb   = getattr(model_cfgs.critic, 'iqn_embed_dim', 64)
+        _ncos  = getattr(model_cfgs.critic, 'iqn_n_cos', 64)
+        _eval  = getattr(model_cfgs.critic, 'iqn_n_tau_eval', 32)
         self.reward_critic: Critic = CriticBuilder(
             obs_space=obs_space,
             act_space=act_space,
             hidden_sizes=model_cfgs.critic.hidden_sizes,
             activation=model_cfgs.critic.activation,
             weight_initialization_mode=model_cfgs.weight_initialization_mode,
-            num_critics=1,
+            num_critics=_n_tqc if _critic_type == 'v_tqc' else 1,
             use_obs_encoder=False,
-        ).build_critic(critic_type='v_dist' if _dist else 'v', n_quantiles=_n_q)
+        ).build_critic(
+            critic_type=_critic_type,
+            n_quantiles=_n_q,
+            n_top_quantiles_to_drop=_n_top,
+            iqn_embed_dim=_emb,
+            iqn_n_cos=_ncos,
+            iqn_n_tau_eval=_eval,
+        )
         self.add_module('actor', self.actor)
         self.add_module('reward_critic', self.reward_critic)
 
