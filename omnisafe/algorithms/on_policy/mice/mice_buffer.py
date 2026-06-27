@@ -183,7 +183,7 @@ class MICEBuffer(OnPolicyBuffer):
     ):
         effective_constant_cost = self._get_effective_constant_cost(epoch)
 
-        if self._advantage_estimator == 'gae':
+        if self._advantage_estimator in ('gae', 'cvar'):
             if effective_constant_cost is not None:
                 # Ablation: fixed, state-independent intrinsic cost with beta frozen at 1.0.
                 # Without freezing beta, it adapts to absorb the constant (beta*C converges to

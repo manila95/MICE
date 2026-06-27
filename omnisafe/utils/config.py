@@ -319,7 +319,7 @@ def __check_algo_configs(configs: Config, algo_type: str) -> None:
         - ``use_max_grad_norm`` must be bool.
         - ``use_cost`` must be bool.
         - ``max_grad_norm`` must be greater than 0 and must be float.
-        - ``adv_estimation_method`` must be in [``gae``, ``v-trace``, ``gae-rtg``, ``plain``].
+        - ``adv_estimation_method`` must be in [``gae``, ``gae-rtg``, ``vtrace``, ``plain``, ``reinforce``, ``td_zero``, ``td_zero_gae``, ``cvar``].
         - ``standardized_rew_adv`` must be bool.
         - ``standardized_cost_adv`` must be bool.
 
@@ -381,7 +381,8 @@ def __check_algo_configs(configs: Config, algo_type: str) -> None:
             'reinforce',
             'td_zero',
             'td_zero_gae',
-        ], "adv_estimation_method must be string, and it values must be ['gae','gae-rtg','vtrace','plain','reinforce','td_zero','td_zero_gae']"
+            'cvar',
+        ], "adv_estimation_method must be string, and it values must be ['gae','gae-rtg','vtrace','plain','reinforce','td_zero','td_zero_gae','cvar']"
         if hasattr(configs, 'n_val_episodes'):
             assert (
                 isinstance(configs.n_val_episodes, int) and configs.n_val_episodes >= 0

@@ -127,7 +127,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self._episode_slices: list[tuple[int, int]] = []
         self._last_episode_slices: list[tuple[int, int]] = []
 
-        _valid = ['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce', 'td_zero', 'td_zero_gae']
+        _valid = ['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce', 'td_zero', 'td_zero_gae', 'cvar']
         assert self._penalty_coefficient >= 0, 'penalty_coefficient must be non-negative!'
         assert self._advantage_estimator in _valid
         assert self._cost_advantage_estimator in _valid
@@ -374,6 +374,15 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             deltas = rewards[:-1] + g * values[1:] - values[:-1]
             adv = discount_cumsum(deltas, g * lam)
             target_value = rewards[:-1] + g * values[1:]
+
+        elif estimator == 'cvar':
+            # CVaR-based GAE: `values` already holds CVaR_alpha estimates from the
+            # distributional critic (computed during rollout via cvar_value()).
+            # The TD-error and GAE accumulation are identical to standard GAE —
+            # the risk-sensitivity comes from the CVaR baseline, not this formula.
+            deltas = rewards[:-1] + g * values[1:] - values[:-1]
+            adv = discount_cumsum(deltas, g * lam)
+            target_value = adv + values[:-1]
 
         else:
             raise NotImplementedError

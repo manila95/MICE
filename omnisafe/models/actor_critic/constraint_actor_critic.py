@@ -63,6 +63,7 @@ class ConstraintActorCritic(ActorCritic):
     ) -> None:
         """Initialize an instance of :class:`ConstraintActorCritic`."""
         super().__init__(obs_space, act_space, model_cfgs, epochs)
+        self._cvar_alpha: float = 0.0  # set by PolicyGradient._init_model when adv_estimation_method='cvar'
         _critic_type = _resolve_critic_type(model_cfgs.critic)
         _n_q   = getattr(model_cfgs.critic, 'n_quantiles', 50)
         _n_tqc = getattr(model_cfgs.critic, 'tqc_n_critics', 2)
@@ -114,8 +115,15 @@ class ConstraintActorCritic(ActorCritic):
             log_prob: The log probability of the action.
         """
         with torch.no_grad():
-            value_r = self.reward_critic(obs)
-            value_c = self.cost_critic(obs)
+            if self._cvar_alpha > 0.0 and hasattr(self.reward_critic, 'cvar_value'):
+                value_r = self.reward_critic.cvar_value(obs, self._cvar_alpha)
+            else:
+                value_r = self.reward_critic(obs)
+
+            if self._cvar_alpha > 0.0 and hasattr(self.cost_critic, 'cvar_value'):
+                value_c = self.cost_critic.cvar_value(obs, self._cvar_alpha)
+            else:
+                value_c = self.cost_critic(obs)
 
             action = self.actor.predict(obs, deterministic=deterministic)
             log_prob = self.actor.log_prob(action)

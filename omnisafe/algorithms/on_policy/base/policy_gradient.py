@@ -96,6 +96,9 @@ class PolicyGradient(BaseAlgo):
             model_cfgs=self._cfgs.model_cfgs,
             epochs=self._cfgs.train_cfgs.epochs,
         ).to(self._device)
+        _cvar_alpha = getattr(self._cfgs.algo_cfgs, 'cvar_alpha', 0.0)
+        if _cvar_alpha > 0.0:
+            self._actor_critic._cvar_alpha = _cvar_alpha
 
         if distributed.world_size() > 1:
             distributed.sync_params(self._actor_critic)

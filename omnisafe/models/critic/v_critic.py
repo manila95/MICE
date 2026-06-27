@@ -172,6 +172,25 @@ class DistributionalVCritic(Critic):
             all_q = all_q.squeeze(0)
         return all_q, self.tau
 
+    def cvar_value(self, obs: torch.Tensor, alpha: float) -> list[torch.Tensor]:
+        """Return CVaR_alpha — mean of the bottom-alpha fraction of quantile atoms.
+
+        CVaR_alpha is the expected value conditional on being in the worst alpha
+        fraction of outcomes. alpha=1.0 reduces to the standard mean.
+
+        Args:
+            obs: Observation tensor.
+            alpha: Risk level in (0, 1].
+        """
+        unbatched = obs.dim() == 1
+        if unbatched:
+            obs = obs.unsqueeze(0)
+        all_q = torch.cat([net(obs) for net in self.net_lst], dim=-1)  # (B, K*N)
+        sorted_q = all_q.sort(dim=-1).values  # ascending
+        k = max(1, round(alpha * sorted_q.shape[-1]))
+        cvar = sorted_q[:, :k].mean(dim=-1)  # (B,)
+        return [cvar.squeeze(0) if unbatched else cvar]
+
 
 class IQNVCritic(Critic):
     """Implicit Quantile Networks (IQN) value critic.
@@ -293,3 +312,19 @@ class IQNVCritic(Critic):
         tau = torch.rand(self.n_quantiles, device=obs.device)
         q = self._forward_with_tau(obs, tau)  # (B, n)
         return q, tau
+
+    def cvar_value(self, obs: torch.Tensor, alpha: float) -> list[torch.Tensor]:
+        """Return CVaR_alpha by sampling tau ~ U(0, alpha).
+
+        IQN's implicit quantile representation lets us query any tau level, so
+        CVaR_alpha = E_{tau ~ U(0,alpha)}[Z_tau] is computed directly without sorting.
+
+        Args:
+            obs: Observation tensor.
+            alpha: Risk level in (0, 1].
+        """
+        tau = torch.rand(self.n_tau_eval, device=obs.device) * alpha
+        q = self._forward_with_tau(obs, tau)  # (B, n_eval) or (n_eval,)
+        if q.dim() == 1:
+            return [q.mean()]
+        return [q.mean(dim=-1)]

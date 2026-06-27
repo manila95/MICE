@@ -64,9 +64,13 @@ defaults:
     lam: 0.95
     # lambda for cost gae
     lam_c: 0.95
-    # advantage estimation method, options: gae, retrace
+    # advantage estimation method, options: gae, gae-rtg, vtrace, plain, reinforce, td_zero, td_zero_gae, cvar
     adv_estimation_method: gae
     cost_adv_estimation_method: ~
+    # CVaR risk level for 'cvar' advantage estimator (ignored for other methods).
+    # alpha in (0, 1]: 0.1 = bottom-10% worst-case, 1.0 = mean (same as gae).
+    # Requires a distributional critic (distributional: true in model_cfgs.critic).
+    cvar_alpha: 0.1
     n_val_episodes: 0
     # Huber threshold for distributional critic quantile loss
     dist_kappa: 1.0
