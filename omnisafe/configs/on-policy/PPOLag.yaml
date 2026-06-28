@@ -68,6 +68,8 @@ defaults:
     clip: 0.2
     # advantage estimation method, options: gae, retrace
     adv_estimation_method: gae
+    # alpha for CVaR
+    cvar_alpha: 0.0
     cost_adv_estimation_method: ~
     n_val_episodes: 0
     # Huber threshold for distributional critic quantile loss

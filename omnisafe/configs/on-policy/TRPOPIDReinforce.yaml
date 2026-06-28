@@ -69,6 +69,8 @@ defaults:
     clip: 0.2
     # advantage estimation method: reinforce uses A_t = G_t (raw MC return, no value baseline)
     adv_estimation_method: reinforce
+    # alpha for CVaR
+    cvar_alpha: 0.0
     cost_adv_estimation_method: ~
     n_val_episodes: 0
     # Huber threshold for distributional critic quantile loss
