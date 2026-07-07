@@ -67,6 +67,7 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
         device: torch.device = DEVICE_CPU,
         cost_gamma: float | None = None,
         cost_advantage_estimator: str | None = None,
+        finite_horizon: bool = False,
     ) -> None:
         """Initialize an instance of :class:`VectorOnPolicyBuffer`."""
         self._num_buffers: int = num_envs
@@ -88,6 +89,7 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
                 device=device,
                 cost_gamma=cost_gamma,
                 cost_advantage_estimator=cost_advantage_estimator,
+                finite_horizon=finite_horizon,
             )
             for _ in range(num_envs)
         ]

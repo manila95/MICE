@@ -96,9 +96,13 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         device: torch.device = DEVICE_CPU,
         cost_gamma: float | None = None,
         cost_advantage_estimator: AdvatageEstimator | None = None,
+        finite_horizon: bool = False,
     ) -> None:
         """Initialize an instance of :class:`OnPolicyBuffer`."""
         super().__init__(obs_space, act_space, size, device)
+        # When True, get() appends the stored remaining-horizon to each observation so the
+        # finite-horizon actor and critic consume the same augmented state during updates.
+        self._finite_horizon: bool = finite_horizon
 
         self._standardized_adv_r: bool = standardized_adv_r
         self._standardized_adv_c: bool = standardized_adv_c
@@ -111,6 +115,9 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self.data['value_c'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['target_value_c'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['logp'] = torch.zeros((size,), dtype=torch.float32, device=device)
+        # Remaining timesteps-to-go (H - t) at each stored state; used only by a finite-horizon
+        # critic to re-augment observations at update time. Left at zero when finite_horizon is off.
+        self.data['remaining_horizon'] = torch.zeros((size,), dtype=torch.float32, device=device)
 
         self._gamma: float = gamma
         self._cost_gamma: float = cost_gamma if cost_gamma is not None else gamma
@@ -237,8 +244,14 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self._episode_slices = []
         self.ptr, self.path_start_idx = 0, 0
 
+        obs = self.data['obs']
+        if self._finite_horizon:
+            # Augment every observation with its remaining horizon so the actor and critic (both
+            # widened by one input) see the same finite-horizon state during the update.
+            obs = torch.cat([obs, self.data['remaining_horizon'].unsqueeze(-1)], dim=-1)
+
         data = {
-            'obs': self.data['obs'],
+            'obs': obs,
             'act': self.data['act'],
             'target_value_r': self.data['target_value_r'],
             'adv_r': self.data['adv_r'],
@@ -249,6 +262,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             'value_c': self.data['value_c'],
             'adv_c': self.data['adv_c'],
             'target_value_c': self.data['target_value_c'],
+            'remaining_horizon': self.data['remaining_horizon'],
         }
 
         adv_mean, adv_std, *_ = distributed.dist_statistics_scalar(data['adv_r'])

@@ -54,6 +54,13 @@ class OnPolicyAdapter(OnlineAdapter):
         """Initialize an instance of :class:`OnPolicyAdapter`."""
         super().__init__(env_id, num_envs, seed, cfgs)
         self._epoch_cost_sum: float = 0.0
+        self._finite_horizon: bool = getattr(
+            getattr(cfgs.model_cfgs, 'critic', object()), 'finite_horizon', False,
+        )
+        if self._finite_horizon:
+            assert self._max_ep_len is not None, (
+                'finite_horizon requires the environment to define max_episode_steps.'
+            )
         self._reset_log()
 
     def rollout(  # pylint: disable=too-many-locals
@@ -84,7 +91,12 @@ class OnPolicyAdapter(OnlineAdapter):
             range(steps_per_epoch),
             description=f'Processing rollout for epoch: {logger.current_epoch}...',
         ):
-            act, value_r, value_c, logp = agent.step(obs)
+            # Remaining timesteps-to-go H - t for the current obs (t = steps already taken this
+            # episode, held in _ep_len before _log_value increments it). No-op when finite_horizon
+            # is off (remaining is ignored by the critic).
+            remaining = self._remaining(obs) if self._finite_horizon else None
+
+            act, value_r, value_c, logp = agent.step(obs, remaining=remaining)
             next_obs, reward, cost, terminated, truncated, info = self.step(act)
 
             self._log_value(reward=reward, cost=cost, info=info)
@@ -101,6 +113,10 @@ class OnPolicyAdapter(OnlineAdapter):
                 value_r=value_r,
                 value_c=value_c,
                 logp=logp,
+                remaining_horizon=(
+                    remaining if remaining is not None
+                    else torch.zeros(self._env.num_envs, device=obs.device)
+                ),
             )
 
             obs = next_obs
@@ -118,14 +134,29 @@ class OnPolicyAdapter(OnlineAdapter):
                     last_value_r = torch.zeros(1)
                     last_value_c = torch.zeros(1)
                     if not done:
-                        if epoch_end:
-                            _, last_value_r, last_value_c, _ = agent.step(obs[idx])
-                        if time_out:
+                        # Bootstrap value for the state after the last stored transition. For a
+                        # finite-horizon critic, a true timeout means the horizon was reached, so
+                        # there is no future reward within the horizon and the bootstrap stays 0.
+                        if self._finite_horizon and time_out:
+                            pass  # keep zeros: remaining horizon at the boundary is 0
+                        elif epoch_end and not time_out:
+                            # Episode cut mid-way by the epoch boundary: bootstrap from next obs.
+                            # After _log_value, _ep_len == t+1, so remaining = H - (t+1).
+                            boot_rem = (
+                                self._remaining(obs[idx], idx) if self._finite_horizon else None
+                            )
+                            _, last_value_r, last_value_c, _ = agent.step(
+                                obs[idx], remaining=boot_rem,
+                            )
+                            last_value_r = last_value_r.unsqueeze(0)
+                            last_value_c = last_value_c.unsqueeze(0)
+                        elif time_out:
+                            # Standard (non-finite-horizon) timeout: bootstrap from final obs.
                             _, last_value_r, last_value_c, _ = agent.step(
                                 info['final_observation'][idx],
                             )
-                        last_value_r = last_value_r.unsqueeze(0)
-                        last_value_c = last_value_c.unsqueeze(0)
+                            last_value_r = last_value_r.unsqueeze(0)
+                            last_value_c = last_value_c.unsqueeze(0)
 
                     if done or time_out:
                         self._log_metrics(logger, idx)
@@ -136,6 +167,28 @@ class OnPolicyAdapter(OnlineAdapter):
                         self._ep_len[idx] = 0.0
 
                     buffer.finish_path(last_value_r, last_value_c, idx)
+
+    def _remaining(
+        self,
+        obs: torch.Tensor,
+        idx: int | None = None,
+    ) -> torch.Tensor:
+        """Remaining timesteps-to-go ``H - t`` for a finite-horizon critic.
+
+        ``self._ep_len`` holds the number of steps already taken in each episode, so
+        ``H - _ep_len`` is the remaining horizon. Call before ``_log_value`` (which increments
+        ``_ep_len``) for the current observation; call after it for a bootstrap (next) observation.
+
+        Args:
+            obs: Observation, only used to place the result on the right device.
+            idx: If given, return the scalar remaining horizon for that single environment;
+                otherwise return the ``(num_envs,)`` vector.
+
+        Returns:
+            Remaining timesteps-to-go as a raw count (float tensor).
+        """
+        ep_len = self._ep_len if idx is None else self._ep_len[idx]
+        return (self._max_ep_len - ep_len).to(obs.device)
 
     def _log_value(
         self,

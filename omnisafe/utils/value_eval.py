@@ -6,7 +6,10 @@ import torch
 from rich.progress import Progress
 
 
-def estimate_true_value(agent, env, cfgs, discount_r, discount_c, eval_episodes=100, epoch=None):
+def estimate_true_value(
+    agent, env, cfgs, discount_r, discount_c, eval_episodes=100, epoch=None,
+    finite_horizon=False, max_ep_len=None,
+):
     """Estimate true V(s) vs. critic estimate by rolling out full episodes.
 
     Uses the provided (already-wrapped) environment directly so that observation
@@ -15,12 +18,25 @@ def estimate_true_value(agent, env, cfgs, discount_r, discount_c, eval_episodes=
     Two evaluation regimes:
     - Eval_s0: initial state of each episode — V(s_0) vs. G_0.
     - Eval_all: every visited state — V(s_t) vs. G_t (MC return from step t).
+
+    When ``finite_horizon`` is enabled the critic is a function of ``(obs, remaining)``, so the
+    per-env timestep is tracked and ``remaining = max_ep_len - t`` is fed to ``agent.step``. The
+    Monte-Carlo targets are already finite-horizon-correct because each episode ends at the horizon.
     """
     device = torch.device(cfgs.train_cfgs.device)
     num_envs = env.num_envs
 
+    # Per-env timestep t of the observation currently held (0 at reset). Only used to feed the
+    # remaining horizon to a finite-horizon critic.
+    t_env = [0] * num_envs
+
+    def _remaining():
+        if not finite_horizon:
+            return None
+        return torch.tensor([max_ep_len - t for t in t_env], dtype=torch.float32, device=device)
+
     obs, _ = env.reset()
-    act, cur_est_r, cur_est_c, _ = agent.step(obs)
+    act, cur_est_r, cur_est_c, _ = agent.step(obs, remaining=_remaining())
 
     # Per-env episode history: each entry is (est_r, est_c, reward, cost) at step t
     ep_history = [[] for _ in range(num_envs)]
@@ -52,6 +68,12 @@ def estimate_true_value(agent, env, cfgs, discount_r, discount_c, eval_episodes=
                 ))
 
             done = (terminated.bool() | truncated.bool()).squeeze(-1)
+
+            # Advance per-env timestep: reset to 0 on episode end, else t += 1. Matches the
+            # AutoReset wrapper so `next_obs` for a done env is a fresh initial state (t=0).
+            done_list = done.flatten().tolist()
+            for i in range(num_envs):
+                t_env[i] = 0 if done_list[i] else t_env[i] + 1
 
             newly_done = 0
             for i in done.nonzero(as_tuple=False).flatten().tolist():
@@ -90,7 +112,7 @@ def estimate_true_value(agent, env, cfgs, discount_r, discount_c, eval_episodes=
             progress.update(task, advance=newly_done)
 
             obs = next_obs
-            act, cur_est_r, cur_est_c, _ = agent.step(obs)
+            act, cur_est_r, cur_est_c, _ = agent.step(obs, remaining=_remaining())
 
     def _to_tensor(lst):
         return torch.tensor(lst, device=device, dtype=torch.float32)

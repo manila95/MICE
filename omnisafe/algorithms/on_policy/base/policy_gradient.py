@@ -135,6 +135,7 @@ class PolicyGradient(BaseAlgo):
             device=self._device,
             cost_gamma=getattr(self._cfgs.algo_cfgs, 'cost_gamma', None),
             cost_advantage_estimator=getattr(self._cfgs.algo_cfgs, 'cost_adv_estimation_method', None),
+            finite_horizon=getattr(self._cfgs.model_cfgs.critic, 'finite_horizon', False),
         )
 
     def _init_log(self) -> None:
@@ -310,6 +311,8 @@ class PolicyGradient(BaseAlgo):
                     discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma),
                     eval_episodes=eval_episodes,
                     epoch=epoch,
+                    finite_horizon=getattr(self._env, '_finite_horizon', False),
+                    max_ep_len=getattr(self._env, '_max_ep_len', None),
                 )
             self._logger.store({'Time/Rollout': time.time() - rollout_time})
 
@@ -539,7 +542,8 @@ class PolicyGradient(BaseAlgo):
 
         ``preupdate_pred_r``/``preupdate_pred_c`` should be ``data['value_r/c'].flatten()``
         (critic predictions collected during rollout, before any gradient step).  The AfterUpdate
-        predictions are always re-queried from the live network.
+        predictions are always re-queried from the live network. ``obs`` is the buffer observation,
+        already augmented with the remaining horizon when ``finite_horizon`` is enabled.
         """
         epoch = getattr(self, '_current_epoch', 0)
         eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
@@ -698,6 +702,9 @@ class PolicyGradient(BaseAlgo):
         Uses MSE loss for a standard VCritic, or quantile-regression Huber loss when a
         DistributionalVCritic is active (``model_cfgs.critic.distributional: true``).
 
+        For a finite-horizon critic, ``obs`` already carries the remaining-horizon feature (the
+        buffer augments it in ``get()``), so no per-call augmentation is needed here.
+
         Args:
             obs (torch.Tensor): The ``observation`` sampled from buffer.
             target_value_r (torch.Tensor): The ``target_value_r`` sampled from buffer.
@@ -729,6 +736,9 @@ class PolicyGradient(BaseAlgo):
 
         Uses MSE loss for a standard VCritic, or quantile-regression Huber loss when a
         DistributionalVCritic is active (``model_cfgs.critic.distributional: true``).
+
+        For a finite-horizon critic, ``obs`` already carries the remaining-horizon feature (the
+        buffer augments it in ``get()``), so no per-call augmentation is needed here.
 
         Args:
             obs (torch.Tensor): The ``observation`` sampled from buffer.

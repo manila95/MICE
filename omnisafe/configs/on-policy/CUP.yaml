@@ -137,6 +137,8 @@ defaults:
       iqn_embed_dim: 64
       iqn_n_cos: 64
       iqn_n_tau_eval: 32
+      # finite-horizon critic: condition V on remaining timesteps-to-go (H - t)
+      finite_horizon: false
   # lagrangian configurations
   lagrange_cfgs:
     # Tolerance of constraint violation

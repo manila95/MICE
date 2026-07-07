@@ -35,6 +35,59 @@ from omnisafe.utils.config import Config
 from omnisafe.utils.tools import get_device
 
 
+def _infer_max_ep_len(env: object, env_id: str | None = None) -> int | None:
+    """Best-effort discovery of the episode horizon H (max timesteps).
+
+    Different env families expose the horizon differently, and the value can raise on vectorized
+    wrappers (whose ``max_episode_steps`` property may dereference a ``None`` child — and whose
+    subprocess children are unreachable by attribute traversal). This walks the wrapper chain and,
+    failing that, consults the gymnasium registry by ``env_id``. Returns the first positive integer
+    horizon found, or ``None`` if the env is genuinely unlimited.
+    """
+    visited: set[int] = set()
+
+    def _try(obj: object) -> int | None:
+        if obj is None or id(obj) in visited:
+            return None
+        visited.add(id(obj))
+        # Direct horizon attributes, then the gym spec, then safety-gymnasium's task.num_steps.
+        for attr in ('max_episode_steps', '_max_episode_steps'):
+            try:
+                val = getattr(obj, attr, None)
+            except Exception:  # pylint: disable=broad-except
+                val = None
+            if isinstance(val, int) and val > 0:
+                return val
+        spec = getattr(obj, 'spec', None)
+        spec_val = getattr(spec, 'max_episode_steps', None) if spec is not None else None
+        if isinstance(spec_val, int) and spec_val > 0:
+            return spec_val
+        task = getattr(obj, 'task', None)
+        task_val = getattr(task, 'num_steps', None) if task is not None else None
+        if isinstance(task_val, int) and task_val > 0:
+            return task_val
+        for inner in ('_env', 'env', 'unwrapped'):
+            found = _try(getattr(obj, inner, None))
+            if found is not None:
+                return found
+        return None
+
+    found = _try(env)
+    if found is not None:
+        return found
+    # Fallback: consult the gymnasium registry (process-independent; works for async vec envs).
+    if env_id is not None:
+        try:
+            import gymnasium  # local import to avoid a hard dependency at module load
+
+            spec_val = gymnasium.spec(env_id).max_episode_steps
+            if isinstance(spec_val, int) and spec_val > 0:
+                return spec_val
+        except Exception:  # pylint: disable=broad-except
+            pass
+    return None
+
+
 class OnlineAdapter:
     """Online Adapter for OmniSafe.
 
@@ -69,6 +122,9 @@ class OnlineAdapter:
             env_cfgs = self._cfgs.env_cfgs.todict()
 
         self._env: CMDP = make(env_id, num_envs=num_envs, device=self._device, **env_cfgs)
+        # Episode horizon H (max timesteps), captured before wrapping. Used by finite-horizon
+        # critics to compute the remaining timesteps-to-go. May be None for unlimited envs.
+        self._max_ep_len: int | None = _infer_max_ep_len(self._env, env_id)
         self._wrapper(
             obs_normalize=cfgs.algo_cfgs.obs_normalize,
             reward_normalize=cfgs.algo_cfgs.reward_normalize,

@@ -72,7 +72,7 @@ class ConstraintActorCritic(ActorCritic):
         _ncos  = getattr(model_cfgs.critic, 'iqn_n_cos', 64)
         _eval  = getattr(model_cfgs.critic, 'iqn_n_tau_eval', 32)
         self.cost_critic: Critic = CriticBuilder(
-            obs_space=obs_space,
+            obs_space=self._model_obs_space,
             act_space=act_space,
             hidden_sizes=model_cfgs.critic.hidden_sizes,
             activation=model_cfgs.critic.activation,
@@ -100,12 +100,15 @@ class ConstraintActorCritic(ActorCritic):
         self,
         obs: torch.Tensor,
         deterministic: bool = False,
+        remaining: torch.Tensor | float | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Choose action based on observation.
 
         Args:
             obs (torch.Tensor): Observation from environments.
             deterministic (bool, optional): Whether to use deterministic policy. Defaults to False.
+            remaining (torch.Tensor, optional): Remaining timesteps-to-go for a finite-horizon
+                critic. Ignored unless ``finite_horizon`` is enabled.
 
         Returns:
             action: The deterministic action if ``deterministic`` is True, otherwise the action with
@@ -115,6 +118,7 @@ class ConstraintActorCritic(ActorCritic):
             log_prob: The log probability of the action.
         """
         with torch.no_grad():
+            obs = self.augment_obs(obs, remaining)
             if self._cvar_alpha > 0.0 and hasattr(self.reward_critic, 'cvar_value'):
                 value_r = self.reward_critic.cvar_value(obs, self._cvar_alpha)
             else:
@@ -134,12 +138,15 @@ class ConstraintActorCritic(ActorCritic):
         self,
         obs: torch.Tensor,
         deterministic: bool = False,
+        remaining: torch.Tensor | float | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Choose action based on observation.
 
         Args:
             obs (torch.Tensor): Observation from environments.
             deterministic (bool, optional): Whether to use deterministic policy. Defaults to False.
+            remaining (torch.Tensor, optional): Remaining timesteps-to-go for a finite-horizon
+                critic. Ignored unless ``finite_horizon`` is enabled.
 
         Returns:
             action: The deterministic action if ``deterministic`` is True, otherwise the action with
@@ -148,4 +155,4 @@ class ConstraintActorCritic(ActorCritic):
             value_c: The cost value of the observation.
             log_prob: The log probability of the action.
         """
-        return self.step(obs, deterministic=deterministic)
+        return self.step(obs, deterministic=deterministic, remaining=remaining)

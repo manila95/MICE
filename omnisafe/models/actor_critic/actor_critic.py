@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+import numpy as np
 import torch
+from gymnasium import spaces
 from torch import nn, optim
 from torch.optim.lr_scheduler import ConstantLR, LinearLR
 
@@ -35,6 +37,21 @@ def _resolve_critic_type(critic_cfg) -> str:
         return 'v'
     dist_type = getattr(critic_cfg, 'dist_type', 'qr')
     return {'qr': 'v_qr', 'tqc': 'v_tqc', 'iqn': 'v_iqn'}.get(dist_type, 'v_qr')
+
+
+def _augment_obs_space(obs_space: OmnisafeSpace) -> OmnisafeSpace:
+    """Return a copy of ``obs_space`` with one extra feature for the remaining horizon.
+
+    The extra dimension carries the remaining timesteps-to-go (a raw count) so that both the actor
+    and the critic can condition on it. Bounds for the new feature are unbounded — the value is
+    metadata for the input width only and is not used to clip observations.
+    """
+    assert isinstance(obs_space, spaces.Box) and len(obs_space.shape) == 1, (
+        'finite_horizon only supports 1-D Box observation spaces.'
+    )
+    low = np.append(obs_space.low, -np.inf).astype(obs_space.dtype)
+    high = np.append(obs_space.high, np.inf).astype(obs_space.dtype)
+    return spaces.Box(low=low, high=high, dtype=obs_space.dtype)
 
 
 class ActorCritic(nn.Module):
@@ -75,8 +92,17 @@ class ActorCritic(nn.Module):
         """Initialize an instance of :class:`ActorCritic`."""
         super().__init__()
 
+        # Finite-horizon: the observation is augmented with the remaining timesteps-to-go, seen
+        # uniformly by BOTH the actor and the critic (the policy becomes time-aware). We widen the
+        # observation space by one feature and build every network against it.
+        self._finite_horizon: bool = getattr(model_cfgs.critic, 'finite_horizon', False)
+        self._model_obs_space: OmnisafeSpace = (
+            _augment_obs_space(obs_space) if self._finite_horizon else obs_space
+        )
+        model_obs_space = self._model_obs_space
+
         self.actor: Actor = ActorBuilder(
-            obs_space=obs_space,
+            obs_space=model_obs_space,
             act_space=act_space,
             hidden_sizes=model_cfgs.actor.hidden_sizes,
             activation=model_cfgs.actor.activation,
@@ -92,7 +118,7 @@ class ActorCritic(nn.Module):
         _ncos  = getattr(model_cfgs.critic, 'iqn_n_cos', 64)
         _eval  = getattr(model_cfgs.critic, 'iqn_n_tau_eval', 32)
         self.reward_critic: Critic = CriticBuilder(
-            obs_space=obs_space,
+            obs_space=model_obs_space,
             act_space=act_space,
             hidden_sizes=model_cfgs.critic.hidden_sizes,
             activation=model_cfgs.critic.activation,
@@ -134,16 +160,50 @@ class ActorCritic(nn.Module):
                     total_iters=epochs,
                 )
 
+    def augment_obs(
+        self,
+        obs: torch.Tensor,
+        remaining: torch.Tensor | float | None,
+    ) -> torch.Tensor:
+        """Append the remaining horizon to ``obs`` for a finite-horizon actor-critic.
+
+        When ``finite_horizon`` is disabled this is a no-op and returns ``obs`` unchanged, so it is
+        safe to call unconditionally. The remaining horizon is stored/passed as a raw timestep
+        count (``H - t``); it is broadcast to the observation's batch shape and concatenated as the
+        last feature. Both the actor and the critic consume this augmented observation.
+
+        Args:
+            obs: Observation, shape ``(obs_dim,)`` or ``(batch, obs_dim)``.
+            remaining: Remaining timesteps-to-go, a scalar or a ``(batch,)`` tensor.
+
+        Returns:
+            The (possibly) augmented observation the actor and critic should consume.
+        """
+        if not self._finite_horizon:
+            return obs
+        if remaining is None:
+            # Graceful fallback (e.g. a caller that does not track the horizon): treat as 0.
+            remaining = 0.0
+        r = torch.as_tensor(remaining, dtype=obs.dtype, device=obs.device)
+        if obs.dim() == 1:  # unbatched (obs_dim,)
+            return torch.cat([obs, r.reshape(1)], dim=-1)
+        if r.dim() == 0:
+            r = r.expand(obs.shape[0])
+        return torch.cat([obs, r.reshape(obs.shape[0], 1)], dim=-1)
+
     def step(
         self,
         obs: torch.Tensor,
         deterministic: bool = False,
+        remaining: torch.Tensor | float | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Choose the action based on the observation. used in rollout without gradient.
 
         Args:
             obs (torch.tensor): The observation from environments.
             deterministic (bool, optional): Whether to use deterministic action. Defaults to False.
+            remaining (torch.Tensor, optional): Remaining timesteps-to-go for a finite-horizon
+                actor-critic. Ignored unless ``finite_horizon`` is enabled.
 
         Returns:
             action: The deterministic action if ``deterministic`` is True, otherwise the action with
@@ -152,6 +212,7 @@ class ActorCritic(nn.Module):
             log_prob: The log probability of the action.
         """
         with torch.no_grad():
+            obs = self.augment_obs(obs, remaining)
             value_r = self.reward_critic(obs)
             act = self.actor.predict(obs, deterministic=deterministic)
             log_prob = self.actor.log_prob(act)
