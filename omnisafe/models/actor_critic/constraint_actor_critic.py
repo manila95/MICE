@@ -128,11 +128,18 @@ class ConstraintActorCritic(ActorCritic):
         """
         sr_cfgs = model_cfgs.sr_cfgs
         obs_dim = obs_space.shape[0]
+        # Every hidden layer of the trunk is sized to match sr_dim (keeping the configured
+        # depth): the layer that produces phi/psi is a plain linear map with no nonlinearity of
+        # its own, so its output can never carry more independent information than the last
+        # hidden layer feeding it. A narrower last hidden layer would silently cap psi/phi's
+        # effective rank below sr_dim (wasted capacity in shared_trunk mode; a rank-deficient,
+        # exactly-singular-without-regularization ridge Gram matrix in td_ridge mode).
+        hidden_sizes = [sr_cfgs.sr_dim] * len(sr_cfgs.hidden_sizes)
 
         if self._sr_mode == 'shared_trunk':
             trunk = SuccessorRepresentationTrunk(
                 obs_dim=obs_dim,
-                hidden_sizes=list(sr_cfgs.hidden_sizes),
+                hidden_sizes=hidden_sizes,
                 sr_dim=sr_cfgs.sr_dim,
                 activation=sr_cfgs.activation,
                 weight_initialization_mode=model_cfgs.weight_initialization_mode,
@@ -160,7 +167,7 @@ class ConstraintActorCritic(ActorCritic):
         elif self._sr_mode == 'td_ridge':
             trunk = TDRidgeSuccessorRepresentationTrunk(
                 obs_dim=obs_dim,
-                hidden_sizes=list(sr_cfgs.hidden_sizes),
+                hidden_sizes=hidden_sizes,
                 sr_dim=sr_cfgs.sr_dim,
                 activation=sr_cfgs.activation,
                 weight_initialization_mode=model_cfgs.weight_initialization_mode,

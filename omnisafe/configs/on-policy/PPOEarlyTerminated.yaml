@@ -139,7 +139,9 @@ defaults:
       sr_mode: shared_trunk
       # dimensionality of the shared successor-feature vector
       sr_dim: 64
-      # hidden layer sizes of the shared trunk / psi network
+      # hidden layer sizes of the shared trunk / psi network -- every layer's width is
+      # overridden to sr_dim at construction time (only the depth, i.e. len(hidden_sizes),
+      # is actually used; a narrower last layer would silently cap psi/phi's rank below sr_dim)
       hidden_sizes: [64, 64]
       # activation function of the trunk
       activation: tanh
