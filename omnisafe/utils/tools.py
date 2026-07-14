@@ -182,7 +182,14 @@ def custom_cfgs_to_dict(key_list: str, value: Any) -> dict[str, Any]:
         value = int(value)
     elif value.startswith('[') and value.endswith(']'):
         value = value[1:-1]
-        value = value.split(',')
+        items = []
+        for item in value.split(','):
+            item = item.strip()
+            try:
+                items.append(int(item))
+            except ValueError:
+                items.append(float(item))
+        value = items
     else:
         value = str(value)
     keys_split = key_list.replace('-', '_').split(':')
