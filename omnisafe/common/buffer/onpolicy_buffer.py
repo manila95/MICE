@@ -96,6 +96,9 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         device: torch.device = DEVICE_CPU,
         cost_gamma: float | None = None,
         cost_advantage_estimator: AdvatageEstimator | None = None,
+        sr_dim: int | None = None,
+        lam_sr: float = 0.95,
+        gamma_sr: float | None = None,
     ) -> None:
         """Initialize an instance of :class:`OnPolicyBuffer`."""
         super().__init__(obs_space, act_space, size, device)
@@ -132,6 +135,17 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         assert self._advantage_estimator in _valid
         assert self._cost_advantage_estimator in _valid
 
+        # successor-representation (``td_ridge`` mode) extra fields: a d-dimensional feature
+        # stream ``phi``/``psi`` trained with the same estimator machinery as the scalar
+        # reward/cost streams above (see :meth:`finish_path`).
+        self._sr_dim: int | None = sr_dim
+        self._lam_sr: float = lam_sr
+        self._gamma_sr: float = gamma if gamma_sr is None else gamma_sr
+        if self._sr_dim is not None:
+            self.data['phi'] = torch.zeros((size, sr_dim), dtype=torch.float32, device=device)
+            self.data['psi'] = torch.zeros((size, sr_dim), dtype=torch.float32, device=device)
+            self.data['target_sr'] = torch.zeros((size, sr_dim), dtype=torch.float32, device=device)
+
     @property
     def standardized_adv_r(self) -> bool:
         """Whether to standardize the advantages of the actor."""
@@ -160,6 +174,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self,
         last_value_r: torch.Tensor | None = None,
         last_value_c: torch.Tensor | None = None,
+        last_psi: torch.Tensor | None = None,
     ) -> None:
         """Finish the current path and calculate the advantages of state-action pairs.
 
@@ -171,12 +186,18 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             #. Calculate the discounted return.
             #. Calculate the advantages of the reward.
             #. Calculate the advantages of the cost.
+            #. (``td_ridge`` successor-representation mode only) Calculate the vector-valued
+               successor-representation target, using the same estimator machinery as steps
+               2-3 above, applied to the ``phi``/``psi`` feature stream instead of the scalar
+               reward/cost stream.
 
         Args:
             last_value_r (torch.Tensor, optional): The value of the last state of the current path.
                 Defaults to torch.zeros(1).
             last_value_c (torch.Tensor, optional): The value of the last state of the current path.
                 Defaults to torch.zeros(1).
+            last_psi (torch.Tensor, optional): The successor-representation feature of the last
+                state of the current path (``td_ridge`` mode only). Defaults to torch.zeros(sr_dim).
         """
         if last_value_r is None:
             last_value_r = torch.zeros(1, device=self._device)
@@ -217,6 +238,23 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self.data['adv_c'][path_slice] = adv_c
         self.data['target_value_c'][path_slice] = target_value_c
 
+        if self._sr_dim is not None:
+            if last_psi is None:
+                last_psi = torch.zeros(self._sr_dim, device=self._device)
+            last_psi = last_psi.to(self._device).reshape(1, self._sr_dim)
+            # mirrors the scalar reward/cost case: the bootstrap value is appended as the
+            # pseudo-final entry of the "reward" stream too, so gae-rtg/plain/reinforce-style
+            # rewards-to-go targets correctly fold in the truncation bootstrap.
+            phi_with_boot = torch.cat([self.data['phi'][path_slice], last_psi], dim=0)
+            psi_with_boot = torch.cat([self.data['psi'][path_slice], last_psi], dim=0)
+            _, target_sr = self._calculate_adv_and_value_targets(
+                psi_with_boot,
+                phi_with_boot,
+                lam=self._lam_sr,
+                gamma=self._gamma_sr,
+            )
+            self.data['target_sr'][path_slice] = target_sr
+
         self._episode_slices.append((self.path_start_idx, self.ptr))
         self.path_start_idx = self.ptr
 
@@ -250,6 +288,11 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             'adv_c': self.data['adv_c'],
             'target_value_c': self.data['target_value_c'],
         }
+        if self._sr_dim is not None:
+            data['phi'] = self.data['phi']
+            data['target_sr'] = self.data['target_sr']
+            data['reward'] = self.data['reward']
+            data['cost'] = self.data['cost']
 
         adv_mean, adv_std, *_ = distributed.dist_statistics_scalar(data['adv_r'])
         cadv_mean, *_ = distributed.dist_statistics_scalar(data['adv_c'])
@@ -417,8 +460,8 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             AssertionError: If the input tensors are scalars.
             AssertionError: If c_bar is greater than rho_bar.
         """
-        assert values.ndim == 1, 'Please provide arrays instead of scalars'
-        assert rewards.ndim == 1, 'Please provide arrays instead of scalars'
+        assert values.ndim in (1, 2), 'Please provide arrays instead of scalars'
+        assert rewards.ndim in (1, 2), 'Please provide arrays instead of scalars'
         assert policy_action_probs.ndim == 1, 'Please provide arrays instead of scalars'
         assert behavior_action_probs.ndim == 1, 'Please provide arrays instead of scalars'
         assert c_bar <= rho_bar, 'c_bar should be less than or equal to rho_bar'
@@ -434,6 +477,11 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             rhos,
             torch.as_tensor(c_bar),
         )  # pylint: disable=assignment-from-no-return
+        if values.ndim == 2:
+            # broadcast the per-timestep scalar importance ratio against a (T, D) feature
+            # stream (used for the successor-representation vector target).
+            clip_rhos = clip_rhos.unsqueeze(-1)
+            clip_cs = clip_cs.unsqueeze(-1)
         v_s = values[:-1].clone()  # copy all values except bootstrap value
         last_v_s = values[-1]  # bootstrap from last state
 

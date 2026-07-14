@@ -39,8 +39,13 @@ def estimate_true_value(agent, env, cfgs, discount_r, discount_c, eval_episodes=
         while episodes_done < eval_episodes:
             next_obs, r, c, terminated, truncated, _ = env.step(act)
 
-            r_sq = r.squeeze(-1)
-            c_sq = c.squeeze(-1)
+            # ``.squeeze(-1)`` is unsafe here: when num_envs == 1 a (1,) or (1, 1) reward
+            # collapses all the way to a 0-d scalar (there is no trailing size-1 feature dim to
+            # remove, only the batch dim), breaking the per-env indexing below. ``.reshape``
+            # instead pins the shape to exactly ``(num_envs,)`` regardless of whether the env
+            # returns ``(num_envs,)`` or ``(num_envs, 1)``.
+            r_sq = r.reshape(num_envs)
+            c_sq = c.reshape(num_envs)
 
             # Record V(s_t), V_c(s_t), r_t, c_t BEFORE moving to next state
             for i in range(num_envs):
@@ -51,7 +56,7 @@ def estimate_true_value(agent, env, cfgs, discount_r, discount_c, eval_episodes=
                     c_sq[i].item(),
                 ))
 
-            done = (terminated.bool() | truncated.bool()).squeeze(-1)
+            done = (terminated.bool() | truncated.bool()).reshape(num_envs)
 
             newly_done = 0
             for i in done.nonzero(as_tuple=False).flatten().tolist():

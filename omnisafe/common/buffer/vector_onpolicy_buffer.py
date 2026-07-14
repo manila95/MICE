@@ -67,6 +67,9 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
         device: torch.device = DEVICE_CPU,
         cost_gamma: float | None = None,
         cost_advantage_estimator: str | None = None,
+        sr_dim: int | None = None,
+        lam_sr: float = 0.95,
+        gamma_sr: float | None = None,
     ) -> None:
         """Initialize an instance of :class:`VectorOnPolicyBuffer`."""
         self._num_buffers: int = num_envs
@@ -88,6 +91,9 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
                 device=device,
                 cost_gamma=cost_gamma,
                 cost_advantage_estimator=cost_advantage_estimator,
+                sr_dim=sr_dim,
+                lam_sr=lam_sr,
+                gamma_sr=gamma_sr,
             )
             for _ in range(num_envs)
         ]
@@ -107,12 +113,13 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
         last_value_r: torch.Tensor | None = None,
         last_value_c: torch.Tensor | None = None,
         idx: int = 0,
+        last_psi: torch.Tensor | None = None,
     ) -> None:
         """Get the data in the buffer.
 
         In vector-on-policy buffer, we get the data from each buffer and then concatenate them.
         """
-        self.buffers[idx].finish_path(last_value_r, last_value_c)
+        self.buffers[idx].finish_path(last_value_r, last_value_c, last_psi)
 
     def get_episode_slices(self) -> list[tuple[int, int]]:
         """Return (start, end) index pairs for every episode in the concatenated buffer.
