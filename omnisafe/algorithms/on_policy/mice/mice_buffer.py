@@ -45,6 +45,7 @@ class MICEBuffer(OnPolicyBuffer):
         no_intrinsic_in_deltas: bool = False,
         cost_gamma: Optional[float] = None,
         cost_advantage_estimator: Optional[str] = None,
+        cost_critic_type: Optional[str] = None,
     ):
         super().__init__(
             obs_space,
@@ -60,6 +61,7 @@ class MICEBuffer(OnPolicyBuffer):
             device,
             cost_gamma=cost_gamma,
             cost_advantage_estimator=cost_advantage_estimator,
+            cost_critic_type=cost_critic_type,
         )
         self.data['intrinsic_costs'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['ep_discount_ci'] = torch.zeros((size,), dtype=torch.float32, device=device)

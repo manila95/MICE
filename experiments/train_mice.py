@@ -213,8 +213,10 @@ if __name__ == '__main__':
         type=str,
         default=None,
         metavar='METHOD',
-        choices=['td_zero', 'td_zero_gae', 'gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce'],
-        help='Advantage estimation method for cost; defaults to --adv-estimation-method if unset',
+        choices=['td_zero', 'td_zero_gae', 'gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce', 'raw_prob'],
+        help='Advantage estimation method for cost; defaults to --adv-estimation-method if unset. '
+        "'raw_prob' uses the cost critic's raw prediction directly (no discounting/bootstrapping); "
+        'intended for use with --model_cfgs.cost_critic_type hazard.',
     )
     args, unparsed_args = parser.parse_known_args()
     # Handle both '--key value' and '--key=value' (wandb sweep format).
