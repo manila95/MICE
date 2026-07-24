@@ -66,6 +66,10 @@ defaults:
     lam_c: 0.95
     # advantage estimation method, options: gae, retrace
     adv_estimation_method: gae
+    # cost advantage estimation method; ~ falls back to adv_estimation_method (gae).
+    # If model_cfgs.cost_critic_type is "hazard", set this to "raw_prob" to use the hazard
+    # critic's predicted probability directly as the cost advantage signal instead of running
+    # it through discounted GAE bootstrapping.
     cost_adv_estimation_method: ~
     n_val_episodes: 0
     # standardize reward advantage
@@ -115,6 +119,9 @@ defaults:
     exploration_noise_anneal: False
     # std upper bound, and lower bound
     std_range: [0.5, 0.1]
+    # cost critic type, options: "v" (regresses discounted cost-to-go, default) or "hazard"
+    # (predicts P(cost > 0) at the current state, i.e. proximity to a hazardous state)
+    cost_critic_type: v
     # actor network configurations
     actor:
       # hidden layer sizes

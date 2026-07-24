@@ -36,9 +36,9 @@ from torch.types import Device
 RenderFrame = TypeVar('RenderFrame')
 OmnisafeSpace = Union[Box, Discrete]
 Activation = Literal['identity', 'relu', 'sigmoid', 'softplus', 'tanh']
-AdvatageEstimator = Literal['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce']
+AdvatageEstimator = Literal['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce', 'raw_prob']
 InitFunction = Literal['kaiming_uniform', 'xavier_normal', 'glorot', 'xavier_uniform', 'orthogonal']
-CriticType = Literal['v', 'q']
+CriticType = Literal['v', 'q', 'hazard']
 ActorType = Literal['gaussian_learning', 'gaussian_sac', 'mlp', 'vae', 'perturbation']
 DEVICE_CPU = torch.device('cpu')
 

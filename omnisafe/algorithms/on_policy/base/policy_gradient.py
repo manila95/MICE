@@ -31,6 +31,7 @@ from omnisafe.algorithms.base_algo import BaseAlgo
 from omnisafe.common.buffer import VectorOnPolicyBuffer
 from omnisafe.common.logger import Logger
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
+from omnisafe.models.critic.hazard_critic import HazardCritic
 from omnisafe.utils import distributed
 from omnisafe.utils.value_eval import estimate_true_value
 
@@ -131,6 +132,7 @@ class PolicyGradient(BaseAlgo):
             device=self._device,
             cost_gamma=getattr(self._cfgs.algo_cfgs, 'cost_gamma', None),
             cost_advantage_estimator=getattr(self._cfgs.algo_cfgs, 'cost_adv_estimation_method', None),
+            cost_critic_type=getattr(self._cfgs.model_cfgs, 'cost_critic_type', 'v'),
         )
 
     def _init_log(self) -> None:
@@ -669,14 +671,19 @@ class PolicyGradient(BaseAlgo):
     def _update_cost_critic(self, obs: torch.Tensor, target_value_c: torch.Tensor) -> None:
         r"""Update value network under a double for loop.
 
-        The loss function is ``MSE loss``, which is defined in ``torch.nn.MSELoss``.
-        Specifically, the loss function is defined as:
+        By default, the loss function is ``MSE loss``, which is defined in
+        ``torch.nn.MSELoss``. Specifically, the loss function is defined as:
 
         .. math::
 
             L = \frac{1}{N} \sum_{i=1}^N (\hat{V} - V)^2
 
         where :math:`\hat{V}` is the predicted cost and :math:`V` is the target cost.
+
+        When the cost critic is a :class:`~omnisafe.models.critic.hazard_critic.HazardCritic`,
+        which predicts the probability of incurring a cost rather than a discounted cost-to-go,
+        the loss function is instead binary cross-entropy between the predicted probability and
+        the (buffer-provided) binary cost indicator target.
 
         #. Compute the loss function.
         #. Add the ``critic norm`` to the loss function if ``use_critic_norm`` is ``True``.
@@ -688,7 +695,11 @@ class PolicyGradient(BaseAlgo):
             target_value_c (torch.Tensor): The ``target_value_c`` sampled from buffer.
         """
         self._actor_critic.cost_critic_optimizer.zero_grad()
-        loss = nn.functional.mse_loss(self._actor_critic.cost_critic(obs)[0], target_value_c)
+        pred_value_c = self._actor_critic.cost_critic(obs)[0]
+        if isinstance(self._actor_critic.cost_critic, HazardCritic):
+            loss = nn.functional.binary_cross_entropy(pred_value_c, target_value_c)
+        else:
+            loss = nn.functional.mse_loss(pred_value_c, target_value_c)
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             for param in self._actor_critic.cost_critic.parameters():

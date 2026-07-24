@@ -96,6 +96,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         device: torch.device = DEVICE_CPU,
         cost_gamma: float | None = None,
         cost_advantage_estimator: AdvatageEstimator | None = None,
+        cost_critic_type: str | None = None,
     ) -> None:
         """Initialize an instance of :class:`OnPolicyBuffer`."""
         super().__init__(obs_space, act_space, size, device)
@@ -121,13 +122,23 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self._cost_advantage_estimator: AdvatageEstimator = (
             cost_advantage_estimator if cost_advantage_estimator is not None else advantage_estimator
         )
+        self._cost_critic_is_classifier: bool = cost_critic_type == 'hazard'
         self.ptr: int = 0
         self.path_start_idx: int = 0
         self.max_size: int = size
         self._episode_slices: list[tuple[int, int]] = []
         self._last_episode_slices: list[tuple[int, int]] = []
 
-        _valid = ['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce', 'td_zero', 'td_zero_gae']
+        _valid = [
+            'gae',
+            'gae-rtg',
+            'vtrace',
+            'plain',
+            'reinforce',
+            'td_zero',
+            'td_zero_gae',
+            'raw_prob',
+        ]
         assert self._penalty_coefficient >= 0, 'penalty_coefficient must be non-negative!'
         assert self._advantage_estimator in _valid
         assert self._cost_advantage_estimator in _valid
@@ -211,6 +222,10 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             gamma=self._cost_gamma,
             advantage_estimator=self._cost_advantage_estimator,
         )
+        if self._cost_critic_is_classifier:
+            # The hazard critic predicts P(cost > 0 at this state), so its regression target
+            # is the immediate binary cost indicator rather than a discounted-return target.
+            target_value_c = (self.data['cost'][path_slice] > 0).float()
 
         self.data['adv_r'][path_slice] = adv_r
         self.data['target_value_r'][path_slice] = target_value_r
@@ -374,6 +389,14 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             deltas = rewards[:-1] + g * values[1:] - values[:-1]
             adv = discount_cumsum(deltas, g * lam)
             target_value = rewards[:-1] + g * values[1:]
+
+        elif estimator == 'raw_prob':
+            # Use the critic's own (undiscounted) prediction at each state directly as the
+            # advantage signal, with no TD bootstrapping. Intended for critics whose output is a
+            # probability (e.g. HazardCritic) rather than a discounted-return value function, for
+            # which the usual delta_t = r_t + gamma*V(s_{t+1}) - V(s_t) recursion does not apply.
+            adv = values[:-1]
+            target_value = values[:-1]
 
         else:
             raise NotImplementedError
