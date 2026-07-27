@@ -31,6 +31,8 @@ from omnisafe.algorithms.base_algo import BaseAlgo
 from omnisafe.common.buffer import VectorOnPolicyBuffer
 from omnisafe.common.logger import Logger
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
+from omnisafe.models.base import Critic
+from omnisafe.models.critic.v_critic_hlgauss import VCriticHLGauss
 from omnisafe.utils import distributed
 from omnisafe.utils.value_eval import estimate_true_value
 
@@ -230,6 +232,10 @@ class PolicyGradient(BaseAlgo):
                 self._logger.register_key(f'Value/{split}/{stage}/RewardPredTrueCorr')
             self._logger.register_key(f'Value/{split}/RewardTargetTrueCorr')
 
+        if isinstance(self._actor_critic.reward_critic, VCriticHLGauss):
+            for split in _splits:
+                self._register_hl_gauss_keys(split, 'Reward')
+
         if self._cfgs.algo_cfgs.use_cost:
             # log information about cost critic
             self._logger.register_key('Loss/Loss_cost_critic', delta=True)
@@ -239,6 +245,9 @@ class PolicyGradient(BaseAlgo):
                     self._logger.register_key(f'Value/{split}/{stage}/CostCriticCorr')
                     self._logger.register_key(f'Value/{split}/{stage}/CostPredTrueCorr')
                 self._logger.register_key(f'Value/{split}/CostTargetTrueCorr')
+            if isinstance(self._actor_critic.cost_critic, VCriticHLGauss):
+                for split in _splits:
+                    self._register_hl_gauss_keys(split, 'Cost')
 
         self._logger.register_key('Time/Total')
         self._logger.register_key('Time/Rollout')
@@ -508,6 +517,134 @@ class PolicyGradient(BaseAlgo):
                 split='Val',
             )
 
+    _HL_GAUSS_METRICS = (
+        'DistStd',
+        'DistStdRatio',
+        'DistEntropy',
+        'DistEntropyRatio',
+        'DistSkew',
+        'DistEdgeMassLow',
+        'DistEdgeMassHigh',
+        'DistFracMultimodal',
+    )
+
+    def _register_hl_gauss_keys(self, split: str, tag: str) -> None:
+        """Register the HL-Gauss distribution-shape keys for one split and critic.
+
+        Args:
+            split (str): Either ``'Train'`` or ``'Val'``.
+            tag (str): Either ``'Reward'`` or ``'Cost'``.
+        """
+        for metric in self._HL_GAUSS_METRICS:
+            self._logger.register_key(f'Value/{split}/{tag}{metric}')
+
+    def _log_hl_gauss_diagnostics(
+        self,
+        critic: Critic,
+        obs: torch.Tensor,
+        target: torch.Tensor,
+        true_ret: torch.Tensor,
+        idx: torch.Tensor,
+        tag: str,
+        split: str,
+        n_panels: int = 6,
+    ) -> None:
+        """Log what an :class:`VCriticHLGauss` critic predicts *as a distribution*, not just its mean.
+
+        A classification critic can only be called distributional if its predicted mass is spread
+        more widely than the smearing its own targets carry.  ``target_to_probs`` turns a scalar
+        into a Gaussian of width ``sigma``, so that target distribution is the floor: a critic that
+        merely regresses the mean reproduces it, giving ``DistStdRatio`` and ``DistEntropyRatio``
+        close to 1.  Ratios meaningfully above 1 mean the network is spreading mass across the
+        support, and ``DistFracMultimodal`` says whether that extra spread is a widened unimodal
+        bump or genuinely separated modes.
+
+        Alongside the scalars this logs the full predicted pmf for ``n_panels`` randomly sampled
+        states, overlaid with the HL-Gauss target the critic is fit against and vertical markers
+        for the predicted mean, the scalar target and the realised return.  Two aggregate panels
+        compare the batch-average predicted pmf with the batch-average target pmf and with the
+        empirical histogram of realised returns.
+
+        Args:
+            critic (Critic): The critic to inspect; a no-op unless it is a :class:`VCriticHLGauss`.
+            obs (torch.Tensor): Observations to evaluate the critic on.
+            target (torch.Tensor): The scalar value targets the critic is fit against.
+            true_ret (torch.Tensor): The realised discounted returns.
+            idx (torch.Tensor): Indices of the random subsample shared with the scatter diagnostics.
+            tag (str): Either ``'Reward'`` or ``'Cost'``.
+            split (str): Either ``'Train'`` or ``'Val'``.
+            n_panels (int, optional): Number of per-state pmfs to plot. Defaults to 6.
+        """
+        if not isinstance(critic, VCriticHLGauss):
+            return
+
+        obs_s = obs[idx]
+        target_s = target.flatten()[idx]
+        true_s = true_ret.flatten()[idx]
+
+        with torch.no_grad():
+            probs = critic.get_probs(obs_s)
+            target_probs = critic.target_to_probs(target_s)
+            stats = critic.distribution_stats(probs)
+            target_stats = critic.distribution_stats(target_probs)
+
+        pred_std = stats['std'].mean().item()
+        tgt_std = target_stats['std'].mean().item()
+        pred_ent = stats['entropy'].mean().item()
+        tgt_ent = target_stats['entropy'].mean().item()
+        self._logger.store({
+            f'Value/{split}/{tag}DistStd': pred_std,
+            f'Value/{split}/{tag}DistStdRatio': pred_std / max(tgt_std, 1e-8),
+            f'Value/{split}/{tag}DistEntropy': pred_ent,
+            f'Value/{split}/{tag}DistEntropyRatio': pred_ent / max(tgt_ent, 1e-8),
+            f'Value/{split}/{tag}DistSkew': stats['skew'].mean().item(),
+            f'Value/{split}/{tag}DistEdgeMassLow': stats['edge_mass_low'].mean().item(),
+            f'Value/{split}/{tag}DistEdgeMassHigh': stats['edge_mass_high'].mean().item(),
+            f'Value/{split}/{tag}DistFracMultimodal': (stats['n_modes'] > 1).float().mean().item(),
+        })
+
+        # Per-state pmfs for a handful of randomly sampled states.
+        n_show = min(n_panels, probs.shape[0])
+        if n_show == 0:
+            return
+        show = torch.randperm(probs.shape[0], device=probs.device)[:n_show]
+        titles = [
+            f'std {stats["std"][i]:.2f} (tgt {target_stats["std"][i]:.2f}), '
+            f'modes {int(stats["n_modes"][i])}'
+            for i in show
+        ]
+        self._logger.log_pmf_grid_image(
+            f'Value/{split}/{tag}DistSamples',
+            support=critic.support,
+            pmfs=probs[show],
+            target_pmfs=target_probs[show],
+            markers={
+                'pred mean': stats['mean'][show],
+                'scalar target': target_s[show],
+                'true G': true_s[show],
+            },
+            titles=titles,
+            xlabel=f'V_{tag[0].lower()} support',
+        )
+
+        # Aggregate view: mixture of the per-state predictions against the target mixture and
+        # against the empirical return distribution binned onto the same support.
+        with torch.no_grad():
+            bins = torch.bucketize(true_s, critic.edges[1:-1].contiguous())
+            counts = torch.bincount(bins, minlength=critic.num_bins).to(probs.dtype)
+            empirical = counts / counts.sum().clamp_min(1.0)
+            mean_pred = probs.mean(dim=0)
+        self._logger.log_pmf_grid_image(
+            f'Value/{split}/{tag}DistAggregate',
+            support=critic.support,
+            pmfs=torch.stack([mean_pred, mean_pred]),
+            target_pmfs=torch.stack([target_probs.mean(dim=0), empirical]),
+            target_labels=['mean target pmf', 'empirical returns'],
+            titles=['mean predicted vs mean target', 'mean predicted vs empirical returns'],
+            xlabel=f'V_{tag[0].lower()} support',
+            ncols=2,
+        )
+
     def _log_critic_diagnostics(
         self,
         obs: torch.Tensor,
@@ -580,6 +717,16 @@ class PolicyGradient(BaseAlgo):
                 ylabel='Predicted V_r',
             )
 
+        self._log_hl_gauss_diagnostics(
+            self._actor_critic.reward_critic,
+            obs,
+            target_r,
+            true_r,
+            idx,
+            tag='Reward',
+            split=split,
+        )
+
         if self._cfgs.algo_cfgs.use_cost:
             target_c = target_value_c.flatten()
             true_c = discounted_cost_ret.flatten()
@@ -626,6 +773,40 @@ class PolicyGradient(BaseAlgo):
                     ylabel='Predicted V_c',
                 )
 
+            self._log_hl_gauss_diagnostics(
+                self._actor_critic.cost_critic,
+                obs,
+                target_c,
+                true_c,
+                idx,
+                tag='Cost',
+                split=split,
+            )
+
+    @staticmethod
+    def _critic_value_loss(
+        critic: Critic,
+        obs: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the value-fitting loss for a critic.
+
+        For an :class:`VCriticHLGauss` critic the value target is fit via the HL-Gauss
+        cross-entropy classification loss; for a standard regression critic the mean-squared
+        error is used instead.
+
+        Args:
+            critic (Critic): The reward or cost critic to fit.
+            obs (torch.Tensor): The ``observation`` sampled from buffer.
+            target (torch.Tensor): The scalar value target sampled from buffer.
+
+        Returns:
+            The scalar value-fitting loss.
+        """
+        if isinstance(critic, VCriticHLGauss):
+            return critic.loss(obs, target)
+        return nn.functional.mse_loss(critic(obs)[0], target)
+
     def _update_reward_critic(self, obs: torch.Tensor, target_value_r: torch.Tensor) -> None:
         r"""Update value network under a double for loop.
 
@@ -648,7 +829,7 @@ class PolicyGradient(BaseAlgo):
             target_value_r (torch.Tensor): The ``target_value_r`` sampled from buffer.
         """
         self._actor_critic.reward_critic_optimizer.zero_grad()
-        loss = nn.functional.mse_loss(self._actor_critic.reward_critic(obs)[0], target_value_r)
+        loss = self._critic_value_loss(self._actor_critic.reward_critic, obs, target_value_r)
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             for param in self._actor_critic.reward_critic.parameters():
@@ -688,7 +869,7 @@ class PolicyGradient(BaseAlgo):
             target_value_c (torch.Tensor): The ``target_value_c`` sampled from buffer.
         """
         self._actor_critic.cost_critic_optimizer.zero_grad()
-        loss = nn.functional.mse_loss(self._actor_critic.cost_critic(obs)[0], target_value_c)
+        loss = self._critic_value_loss(self._actor_critic.cost_critic, obs, target_value_c)
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             for param in self._actor_critic.cost_critic.parameters():

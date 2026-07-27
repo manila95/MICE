@@ -24,9 +24,45 @@ from omnisafe.models.actor import GaussianLearningActor
 from omnisafe.models.actor.actor_builder import ActorBuilder
 from omnisafe.models.base import Actor, Critic
 from omnisafe.models.critic.critic_builder import CriticBuilder
-from omnisafe.typing import OmnisafeSpace
+from omnisafe.typing import CriticType, OmnisafeSpace
 from omnisafe.utils.config import ModelConfig
 from omnisafe.utils.schedule import PiecewiseSchedule, Schedule
+
+
+def resolve_v_critic_cfgs(critic_cfgs: ModelConfig, cost: bool = False) -> tuple[CriticType, dict]:
+    """Resolve the V-critic type and HL-Gauss keyword arguments from the critic config.
+
+    When ``critic_cfgs.use_hl_gauss`` is truthy, a ``v_hlgauss`` critic is requested and the
+    ``hl_gauss_*`` config keys are mapped to :class:`VCriticHLGauss` constructor arguments.
+    Otherwise a standard ``v`` critic is used.
+
+    The cost critic (``cost=True``) shares the same knobs but accepts ``hl_gauss_cost_v_min`` /
+    ``hl_gauss_cost_v_max`` overrides, since cost returns usually span a different range than
+    reward returns.
+
+    Args:
+        critic_cfgs (ModelConfig): The ``model_cfgs.critic`` sub-config.
+        cost (bool, optional): Whether the critic being built is the cost critic. Defaults to False.
+
+    Returns:
+        A ``(critic_type, hl_gauss_cfgs)`` tuple to pass to :class:`CriticBuilder`.
+    """
+    if not critic_cfgs.get('use_hl_gauss', False):
+        return 'v', {}
+    key_map = {
+        'hl_gauss_v_min': 'v_min',
+        'hl_gauss_v_max': 'v_max',
+        'hl_gauss_num_bins': 'num_bins',
+        'hl_gauss_sigma_ratio': 'sigma_ratio',
+    }
+    hl_gauss_cfgs = {
+        arg: critic_cfgs[cfg_key] for cfg_key, arg in key_map.items() if cfg_key in critic_cfgs
+    }
+    if cost:
+        for cfg_key, arg in {'hl_gauss_cost_v_min': 'v_min', 'hl_gauss_cost_v_max': 'v_max'}.items():
+            if cfg_key in critic_cfgs:
+                hl_gauss_cfgs[arg] = critic_cfgs[cfg_key]
+    return 'v_hlgauss', hl_gauss_cfgs
 
 
 class ActorCritic(nn.Module):
@@ -76,6 +112,7 @@ class ActorCritic(nn.Module):
         ).build_actor(
             actor_type=model_cfgs.actor_type,
         )
+        reward_critic_type, reward_hl_gauss_cfgs = resolve_v_critic_cfgs(model_cfgs.critic)
         self.reward_critic: Critic = CriticBuilder(
             obs_space=obs_space,
             act_space=act_space,
@@ -84,7 +121,8 @@ class ActorCritic(nn.Module):
             weight_initialization_mode=model_cfgs.weight_initialization_mode,
             num_critics=1,
             use_obs_encoder=False,
-        ).build_critic(critic_type='v')
+            hl_gauss_cfgs=reward_hl_gauss_cfgs,
+        ).build_critic(critic_type=reward_critic_type)
         self.add_module('actor', self.actor)
         self.add_module('reward_critic', self.reward_critic)
 

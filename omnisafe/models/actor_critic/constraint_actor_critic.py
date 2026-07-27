@@ -19,7 +19,7 @@ from __future__ import annotations
 import torch
 from torch import optim
 
-from omnisafe.models.actor_critic.actor_critic import ActorCritic
+from omnisafe.models.actor_critic.actor_critic import ActorCritic, resolve_v_critic_cfgs
 from omnisafe.models.base import Critic
 from omnisafe.models.critic.critic_builder import CriticBuilder
 from omnisafe.typing import OmnisafeSpace
@@ -63,6 +63,7 @@ class ConstraintActorCritic(ActorCritic):
     ) -> None:
         """Initialize an instance of :class:`ConstraintActorCritic`."""
         super().__init__(obs_space, act_space, model_cfgs, epochs)
+        cost_critic_type, cost_hl_gauss_cfgs = resolve_v_critic_cfgs(model_cfgs.critic, cost=True)
         self.cost_critic: Critic = CriticBuilder(
             obs_space=obs_space,
             act_space=act_space,
@@ -71,7 +72,8 @@ class ConstraintActorCritic(ActorCritic):
             weight_initialization_mode=model_cfgs.weight_initialization_mode,
             num_critics=1,
             use_obs_encoder=False,
-        ).build_critic('v')
+            hl_gauss_cfgs=cost_hl_gauss_cfgs,
+        ).build_critic(cost_critic_type)
         self.add_module('cost_critic', self.cost_critic)
 
         if model_cfgs.critic.lr is not None:

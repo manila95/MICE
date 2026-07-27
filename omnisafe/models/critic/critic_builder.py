@@ -19,6 +19,7 @@ from __future__ import annotations
 from omnisafe.models.base import Critic
 from omnisafe.models.critic.q_critic import QCritic
 from omnisafe.models.critic.v_critic import VCritic
+from omnisafe.models.critic.v_critic_hlgauss import VCriticHLGauss
 from omnisafe.typing import Activation, CriticType, InitFunction, OmnisafeSpace
 
 
@@ -43,6 +44,9 @@ class CriticBuilder:
         num_critics (int, optional): Number of critics. Defaults to 1.
         use_obs_encoder (bool, optional): Whether to use observation encoder, only used in q critic.
             Defaults to False.
+        hl_gauss_cfgs (dict, optional): Extra keyword arguments forwarded to
+            :class:`VCriticHLGauss` (e.g. ``v_min``, ``v_max``, ``num_bins``, ``sigma_ratio``) when
+            building a ``v_hlgauss`` critic. Defaults to None.
     """
 
     # pylint: disable-next=too-many-arguments
@@ -55,6 +59,7 @@ class CriticBuilder:
         weight_initialization_mode: InitFunction = 'kaiming_uniform',
         num_critics: int = 1,
         use_obs_encoder: bool = False,
+        hl_gauss_cfgs: dict | None = None,
     ) -> None:
         """Initialize an instance of :class:`CriticBuilder`."""
         self._obs_space: OmnisafeSpace = obs_space
@@ -64,6 +69,7 @@ class CriticBuilder:
         self._hidden_sizes: list[int] = hidden_sizes
         self._num_critics: int = num_critics
         self._use_obs_encoder: bool = use_obs_encoder
+        self._hl_gauss_cfgs: dict = dict(hl_gauss_cfgs) if hl_gauss_cfgs is not None else {}
 
     def build_critic(
         self,
@@ -71,18 +77,28 @@ class CriticBuilder:
     ) -> Critic:
         """Build critic.
 
-        Currently, we support two types of critics: ``q`` and ``v``.
+        Currently, we support three types of critics: ``q``, ``v`` and ``v_hlgauss``.
         If you want to add a new critic type, you can simply add it here.
 
         Args:
             critic_type (str): Critic type.
 
         Returns:
-            An instance of V-Critic or Q-Critic
+            An instance of V-Critic, Q-Critic or HL-Gauss V-Critic.
 
         Raises:
-            NotImplementedError: If the critic type is not ``q`` or ``v``.
+            NotImplementedError: If the critic type is not ``q``, ``v`` or ``v_hlgauss``.
         """
+        if critic_type == 'v_hlgauss':
+            return VCriticHLGauss(
+                obs_space=self._obs_space,
+                act_space=self._act_space,
+                hidden_sizes=self._hidden_sizes,
+                activation=self._activation,
+                weight_initialization_mode=self._weight_initialization_mode,
+                num_critics=self._num_critics,
+                **self._hl_gauss_cfgs,
+            )
         if critic_type == 'q':
             return QCritic(
                 obs_space=self._obs_space,
@@ -105,5 +121,5 @@ class CriticBuilder:
 
         raise NotImplementedError(
             f'critic_type "{critic_type}" is not implemented.'
-            'Available critic types are: "q", "v".',
+            'Available critic types are: "q", "v", "v_hlgauss".',
         )

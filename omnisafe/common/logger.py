@@ -361,6 +361,112 @@ class Logger:  # pylint: disable=too-many-instance-attributes
 
         plt.close(fig)
 
+    def log_pmf_grid_image(
+        self,
+        key: str,
+        support: np.ndarray | torch.Tensor,
+        pmfs: np.ndarray | torch.Tensor,
+        target_pmfs: np.ndarray | torch.Tensor | None = None,
+        target_labels: str | list[str] = 'target pmf',
+        markers: dict[str, np.ndarray | torch.Tensor] | None = None,
+        titles: list[str] | None = None,
+        xlabel: str = 'value',
+        ncols: int = 3,
+        step: int | None = None,
+    ) -> None:
+        """Log a grid of categorical distributions (one panel per sampled state) as an image.
+
+        Used to inspect what a distributional/classification critic actually predicts: each panel
+        draws the predicted probability mass over the value support as bars, optionally overlaid
+        with the training target distribution as a step line, plus vertical markers (predicted
+        mean, scalar target, realised return).
+
+        Args:
+            key (str): The name of the image.
+            support (np.ndarray or torch.Tensor): Bin centres, shape ``(num_bins,)``.
+            pmfs (np.ndarray or torch.Tensor): Predicted probabilities, shape ``(n_panels,
+                num_bins)``.
+            target_pmfs (np.ndarray or torch.Tensor or None, optional): Target probabilities of the
+                same shape, drawn as a step line. Defaults to None.
+            target_labels (str or list of str, optional): Legend label for the step line, either
+                shared or one per panel. Defaults to ``'target pmf'``.
+            markers (dict or None, optional): Mapping from label to a ``(n_panels,)`` array of
+                x-positions, drawn as vertical dashed lines. Defaults to None.
+            titles (list of str or None, optional): Per-panel titles. Defaults to None.
+            xlabel (str, optional): Label for the x-axis. Defaults to ``'value'``.
+            ncols (int, optional): Number of columns in the panel grid. Defaults to 3.
+            step (int or None, optional): Global step. Defaults to current epoch.
+        """
+        if not self._maste_proc:
+            return
+        if step is None:
+            step = self._epoch
+
+        def _np(arr):  # noqa: ANN001, ANN202
+            return arr.detach().cpu().numpy() if isinstance(arr, torch.Tensor) else np.asarray(arr)
+
+        z = np.atleast_1d(_np(support)).flatten()
+        p = np.atleast_2d(_np(pmfs))
+        if p.shape[0] == 0 or p.shape[-1] != z.shape[0]:
+            return
+        q = np.atleast_2d(_np(target_pmfs)) if target_pmfs is not None else None
+        marks = {k: np.atleast_1d(_np(v)).flatten() for k, v in (markers or {}).items()}
+
+        n_panels = p.shape[0]
+        ncols = max(1, min(ncols, n_panels))
+        nrows = int(np.ceil(n_panels / ncols))
+        width = z[1] - z[0] if z.shape[0] > 1 else 1.0
+
+        fig, axes = plt.subplots(
+            nrows,
+            ncols,
+            figsize=(4.2 * ncols, 3.0 * nrows),
+            squeeze=False,
+        )
+        colors = ['tab:red', 'tab:green', 'tab:purple', 'tab:orange']
+        for i in range(nrows * ncols):
+            ax = axes[i // ncols][i % ncols]
+            if i >= n_panels:
+                ax.axis('off')
+                continue
+            ax.bar(z, p[i], width=width, alpha=0.65, color='tab:blue', label='predicted')
+            if q is not None and i < q.shape[0]:
+                label = (
+                    target_labels
+                    if isinstance(target_labels, str)
+                    else target_labels[min(i, len(target_labels) - 1)]
+                )
+                ax.step(z, q[i], where='mid', color='black', lw=1.2, label=label)
+            for j, (label, vals) in enumerate(marks.items()):
+                if i < vals.shape[0]:
+                    ax.axvline(
+                        float(vals[i]),
+                        color=colors[j % len(colors)],
+                        ls='--',
+                        lw=1.2,
+                        label=label,
+                    )
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel('prob mass')
+            if titles is not None and i < len(titles):
+                ax.set_title(titles[i], fontsize=9)
+            # Per-panel legend: the step line's meaning can differ between panels.
+            ax.legend(fontsize=7)
+        fig.suptitle(f'{key} (step {step})', fontsize=10)
+        fig.tight_layout()
+
+        if self._use_tensorboard:
+            self._tensorboard_writer.add_figure(key, fig, global_step=step)
+
+        if self._use_wandb:
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+            buf.seek(0)
+            img = np.array(Image.open(buf))
+            wandb.log({key: wandb.Image(img)}, step=step)
+
+        plt.close(fig)
+
     def log_scatter_image(
         self,
         key: str,

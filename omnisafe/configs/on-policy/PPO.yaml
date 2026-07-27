@@ -123,6 +123,18 @@ defaults:
       activation: tanh
       # learning rate
       lr: 0.0003
+      # train the value function via HL-Gauss classification instead of MSE regression
+      use_hl_gauss: False
+      # value support range for the HL-Gauss reward critic
+      hl_gauss_v_min: -10.0
+      hl_gauss_v_max: 10.0
+      # number of bins spanning the support
+      hl_gauss_num_bins: 51
+      # Gaussian std as a multiple of the bin width (0.75 recommended by the paper)
+      hl_gauss_sigma_ratio: 0.75
+      # optional cost-critic support overrides (costs are usually non-negative)
+      hl_gauss_cost_v_min: 0.0
+      hl_gauss_cost_v_max: 25.0
 
   env_cfgs:
     lidar_num_bins: ~
