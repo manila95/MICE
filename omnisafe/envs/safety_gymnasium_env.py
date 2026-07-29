@@ -16,14 +16,58 @@
 
 from __future__ import annotations
 
+import types
+from copy import deepcopy
 from typing import Any, ClassVar
 
 import numpy as np
 import safety_gymnasium
 import torch
+from gymnasium.vector.utils import concatenate
 
 from omnisafe.envs.core import CMDP, env_register
+from omnisafe.envs.safety_gymnasium_state import restore_env, snapshot_env, supports_snapshot
 from omnisafe.typing import DEVICE_CPU, Box
+
+
+def _step_wait_without_reset(self):  # noqa: ANN001, ANN201
+    """A :meth:`SafetySyncVectorEnv.step_wait` that leaves finished sub-envs alone.
+
+    Rebuilding a Safety-Gymnasium world costs ~600 ms (the MuJoCo XML is
+    recompiled) against ~0.2 ms per step, so the auto-reset that normally
+    follows a terminated sub-env dominates the runtime of value evaluation,
+    where every finished rollout is immediately replaced by a state restore
+    anyway. Callers that disable auto-reset must not step a finished sub-env.
+
+    Returns:
+        The same tuple as the stock ``step_wait``, minus the reset.
+    """
+    observations, infos = [], {}
+    for i, (env, action) in enumerate(zip(self.envs, self._actions)):  # noqa: SLF001
+        (
+            observation,
+            self._rewards[i],
+            self._costs[i],
+            self._terminateds[i],
+            self._truncateds[i],
+            info,
+        ) = env.step(action)
+        observations.append(observation)
+        infos = self._add_info(infos, info, i)
+    self.observations = concatenate(
+        self.single_observation_space,
+        observations,
+        self.observations,
+    )
+
+    return (
+        deepcopy(self.observations) if self.copy else self.observations,
+        np.copy(self._rewards),
+        np.copy(self._costs),
+        np.copy(self._terminateds),
+        np.copy(self._truncateds),
+        infos,
+    )
 
 
 @env_register
@@ -51,6 +95,7 @@ class SafetyGymnasiumEnv(CMDP):
 
     need_auto_reset_wrapper: bool = False
     need_time_limit_wrapper: bool = False
+    _supports_state_restore: bool = True
 
     _support_envs: ClassVar[list[str]] = [
         'SafetyPointGoal0-v0',
@@ -135,15 +180,25 @@ class SafetyGymnasiumEnv(CMDP):
         self._num_envs = num_envs
         self._device = torch.device(device)
 
-        # Pop before passing to safety_gymnasium — it doesn't know this kwarg.
+        # Pop before passing to safety_gymnasium — it doesn't know these kwargs
+        # (``asynchronous`` is only meaningful for the vectorized constructor).
         lidar_num_bins = kwargs.pop('lidar_num_bins', None)
+        asynchronous = kwargs.pop('asynchronous', None)
 
         if num_envs > 1:
-            if lidar_num_bins is not None:
+            if asynchronous is None:
                 # AsyncVectorEnv runs envs in subprocesses so tasks aren't
                 # directly accessible.  Force sync so we can patch in-process.
-                kwargs.setdefault('asynchronous', False)
-            self._env = safety_gymnasium.vector.make(env_id=env_id, num_envs=num_envs, **kwargs)
+                asynchronous = lidar_num_bins is None
+            # Snapshot/restore reaches into the MuJoCo structs directly, which is
+            # only possible while the sub-envs live in this process.
+            self._supports_state_restore = not asynchronous
+            self._env = safety_gymnasium.vector.make(
+                env_id=env_id,
+                num_envs=num_envs,
+                asynchronous=asynchronous,
+                **kwargs,
+            )
             if lidar_num_bins is not None:
                 self._patch_lidar_num_bins(lidar_num_bins)
             assert isinstance(self._env.single_action_space, Box), 'Only support Box action space.'
@@ -265,6 +320,75 @@ class SafetyGymnasiumEnv(CMDP):
         """
         obs, info = self._env.reset(seed=seed, options=options)
         return torch.as_tensor(obs, dtype=torch.float32, device=self._device), info
+
+    def _sub_env(self, env_idx: int) -> Any:
+        """Return the individual Gymnasium environment behind slot ``env_idx``.
+
+        Args:
+            env_idx (int): Index of the parallel environment.
+
+        Returns:
+            The underlying (wrapped) Safety-Gymnasium environment.
+        """
+        if self._num_envs > 1:
+            return self._env.envs[env_idx]
+        return self._env
+
+    @property
+    def supports_state_restore(self) -> bool:
+        """Whether :meth:`snapshot_state` / :meth:`restore_state` are usable."""
+        return self._supports_state_restore and supports_snapshot(self._sub_env(0))
+
+    def set_auto_reset(self, enabled: bool) -> None:
+        """Turn the vector env's automatic reset-on-done on or off.
+
+        Args:
+            enabled (bool): Whether a finished sub-env should be reset in place.
+        """
+        if self._num_envs <= 1:
+            # Built with ``autoreset=False``; omnisafe's AutoReset wrapper owns this.
+            return
+        if enabled:
+            self._env.__dict__.pop('step_wait', None)
+        else:
+            self._env.step_wait = types.MethodType(_step_wait_without_reset, self._env)
+
+    def snapshot_state(self, env_idx: int = 0) -> dict[str, Any]:
+        """Capture the full simulator state of one parallel environment.
+
+        Args:
+            env_idx (int, optional): Index of the parallel environment. Defaults to 0.
+
+        Returns:
+            An opaque snapshot to hand back to :meth:`restore_state`.
+        """
+        return snapshot_env(self._sub_env(env_idx))
+
+    def restore_state(
+        self,
+        snapshot: dict[str, Any],
+        env_idx: int = 0,
+        rng_seed: int | None = None,
+    ) -> torch.Tensor:
+        """Put one parallel environment back into a previously captured state.
+
+        Args:
+            snapshot (dict[str, Any]): A snapshot from :meth:`snapshot_state`.
+            env_idx (int, optional): Index of the parallel environment. Defaults to 0.
+            rng_seed (int, optional): Re-seed the environment's random generator
+                after restoring, so repeated rollouts from the same state see
+                fresh environment stochasticity. Defaults to None.
+
+        Returns:
+            The observation of the restored state, unbatched.
+        """
+        obs = restore_env(self._sub_env(env_idx), snapshot, rng_seed=rng_seed)
+        if self._num_envs > 1:
+            # Keep the vector env's cached batch consistent with the restore.
+            self._env.observations[env_idx] = obs
+            self._env._terminateds[env_idx] = False  # noqa: SLF001
+            self._env._truncateds[env_idx] = False  # noqa: SLF001
+        return torch.as_tensor(obs, dtype=torch.float32, device=self._device)
 
     @property
     def max_episode_steps(self) -> int:

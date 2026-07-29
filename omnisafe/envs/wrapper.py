@@ -111,6 +111,42 @@ class TimeLimit(Wrapper):
 
         return obs, reward, cost, terminated, truncated, info
 
+    def snapshot_state(self, env_idx: int = 0) -> Any:
+        """Capture the inner state together with the elapsed time.
+
+        Args:
+            env_idx (int, optional): Index of the parallel environment. Defaults to 0.
+
+        Returns:
+            An opaque snapshot to hand back to :meth:`restore_state`.
+        """
+        return {'inner': super().snapshot_state(env_idx), 'time': self._time}
+
+    def restore_state(
+        self,
+        snapshot: Any,
+        env_idx: int = 0,
+        rng_seed: int | None = None,
+    ) -> torch.Tensor:
+        """Restore the inner state and the elapsed time.
+
+        .. note::
+            Without restoring ``_time`` the rollout would run for a full time
+            limit from the restored state instead of the remaining horizon,
+            which changes the value being estimated.
+
+        Args:
+            snapshot (Any): A snapshot from :meth:`snapshot_state`.
+            env_idx (int, optional): Index of the parallel environment. Defaults to 0.
+            rng_seed (int, optional): Re-seed the environment's random generator
+                after restoring. Defaults to None.
+
+        Returns:
+            The observation of the restored state.
+        """
+        self._time = snapshot['time']
+        return super().restore_state(snapshot['inner'], env_idx, rng_seed)
+
 
 class AutoReset(Wrapper):
     """Auto reset the environment when the episode is terminated.
@@ -128,6 +164,16 @@ class AutoReset(Wrapper):
         super().__init__(env=env, device=device)
 
         assert self.num_envs == 1, 'AutoReset only supports single environment'
+        self._auto_reset_enabled: bool = True
+
+    def set_auto_reset(self, enabled: bool) -> None:
+        """Turn the reset-on-done behaviour on or off.
+
+        Args:
+            enabled (bool): Whether a finished environment should be reset in place.
+        """
+        self._auto_reset_enabled = enabled
+        super().set_auto_reset(enabled)
 
     def step(
         self,
@@ -160,7 +206,7 @@ class AutoReset(Wrapper):
         """
         obs, reward, cost, terminated, truncated, info = super().step(action)
 
-        if terminated or truncated:
+        if (terminated or truncated) and self._auto_reset_enabled:
             new_obs, new_info = self.reset()
             assert (
                 'final_observation' not in new_info
@@ -259,6 +305,26 @@ class ObsNormalize(Wrapper):
         info['original_obs'] = obs
         obs = self._obs_normalizer.normalize(obs)
         return obs, info
+
+    def restore_state(
+        self,
+        snapshot: Any,
+        env_idx: int = 0,
+        rng_seed: int | None = None,
+    ) -> torch.Tensor:
+        """Restore the inner state and normalize the resulting observation.
+
+        Args:
+            snapshot (Any): A snapshot from :meth:`snapshot_state`.
+            env_idx (int, optional): Index of the parallel environment. Defaults to 0.
+            rng_seed (int, optional): Re-seed the environment's random generator
+                after restoring. Defaults to None.
+
+        Returns:
+            The normalized observation of the restored state.
+        """
+        obs = super().restore_state(snapshot, env_idx, rng_seed)
+        return self._obs_normalizer.normalize(obs)
 
     def save(self) -> dict[str, torch.nn.Module]:
         """Save the observation normalizer.
@@ -650,3 +716,22 @@ class Unsqueeze(Wrapper):
                 info[k] = v.unsqueeze(0)
 
         return obs, info
+
+    def restore_state(
+        self,
+        snapshot: Any,
+        env_idx: int = 0,
+        rng_seed: int | None = None,
+    ) -> torch.Tensor:
+        """Restore the inner state and unsqueeze the resulting observation.
+
+        Args:
+            snapshot (Any): A snapshot from :meth:`snapshot_state`.
+            env_idx (int, optional): Index of the parallel environment. Defaults to 0.
+            rng_seed (int, optional): Re-seed the environment's random generator
+                after restoring. Defaults to None.
+
+        Returns:
+            The observation of the restored state, shaped ``(1, obs_dim)``.
+        """
+        return super().restore_state(snapshot, env_idx, rng_seed).unsqueeze(0)

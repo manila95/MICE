@@ -177,6 +177,69 @@ class CMDP(ABC):
         """
         return {}
 
+    @property
+    def supports_state_restore(self) -> bool:
+        """Whether the environment can snapshot and restore its simulator state.
+
+        Environments that override this to ``True`` must also implement
+        :meth:`snapshot_state` and :meth:`restore_state`, which together allow
+        the policy to be rolled out repeatedly from one identical state — the
+        basis of a multi-sample Monte-Carlo value estimate.
+        """
+        return False
+
+    def snapshot_state(self, env_idx: int = 0) -> Any:
+        """Capture the full state of one parallel environment.
+
+        Args:
+            env_idx (int, optional): Index of the parallel environment. Defaults to 0.
+
+        Returns:
+            An opaque snapshot to hand back to :meth:`restore_state`.
+
+        Raises:
+            NotImplementedError: If the environment does not support snapshots.
+        """
+        raise NotImplementedError(
+            f'{type(self).__name__} does not support state snapshots.',
+        )
+
+    def restore_state(
+        self,
+        snapshot: Any,
+        env_idx: int = 0,
+        rng_seed: int | None = None,
+    ) -> torch.Tensor:
+        """Put one parallel environment back into a previously captured state.
+
+        Args:
+            snapshot (Any): A snapshot from :meth:`snapshot_state`.
+            env_idx (int, optional): Index of the parallel environment. Defaults to 0.
+            rng_seed (int, optional): Re-seed the environment's random generator
+                after restoring. Defaults to None.
+
+        Returns:
+            The observation of the restored state.
+
+        Raises:
+            NotImplementedError: If the environment does not support snapshots.
+        """
+        raise NotImplementedError(
+            f'{type(self).__name__} does not support state restores.',
+        )
+
+    def set_auto_reset(self, enabled: bool) -> None:
+        """Turn automatic reset-on-done on or off.
+
+        Disabling it is only useful together with :meth:`restore_state`, where a
+        finished episode is replaced by an explicit state restore and the reset
+        would be wasted work. While disabled, a finished environment must not be
+        stepped.
+
+        Args:
+            enabled (bool): Whether a finished environment should be reset in place.
+        """
+
     @abstractmethod
     def close(self) -> None:
         """Close the environment."""
@@ -291,6 +354,49 @@ class Wrapper(CMDP):
             The saved components.
         """
         return self._env.save()
+
+    @property
+    def supports_state_restore(self) -> bool:
+        """Whether the wrapped environment can snapshot and restore its state."""
+        return self._env.supports_state_restore
+
+    def snapshot_state(self, env_idx: int = 0) -> Any:
+        """Capture the full state of one parallel environment.
+
+        Args:
+            env_idx (int, optional): Index of the parallel environment. Defaults to 0.
+
+        Returns:
+            An opaque snapshot to hand back to :meth:`restore_state`.
+        """
+        return self._env.snapshot_state(env_idx)
+
+    def restore_state(
+        self,
+        snapshot: Any,
+        env_idx: int = 0,
+        rng_seed: int | None = None,
+    ) -> torch.Tensor:
+        """Put one parallel environment back into a previously captured state.
+
+        Args:
+            snapshot (Any): A snapshot from :meth:`snapshot_state`.
+            env_idx (int, optional): Index of the parallel environment. Defaults to 0.
+            rng_seed (int, optional): Re-seed the environment's random generator
+                after restoring. Defaults to None.
+
+        Returns:
+            The observation of the restored state, transformed by this wrapper.
+        """
+        return self._env.restore_state(snapshot, env_idx, rng_seed)
+
+    def set_auto_reset(self, enabled: bool) -> None:
+        """Turn automatic reset-on-done on or off throughout the wrapper chain.
+
+        Args:
+            enabled (bool): Whether a finished environment should be reset in place.
+        """
+        self._env.set_auto_reset(enabled)
 
     def close(self) -> None:
         """Close the environment."""

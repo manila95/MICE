@@ -180,6 +180,30 @@ if __name__ == '__main__':
         help='if false, use value-function bootstrap for reward (TRPOPIDReinforce only)',
     )
     parser.add_argument(
+        '--value-eval-mc-samples',
+        type=int,
+        default=None,
+        metavar='K',
+        help='Monte-Carlo rollouts per query state in the value-function evaluation; '
+        '>1 replaces the single-sample cost-to-go with a proper MC estimate of V^pi(s) '
+        'by restoring the simulator state and re-running the policy (forces synchronous '
+        'vector envs)',
+    )
+    parser.add_argument(
+        '--value-eval-mc-episodes',
+        type=int,
+        default=None,
+        metavar='N',
+        help='number of episodes to draw value-evaluation query states from (Monte-Carlo path only)',
+    )
+    parser.add_argument(
+        '--value-eval-states-per-episode',
+        type=int,
+        default=None,
+        metavar='N',
+        help='interior query states sampled per episode, on top of s0 (Monte-Carlo path only)',
+    )
+    parser.add_argument(
         '--lam',
         type=float,
         default=None,
@@ -260,6 +284,9 @@ if __name__ == '__main__':
     steps_per_epoch = args.steps_per_epoch
     early_eval_freq = args.early_eval_freq
     lidar_bins = args.lidar_bins
+    value_eval_mc_samples = args.value_eval_mc_samples
+    value_eval_mc_episodes = args.value_eval_mc_episodes
+    value_eval_states_per_episode = args.value_eval_states_per_episode
     opt = vars(args)
     del opt["seed"]
     del opt["constant_cost"]
@@ -283,6 +310,9 @@ if __name__ == '__main__':
     del opt["steps_per_epoch"]
     del opt["early_eval_freq"]
     del opt["lidar_bins"]
+    del opt["value_eval_mc_samples"]
+    del opt["value_eval_mc_episodes"]
+    del opt["value_eval_states_per_episode"]
     custom_cfgs = {}
     for k, v in unparsed_args.items():
         update_dict(custom_cfgs, custom_cfgs_to_dict(k, v))
@@ -338,6 +368,12 @@ if __name__ == '__main__':
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:early_eval_freq', str(early_eval_freq)))
     if lidar_bins is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('env_cfgs:lidar_num_bins', str(lidar_bins)))
+    if value_eval_mc_samples is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:value_eval_mc_samples', str(value_eval_mc_samples)))
+    if value_eval_mc_episodes is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:value_eval_mc_episodes', str(value_eval_mc_episodes)))
+    if value_eval_states_per_episode is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:value_eval_states_per_episode', str(value_eval_states_per_episode)))
 
     agent = omnisafe.Agent(
         args.algo,

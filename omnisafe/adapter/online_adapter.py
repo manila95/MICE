@@ -68,6 +68,18 @@ class OnlineAdapter:
         if hasattr(self._cfgs, 'env_cfgs') and self._cfgs.env_cfgs is not None:
             env_cfgs = self._cfgs.env_cfgs.todict()
 
+        if int(getattr(cfgs.algo_cfgs, 'value_eval_mc_samples', 1)) > 1:
+            # Multi-sample Monte-Carlo value evaluation snapshots and restores the
+            # simulator state, which requires the sub-envs to live in this process.
+            if env_cfgs.get('asynchronous') is None:
+                env_cfgs['asynchronous'] = False
+            elif env_cfgs['asynchronous']:
+                print(
+                    'WARNING: value_eval_mc_samples > 1 needs synchronous vector envs, '
+                    'but env_cfgs.asynchronous is True; Monte-Carlo value evaluation '
+                    'will fall back to the single-trajectory estimator.',
+                )
+
         self._env: CMDP = make(env_id, num_envs=num_envs, device=self._device, **env_cfgs)
         self._wrapper(
             obs_normalize=cfgs.algo_cfgs.obs_normalize,

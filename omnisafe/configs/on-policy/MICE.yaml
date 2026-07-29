@@ -110,6 +110,14 @@ defaults:
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5
     value_eval_freq: 50
+    # number of Monte-Carlo rollouts per query state; >1 replaces the
+    # single-sample cost-to-go with a proper MC estimate of V^pi(s), which
+    # requires an env supporting snapshot_state/restore_state
+    value_eval_mc_samples: 1
+    # number of episodes to draw query states from (Monte-Carlo path only)
+    value_eval_mc_episodes: 10
+    # interior states sampled per episode, on top of s0 (Monte-Carlo path only)
+    value_eval_states_per_episode: 5
   # logger configurations
   logger_cfgs:
     # use wandb for logging
