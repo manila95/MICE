@@ -142,9 +142,16 @@ class SACPIDReinforce(SACPID):
                 data['next_obs'],
             )
 
+            # This method reimplements DDPG._update rather than extending it, so the
+            # successor-representation hooks have to be repeated here or they silently no-op.
+            if self._sr_td_ridge:
+                self._ridge_update_successor_weights(obs, act, reward, cost)
+
             self._update_reward_critic(obs, act, reward, done, next_obs)
             if self._cfgs.algo_cfgs.use_cost:
                 self._update_cost_critic(obs, act, cost, done, next_obs)  # no-op
+            if self._sr_td_ridge:
+                self._update_successor_features(obs, act, done, next_obs)
 
             if self._update_count % self._cfgs.algo_cfgs.policy_delay == 0:
                 # Store for use in _loss_pi without changing parent signatures.

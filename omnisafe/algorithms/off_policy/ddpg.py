@@ -134,6 +134,11 @@ class DDPG(BaseAlgo):
             device=self._device,
         )
 
+        use_sr = bool(self._cfgs.model_cfgs.get('use_successor_representation', False))
+        self._sr_td_ridge: bool = (
+            use_sr and self._cfgs.model_cfgs.sr_cfgs.get('sr_mode', 'shared_trunk') == 'td_ridge'
+        )
+
     def _init_log(self) -> None:
         """Log info about epoch.
 
@@ -242,6 +247,15 @@ class DDPG(BaseAlgo):
             # log information about cost critic
             self._logger.register_key('Loss/Loss_cost_critic', delta=True)
             self._logger.register_key('Value/cost_critic')
+
+        if self._sr_td_ridge:
+            # log information about the td_ridge successor-representation critic
+            self._logger.register_key('Loss/Loss_sr', delta=True)
+            self._logger.register_key('Misc/RidgeResidualReward')
+            self._logger.register_key('Misc/RidgeResidualCost')
+            self._logger.register_key('Misc/WrNorm')
+            self._logger.register_key('Misc/WcNorm')
+            self._logger.register_key('Misc/GramCond')
 
         self._logger.register_key('Time/Total')
         self._logger.register_key('Time/Rollout')
@@ -403,13 +417,126 @@ class DDPG(BaseAlgo):
                 data['next_obs'],
             )
 
+            if self._sr_td_ridge:
+                # Refresh w_r / w_c before the critic losses consume them, mirroring how the
+                # on-policy path solves the ridge on the fresh batch before its minibatch loop.
+                self._ridge_update_successor_weights(obs, act, reward, cost)
+
             self._update_reward_critic(obs, act, reward, done, next_obs)
             if self._cfgs.algo_cfgs.use_cost:
                 self._update_cost_critic(obs, act, cost, done, next_obs)
+            if self._sr_td_ridge:
+                self._update_successor_features(obs, act, done, next_obs)
 
             if self._update_count % self._cfgs.algo_cfgs.policy_delay == 0:
                 self._update_actor(obs)
                 self._actor_critic.polyak_update(self._cfgs.algo_cfgs.polyak)
+
+    def _ridge_update_successor_weights(
+        self,
+        obs: torch.Tensor,
+        act: torch.Tensor,
+        reward: torch.Tensor,
+        cost: torch.Tensor,
+    ) -> None:
+        """Refresh the ``td_ridge`` successor-representation read-out weights.
+
+        Solves ``w_r`` / ``w_c`` in closed form on the replay minibatch, once per
+        :meth:`_update` iteration. The on-policy counterpart solves them once per epoch on the
+        freshly collected batch; here the natural analogue is once per fresh env-step batch,
+        since off-policy ``_update`` is called every rollout step.
+
+        Unlike the successor-feature TD target below, this solve needs no trajectory structure
+        at all -- it is a regression of the *immediate* reward/cost onto the *immediate* feature
+        ``phi(s, a)``, so an i.i.d. replay sample is a perfectly valid design matrix. The result
+        is synced onto the target trunk, whose ``w`` buffers ``polyak_update`` cannot reach.
+
+        Args:
+            obs (torch.Tensor): The ``observation`` sampled from buffer.
+            act (torch.Tensor): The ``action`` sampled from buffer.
+            reward (torch.Tensor): The ``reward`` sampled from buffer.
+            cost (torch.Tensor): The ``cost`` sampled from buffer.
+        """
+        sr_cfgs = self._cfgs.model_cfgs.sr_cfgs
+        phi, _ = self._actor_critic.sr_features(obs, act)
+        stats = self._actor_critic.sr_trunk.ridge_update(
+            phi,
+            reward,
+            cost,
+            ridge_kappa=sr_cfgs.get('ridge_kappa', 1e-3),
+            ema_tau=sr_cfgs.get('ema_tau', 1.0),
+        )
+        self._actor_critic.sync_sr_readout_weights()
+        self._logger.store(stats)
+
+    def _update_successor_features(
+        self,
+        obs: torch.Tensor,
+        act: torch.Tensor,
+        done: torch.Tensor,
+        next_obs: torch.Tensor,
+    ) -> None:
+        r"""Update the ``td_ridge`` successor-representation trunk on a replay minibatch.
+
+        Trains every ``psi`` head to satisfy the successor-representation Bellman recursion
+
+        .. math::
+
+            \psi_i(s, a) \approx \phi(s, a)
+                + \gamma_{sr} (1 - d) \, \bar\psi_i(s', a'),\quad a' \sim \pi(\cdot|s')
+
+        via MSE, summed over heads exactly as SAC sums the MSE over its twin reward critics.
+
+        This is where the port necessarily departs from the on-policy version, which regresses
+        ``psi`` onto ``target_sr`` -- a discounted lambda-return over the ``phi`` stream, built by
+        the buffer from complete on-policy trajectories. A replay sample has no trajectory
+        structure to build a lambda-return from, so the target is the one-step bootstrap above,
+        which is the same substitution the reward and cost critics themselves make when going
+        from on-policy (GAE targets) to off-policy (one-step Bellman targets). Consequently
+        ``sr_cfgs.lam_sr`` has no meaning here and is not read.
+
+        The immediate ``phi`` term comes from the *live* trunk (detached), matching the
+        on-policy convention where ``phi`` was computed by the live network at collection time
+        and is the same ``phi`` the ridge solve above regresses against; only the bootstrap term
+        is taken from the target trunk.
+
+        Args:
+            obs (torch.Tensor): The ``observation`` sampled from buffer.
+            act (torch.Tensor): The ``action`` sampled from buffer.
+            done (torch.Tensor): The ``terminated`` sampled from buffer.
+            next_obs (torch.Tensor): The ``next observation`` sampled from buffer.
+        """
+        gamma_sr = self._cfgs.model_cfgs.sr_cfgs.get('gamma_sr', None)
+        if gamma_sr is None:
+            gamma_sr = self._cfgs.algo_cfgs.gamma
+
+        with torch.no_grad():
+            phi, _ = self._actor_critic.sr_features(obs, act)
+            next_act = self._actor_critic.actor.predict(next_obs, deterministic=False)
+            next_psi = self._actor_critic.target_sr_trunk.psi(next_obs, next_act)
+            not_done = (1 - done).unsqueeze(-1)
+            target_psi = [phi + gamma_sr * not_done * next_psi_i for next_psi_i in next_psi]
+
+        psi = self._actor_critic.sr_trunk.psi(obs, act)
+        loss = torch.stack(
+            [nn.functional.mse_loss(psi_i, target_i) for psi_i, target_i in zip(psi, target_psi)],
+        ).sum()
+
+        if self._cfgs.algo_cfgs.use_critic_norm:
+            for param in self._actor_critic.sr_trunk.parameters():
+                loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coeff
+
+        self._actor_critic.sr_optimizer.zero_grad()
+        loss.backward()
+
+        if self._cfgs.algo_cfgs.max_grad_norm:
+            clip_grad_norm_(
+                self._actor_critic.sr_trunk.parameters(),
+                self._cfgs.algo_cfgs.max_grad_norm,
+            )
+        self._actor_critic.sr_optimizer.step()
+
+        self._logger.store({'Loss/Loss_sr': loss.mean().item()})
 
     def _update_reward_critic(
         self,
@@ -572,5 +699,16 @@ class DDPG(BaseAlgo):
                 {
                     'Loss/Loss_cost_critic': 0.0,
                     'Value/cost_critic': 0.0,
+                },
+            )
+        if self._sr_td_ridge:
+            self._logger.store(
+                {
+                    'Loss/Loss_sr': 0.0,
+                    'Misc/RidgeResidualReward': 0.0,
+                    'Misc/RidgeResidualCost': 0.0,
+                    'Misc/WrNorm': 0.0,
+                    'Misc/WcNorm': 0.0,
+                    'Misc/GramCond': 0.0,
                 },
             )

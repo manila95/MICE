@@ -127,7 +127,12 @@ class OffPolicyAdapter(OnlineAdapter):
         """
         for _ in range(rollout_step):
             if use_rand_action:
-                act = (torch.rand(self.action_space.shape) * 2 - 1).unsqueeze(0).to(self._device)  # type: ignore
+                # One action per parallel env: a (1, act_dim) batch would make
+                # AsyncVectorEnv.step_async zip-truncate to a single pipe, and
+                # step_wait would then block forever recv()ing the other envs.
+                act = (
+                    torch.rand(self._env.num_envs, *self.action_space.shape) * 2 - 1  # type: ignore
+                ).to(self._device)
             else:
                 act = agent.step(self._current_obs, deterministic=False)
             next_obs, reward, cost, terminated, truncated, info = self.step(act)

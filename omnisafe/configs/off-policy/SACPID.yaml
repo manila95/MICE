@@ -118,6 +118,39 @@ defaults:
       activation: relu
       # The learning rate of Critic network
       lr: 0.0003
+    # whether to replace the independent reward/cost Q-critics with read-out heads over a
+    # single shared successor-representation Q-function
+    use_successor_representation: False
+    # successor representation configurations, only used when use_successor_representation is True
+    sr_cfgs:
+      # 'shared_trunk': shared feature trunk over (obs, act) + linear reward/cost read-out
+      # heads, trained end-to-end by the ordinary one-step Bellman MSE loss (reuses the stock
+      # off-policy critic update code exactly).
+      # 'td_ridge': literal successor representation -- phi(s,a)/psi(s,a) trained by a one-step
+      # TD backup off the target trunk, with the reward/cost read-out weights solved by
+      # closed-form ridge regression each update.
+      sr_mode: shared_trunk
+      # dimensionality of the shared successor-feature vector
+      sr_dim: 256
+      # hidden layer sizes of the shared trunk / psi network -- every layer's width is
+      # overridden to sr_dim at construction time (only the depth, i.e. len(hidden_sizes),
+      # is actually used; a narrower last layer would silently cap psi/phi's rank below sr_dim)
+      hidden_sizes: [256, 256]
+      # activation function of the trunk
+      activation: relu
+      # learning rate for the trunk (shared_trunk mode) or the psi network (td_ridge mode)
+      lr: 0.0003
+      # discount factor for the successor-feature TD recursion (td_ridge mode only);
+      # defaults to algo_cfgs.gamma when null
+      gamma_sr: ~
+      # ridge regression L2 regularization coefficient for solving w_r / w_c (td_ridge mode only)
+      ridge_kappa: 0.001
+      # EMA smoothing coefficient for w_r / w_c across iterations, 1.0 = no smoothing (td_ridge mode only)
+      ema_tau: 1.0
+      # NOTE: the on-policy sr_cfgs also carries lam_sr, the lambda of the successor-feature
+      # lambda-return. It is absent here on purpose: a replay minibatch has no trajectory
+      # structure to build a lambda-return from, so the off-policy psi target is a one-step
+      # bootstrap. See DDPG._update_successor_features.
   # lagrangian configurations
   lagrange_cfgs:
     # The Kp of PID controller

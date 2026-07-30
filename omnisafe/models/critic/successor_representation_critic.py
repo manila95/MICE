@@ -27,6 +27,28 @@ Two modes are provided, selected by ``model_cfgs.sr_cfgs.sr_mode``:
   read-out weights ``w_r`` / ``w_c`` are solved in closed form by ridge regression of the
   one-step reward/cost onto ``phi`` once per update (see :meth:`ridge_update`) and are stored
   as buffers, not parameters.
+
+Each mode comes in a state-only V-critic flavor for the on-policy algorithms and an
+action-conditioned Q-critic flavor for the off-policy ones (DDPG/TD3/SAC and their Lagrangian
+and PID variants). The Q flavors are the same architectures with ``cat([obs, act], -1)`` as
+the trunk input, so ``phi(s, a)`` / ``psi(s, a)`` and the read-outs satisfy the standard
+``forward(obs, act) -> [value, ...]`` :class:`Critic` contract:
+
++---------------+-----------------------------------------+---------------------------------------+
+| Mode          | V flavor (on-policy)                    | Q flavor (off-policy)                 |
++===============+=========================================+=======================================+
+| shared_trunk  | :class:`SuccessorRepresentationTrunk`   | :class:`QSuccessorRepresentationTrunk`|
+|               | :class:`SuccessorRepresentationReadout` | :class:`SuccessorRepresentationQReadout`|
++---------------+-----------------------------------------+---------------------------------------+
+| td_ridge      | :class:`TDRidgeSuccessorRepresentationTrunk` | :class:`TDRidgeSuccessorRepresentationQTrunk`|
+|               | :class:`SuccessorRepresentationLinearReadout`| :class:`SuccessorRepresentationQLinearReadout`|
++---------------+-----------------------------------------+---------------------------------------+
+
+The one structural difference in the Q flavors is that ``td_ridge`` carries ``num_psi_heads``
+independent ``psi`` heads over the shared trunk rather than one, so that the off-policy
+twin-critic (clipped double-Q) machinery in SAC/TD3 has genuinely distinct estimates to take a
+minimum over. ``phi`` stays single -- it defines the regression basis that ``w_r`` / ``w_c`` are
+solved against, and is what makes the representation shared between reward and cost.
 """
 
 from __future__ import annotations
@@ -116,65 +138,24 @@ class SuccessorRepresentationReadout(Critic):
         return [value]
 
 
-class TDRidgeSuccessorRepresentationTrunk(nn.Module):
-    """phi / psi bundle for the literal successor-representation (``td_ridge``) mode.
+class RidgeSolvedReadoutWeights(nn.Module):
+    """Owns the ridge-solved ``w_r`` / ``w_c`` read-out weights of a ``td_ridge`` trunk.
+
+    Factored out of the trunks themselves so the state-only (V) and action-conditioned (Q)
+    flavors share one implementation of the closed-form solve.
 
     Args:
-        obs_dim (int): Observation dimension.
-        hidden_sizes (list of int): Hidden layer sizes of the shared trunk.
-        sr_dim (int): Dimensionality of ``phi`` and ``psi``.
-        activation (Activation): Activation function.
-        weight_initialization_mode (InitFunction): Weight initialization mode.
+        sr_dim (int): Dimensionality of ``phi``, and hence of ``w_r`` / ``w_c``.
     """
 
-    def __init__(
-        self,
-        obs_dim: int,
-        hidden_sizes: list[int],
-        sr_dim: int,
-        activation: Activation,
-        weight_initialization_mode: InitFunction,
-    ) -> None:
-        """Initialize an instance of :class:`TDRidgeSuccessorRepresentationTrunk`."""
+    def __init__(self, sr_dim: int) -> None:
+        """Initialize an instance of :class:`RidgeSolvedReadoutWeights`."""
         super().__init__()
         self.sr_dim = sr_dim
-        trunk_out = hidden_sizes[-1] if hidden_sizes else obs_dim
-        self.trunk: nn.Module = (
-            build_mlp_network(
-                sizes=[obs_dim, *hidden_sizes],
-                activation=activation,
-                output_activation=activation,
-                weight_initialization_mode=weight_initialization_mode,
-            )
-            if hidden_sizes
-            else nn.Identity()
-        )
-        self.phi_head = nn.Linear(trunk_out, sr_dim)
-        initialize_layer(weight_initialization_mode, self.phi_head)
-        self.psi_head = build_mlp_network(
-            sizes=[trunk_out, sr_dim],
-            activation=activation,
-            weight_initialization_mode=weight_initialization_mode,
-        )
         # w_r / w_c are solved by closed-form ridge regression (see ridge_update), never by
         # SGD, so they are buffers rather than parameters.
         self.register_buffer('w_r', torch.zeros(sr_dim))
         self.register_buffer('w_c', torch.zeros(sr_dim))
-
-    def features(self, obs: torch.Tensor) -> torch.Tensor:
-        """Shared trunk features."""
-        return self.trunk(obs)
-
-    def phi(self, obs: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
-        """L2-normalized one-step feature ``phi(s)``."""
-        z = self.features(obs) if z is None else z
-        p = self.phi_head(z)
-        return p / (p.norm(dim=-1, keepdim=True) + 1e-8)
-
-    def psi(self, obs: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
-        """Successor feature ``psi(s)``."""
-        z = self.features(obs) if z is None else z
-        return self.psi_head(z)
 
     @torch.no_grad()
     def ridge_update(
@@ -225,6 +206,62 @@ class TDRidgeSuccessorRepresentationTrunk(nn.Module):
         }
 
 
+class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
+    """phi / psi bundle for the literal successor-representation (``td_ridge``) mode.
+
+    Args:
+        obs_dim (int): Observation dimension.
+        hidden_sizes (list of int): Hidden layer sizes of the shared trunk.
+        sr_dim (int): Dimensionality of ``phi`` and ``psi``.
+        activation (Activation): Activation function.
+        weight_initialization_mode (InitFunction): Weight initialization mode.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        hidden_sizes: list[int],
+        sr_dim: int,
+        activation: Activation,
+        weight_initialization_mode: InitFunction,
+    ) -> None:
+        """Initialize an instance of :class:`TDRidgeSuccessorRepresentationTrunk`."""
+        super().__init__(sr_dim)
+        trunk_out = hidden_sizes[-1] if hidden_sizes else obs_dim
+        self.trunk: nn.Module = (
+            build_mlp_network(
+                sizes=[obs_dim, *hidden_sizes],
+                activation=activation,
+                output_activation=activation,
+                weight_initialization_mode=weight_initialization_mode,
+            )
+            if hidden_sizes
+            else nn.Identity()
+        )
+        self.phi_head = nn.Linear(trunk_out, sr_dim)
+        initialize_layer(weight_initialization_mode, self.phi_head)
+        self.psi_head = build_mlp_network(
+            sizes=[trunk_out, sr_dim],
+            activation=activation,
+            weight_initialization_mode=weight_initialization_mode,
+        )
+
+    def features(self, obs: torch.Tensor) -> torch.Tensor:
+        """Shared trunk features."""
+        return self.trunk(obs)
+
+    def phi(self, obs: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
+        """L2-normalized one-step feature ``phi(s)``."""
+        z = self.features(obs) if z is None else z
+        p = self.phi_head(z)
+        return p / (p.norm(dim=-1, keepdim=True) + 1e-8)
+
+    def psi(self, obs: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
+        """Successor feature ``psi(s)``."""
+        z = self.features(obs) if z is None else z
+        return self.psi_head(z)
+
+
 class SuccessorRepresentationLinearReadout(Critic):
     """A read-out head whose weight vector is solved by ridge regression, not by SGD.
 
@@ -266,3 +303,226 @@ class SuccessorRepresentationLinearReadout(Critic):
         weight = getattr(self.trunk, self._weight_name)
         value = (psi * weight).sum(-1)
         return [value]
+
+
+# ======================================================================================
+# Action-conditioned (Q) flavors, for the off-policy algorithms
+# ======================================================================================
+
+
+class QSuccessorRepresentationTrunk(nn.Module):
+    """Shared feature trunk over ``(obs, act)`` pairs, for ``shared_trunk`` mode.
+
+    The action-conditioned counterpart of :class:`SuccessorRepresentationTrunk`: identical
+    architecture, but the input is ``cat([obs, act], -1)`` so the read-outs above it are
+    Q-functions rather than V-functions.
+
+    Args:
+        obs_dim (int): Observation dimension.
+        act_dim (int): Action dimension.
+        hidden_sizes (list of int): Hidden layer sizes of the trunk.
+        sr_dim (int): Dimensionality of the shared feature vector.
+        activation (Activation): Activation function.
+        weight_initialization_mode (InitFunction): Weight initialization mode.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        hidden_sizes: list[int],
+        sr_dim: int,
+        activation: Activation,
+        weight_initialization_mode: InitFunction,
+    ) -> None:
+        """Initialize an instance of :class:`QSuccessorRepresentationTrunk`."""
+        super().__init__()
+        self.net = build_mlp_network(
+            sizes=[obs_dim + act_dim, *hidden_sizes, sr_dim],
+            activation=activation,
+            weight_initialization_mode=weight_initialization_mode,
+        )
+
+    def forward(self, obs: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
+        """Compute the shared feature vector for the ``(obs, act)`` pair."""
+        return self.net(torch.cat([obs, act], dim=-1))
+
+
+class SuccessorRepresentationQReadout(Critic):
+    """Linear read-out heads over a shared action-conditioned trunk.
+
+    Mirrors the standard Q-:class:`Critic` interface (``forward(obs, act)`` returns a list of
+    ``num_critics`` ``(B,)`` value tensors), so it drops in place of the stock ``reward_critic``
+    / ``cost_critic`` of :class:`ConstraintActorQCritic` without changing any of their call
+    sites -- including SAC's and TD3's twin-critic unpacking, ``q1, q2 = reward_critic(obs, act)``.
+
+    Args:
+        obs_space (OmnisafeSpace): Observation space.
+        act_space (OmnisafeSpace): Action space.
+        trunk (QSuccessorRepresentationTrunk): The shared trunk (same instance passed to both
+            the reward and the cost read-out, so its parameters are trained by both losses).
+        sr_dim (int): Dimensionality of the shared feature vector.
+        num_critics (int): Number of independent read-out heads.
+        weight_initialization_mode (InitFunction): Weight initialization mode.
+    """
+
+    def __init__(
+        self,
+        obs_space: OmnisafeSpace,
+        act_space: OmnisafeSpace,
+        trunk: QSuccessorRepresentationTrunk,
+        sr_dim: int,
+        num_critics: int,
+        weight_initialization_mode: InitFunction,
+    ) -> None:
+        """Initialize an instance of :class:`SuccessorRepresentationQReadout`."""
+        super().__init__(
+            obs_space,
+            act_space,
+            hidden_sizes=[],
+            activation='identity',
+            weight_initialization_mode=weight_initialization_mode,
+            num_critics=num_critics,
+            use_obs_encoder=False,
+        )
+        self.trunk = trunk
+        self.heads = nn.ModuleList(nn.Linear(sr_dim, 1) for _ in range(num_critics))
+        for head in self.heads:
+            initialize_layer(weight_initialization_mode, head)
+
+    def forward(self, obs: torch.Tensor, act: torch.Tensor) -> list[torch.Tensor]:
+        """Read out one scalar per head from the shared trunk's feature vector."""
+        feat = self.trunk(obs, act)
+        return [torch.squeeze(head(feat), -1) for head in self.heads]
+
+
+class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
+    """phi / psi bundle over ``(obs, act)`` pairs, for ``td_ridge`` mode.
+
+    The action-conditioned counterpart of :class:`TDRidgeSuccessorRepresentationTrunk`. Two
+    differences beyond the input being ``cat([obs, act], -1)``:
+
+    * ``psi`` is a list of ``num_psi_heads`` independent heads rather than a single one, so the
+      off-policy clipped double-Q machinery has genuinely distinct estimates to minimize over.
+      They share the trunk body (and therefore the representation), differing only in their
+      read-out MLP and its initialization.
+    * ``phi`` stays single. It is the basis that ``w_r`` / ``w_c`` are regressed against, so
+      duplicating it would mean duplicating the very thing the two critics are meant to share.
+
+    Args:
+        obs_dim (int): Observation dimension.
+        act_dim (int): Action dimension.
+        hidden_sizes (list of int): Hidden layer sizes of the shared trunk.
+        sr_dim (int): Dimensionality of ``phi`` and ``psi``.
+        num_psi_heads (int): Number of independent ``psi`` read-out heads.
+        activation (Activation): Activation function.
+        weight_initialization_mode (InitFunction): Weight initialization mode.
+    """
+
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        hidden_sizes: list[int],
+        sr_dim: int,
+        num_psi_heads: int,
+        activation: Activation,
+        weight_initialization_mode: InitFunction,
+    ) -> None:
+        """Initialize an instance of :class:`TDRidgeSuccessorRepresentationQTrunk`."""
+        super().__init__(sr_dim)
+        in_dim = obs_dim + act_dim
+        trunk_out = hidden_sizes[-1] if hidden_sizes else in_dim
+        self.trunk: nn.Module = (
+            build_mlp_network(
+                sizes=[in_dim, *hidden_sizes],
+                activation=activation,
+                output_activation=activation,
+                weight_initialization_mode=weight_initialization_mode,
+            )
+            if hidden_sizes
+            else nn.Identity()
+        )
+        self.phi_head = nn.Linear(trunk_out, sr_dim)
+        initialize_layer(weight_initialization_mode, self.phi_head)
+        self.psi_heads = nn.ModuleList(
+            build_mlp_network(
+                sizes=[trunk_out, sr_dim],
+                activation=activation,
+                weight_initialization_mode=weight_initialization_mode,
+            )
+            for _ in range(num_psi_heads)
+        )
+
+    def features(self, obs: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
+        """Shared trunk features of the ``(obs, act)`` pair."""
+        return self.trunk(torch.cat([obs, act], dim=-1))
+
+    def phi(
+        self,
+        obs: torch.Tensor,
+        act: torch.Tensor,
+        z: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """L2-normalized one-step feature ``phi(s, a)``."""
+        z = self.features(obs, act) if z is None else z
+        p = self.phi_head(z)
+        return p / (p.norm(dim=-1, keepdim=True) + 1e-8)
+
+    def psi(
+        self,
+        obs: torch.Tensor,
+        act: torch.Tensor,
+        z: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        """Successor features ``psi_i(s, a)``, one ``(B, sr_dim)`` tensor per head."""
+        z = self.features(obs, act) if z is None else z
+        return [head(z) for head in self.psi_heads]
+
+
+class SuccessorRepresentationQLinearReadout(Critic):
+    """A Q read-out whose weight vector is solved by ridge regression, not by SGD.
+
+    ``Q_i(s, a) = psi_i(s, a)^T w``, where ``psi_i`` are the trunk's successor-feature heads
+    selected by ``head_indices`` and ``w`` is a non-learnable buffer refreshed by
+    :meth:`RidgeSolvedReadoutWeights.ridge_update`.
+
+    Args:
+        obs_space (OmnisafeSpace): Observation space.
+        act_space (OmnisafeSpace): Action space.
+        trunk (TDRidgeSuccessorRepresentationQTrunk): The shared phi/psi trunk.
+        weight_name (str): Name of the trunk buffer to read out (``'w_r'`` or ``'w_c'``).
+        head_indices (list of int): Which of the trunk's ``psi`` heads this critic reads out,
+            one returned value per entry. The reward critic takes all of them (giving SAC/TD3
+            their twin estimates); the cost critic takes head ``0`` only.
+        weight_initialization_mode (InitFunction): Weight initialization mode.
+    """
+
+    def __init__(
+        self,
+        obs_space: OmnisafeSpace,
+        act_space: OmnisafeSpace,
+        trunk: TDRidgeSuccessorRepresentationQTrunk,
+        weight_name: str,
+        head_indices: list[int],
+        weight_initialization_mode: InitFunction,
+    ) -> None:
+        """Initialize an instance of :class:`SuccessorRepresentationQLinearReadout`."""
+        super().__init__(
+            obs_space,
+            act_space,
+            hidden_sizes=[],
+            activation='identity',
+            weight_initialization_mode=weight_initialization_mode,
+            num_critics=len(head_indices),
+            use_obs_encoder=False,
+        )
+        self.trunk = trunk
+        self._weight_name = weight_name
+        self._head_indices = list(head_indices)
+
+    def forward(self, obs: torch.Tensor, act: torch.Tensor) -> list[torch.Tensor]:
+        """Read out ``psi_i(s, a)^T w``, with gradient flowing into ``psi`` only."""
+        psi = self.trunk.psi(obs, act)
+        weight = getattr(self.trunk, self._weight_name)
+        return [(psi[idx] * weight).sum(-1) for idx in self._head_indices]
