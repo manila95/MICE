@@ -156,5 +156,26 @@ defaults:
       ridge_kappa: 0.001
       # EMA smoothing coefficient for w_r / w_c across iterations, 1.0 = no smoothing (td_ridge mode only)
       ema_tau: 1.0
+      # where phi comes from (td_ridge mode only). In the off-policy Q flavors "s" below is
+      # really the raw (obs, act) pair, since the ridge regresses the immediate reward onto phi.
+      #   'trunk'    : phi = normalize(Linear(trunk(s))), a read-out of the same trunk psi is
+      #                read from. Nothing optimizes phi, but it drifts anyway because the trunk
+      #                beneath it is trained by the psi TD loss and the value losses -- so psi is
+      #                fit against a feature stream that moves during the fit, and the ridge
+      #                basis shifts out from under the w_r / w_c solved on it.
+      #   'random'   : phi = normalize(Linear(s)), frozen at init -- a fixed random projection of
+      #                the raw input. Stationary, but an affine map cannot raise rank: phi's
+      #                effective rank is capped at obs_dim + 1 however large sr_dim is (measured
+      #                18 of 64 on a 17-dim obs), and the ridge can only fit near-affine
+      #                rewards/costs. A lower-bound baseline; 'separate' is the full-rank
+      #                nonlinear version of the same stationarity idea.
+      #   'separate' : phi = normalize(MLP(s)) on the raw input, frozen at init -- fixed deep
+      #                random features. Stationary like 'random' but nonlinear, and its depth is
+      #                set independently of the trunk's (which 'trunk' mode cannot do, since phi
+      #                and psi are both single read-outs of one shared body there).
+      phi_source: trunk
+      # depth of the standalone phi network (phi_source: 'separate' only); as with sr_cfgs.
+      # hidden_sizes above, only the number of layers is used -- every width becomes sr_dim
+      phi_hidden_sizes: [64, 64]
   env_cfgs:
     lidar_num_bins: ~

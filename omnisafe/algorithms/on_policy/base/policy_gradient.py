@@ -688,6 +688,9 @@ class PolicyGradient(BaseAlgo):
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             for param in self._actor_critic.reward_critic.parameters():
+                if not param.requires_grad:
+                    # frozen phi network (sr_cfgs.phi_source); a no-op otherwise
+                    continue
                 loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coef
 
         loss.backward()
@@ -728,6 +731,9 @@ class PolicyGradient(BaseAlgo):
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             for param in self._actor_critic.cost_critic.parameters():
+                if not param.requires_grad:
+                    # frozen phi network (sr_cfgs.phi_source); a no-op otherwise
+                    continue
                 loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coef
 
         loss.backward()
@@ -785,6 +791,9 @@ class PolicyGradient(BaseAlgo):
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             for param in self._actor_critic.sr_trunk.parameters():
+                if not param.requires_grad:
+                    # frozen phi network (sr_cfgs.phi_source); a no-op otherwise
+                    continue
                 loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coef
 
         loss.backward()

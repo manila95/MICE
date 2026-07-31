@@ -44,6 +44,26 @@ the trunk input, so ``phi(s, a)`` / ``psi(s, a)`` and the read-outs satisfy the 
 |               | :class:`SuccessorRepresentationLinearReadout`| :class:`SuccessorRepresentationQLinearReadout`|
 +---------------+-----------------------------------------+---------------------------------------+
 
+Within ``td_ridge``, ``model_cfgs.sr_cfgs.phi_source`` selects where ``phi`` comes from:
+
+* ``trunk``: ``phi = normalize(phi_head(trunk(s)))`` -- a linear read-out of the same trunk
+  ``psi`` is read from. No loss is differentiable in ``phi``, so ``phi_head`` learns nothing, but
+  ``phi(s)`` still drifts every update because the trunk beneath it is trained by the ``psi`` TD
+  loss and the value losses. ``psi`` is therefore regressed onto a feature stream that moves
+  during the very updates that are fitting it, and the ridge basis shifts under ``w_r`` / ``w_c``.
+* ``random``: ``phi = normalize(W s + b)`` with ``W``, ``b`` frozen at initialization -- a fixed
+  random projection, the classic successor-feature setting. Stationary, but note that an affine
+  map cannot raise rank: ``phi``'s effective rank is capped at ``obs_dim + 1`` no matter how large
+  ``sr_dim`` is (measured 18 of 64 on a 17-dim observation), and the ridge can only fit
+  rewards/costs that are near-affine in the raw observation. Treat it as a lower-bound baseline
+  rather than a competitive mode -- ``separate`` is the full-rank nonlinear version of the same
+  stationarity idea.
+* ``separate``: ``phi = normalize(MLP(s))``, its own network on the raw observation, frozen at
+  initialization -- fixed *deep* random features. Stationary like ``random`` while recovering the
+  nonlinearity, and its depth is set independently of the trunk, which ``trunk`` mode cannot do
+  (there ``phi`` and ``psi`` are both single linear read-outs of one shared body, so they are
+  forced to share depth).
+
 The one structural difference in the Q flavors is that ``td_ridge`` carries ``num_psi_heads``
 independent ``psi`` heads over the shared trunk rather than one, so that the off-policy
 twin-critic (clipped double-Q) machinery in SAC/TD3 has genuinely distinct estimates to take a
@@ -206,6 +226,100 @@ class RidgeSolvedReadoutWeights(nn.Module):
         }
 
 
+class FrozenPhiFeatures(nn.Module):
+    r"""A one-step feature map ``phi`` held fixed at its initialization.
+
+    Backs the ``phi_source`` settings ``'random'`` (no hidden layers, i.e. a single random linear
+    projection) and ``'separate'`` (its own MLP). Both read the *raw* input rather than the trunk
+    that ``psi`` is read from, and every parameter is frozen with ``requires_grad_(False)`` and
+    left out of the SR optimizer.
+
+    Freezing is the entire point rather than an optimization detail. ``psi`` is *defined* as the
+    discounted sum of the ``phi`` stream, so a ``phi`` that moves during training gives ``psi`` a
+    target that refers to a feature map which no longer exists, and gives the ridge solve a basis
+    that shifts out from under the ``w_r`` / ``w_c`` it fitted. Holding ``phi`` still makes both
+    stationary for the whole run.
+
+    Args:
+        in_dim (int): Input dimension -- ``obs_dim`` for the V flavor, ``obs_dim + act_dim`` for
+            the Q flavor. The Q flavor must include the action: the ridge regresses the immediate
+            reward onto ``phi``, and that reward depends on the action taken.
+        hidden_sizes (list of int): Hidden layer sizes; empty gives a single linear projection.
+        sr_dim (int): Dimensionality of ``phi``.
+        activation (Activation): Activation function.
+        weight_initialization_mode (InitFunction): Weight initialization mode.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_sizes: list[int],
+        sr_dim: int,
+        activation: Activation,
+        weight_initialization_mode: InitFunction,
+    ) -> None:
+        """Initialize an instance of :class:`FrozenPhiFeatures`."""
+        super().__init__()
+        self.net = build_mlp_network(
+            sizes=[in_dim, *hidden_sizes, sr_dim],
+            activation=activation,
+            weight_initialization_mode=weight_initialization_mode,
+        )
+        self.net.requires_grad_(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the l2-normalized frozen feature of ``x``."""
+        p = self.net(x)
+        return p / (p.norm(dim=-1, keepdim=True) + 1e-8)
+
+
+def build_frozen_phi(
+    phi_source: str,
+    in_dim: int,
+    phi_hidden_sizes: list[int],
+    sr_dim: int,
+    activation: Activation,
+    weight_initialization_mode: InitFunction,
+) -> FrozenPhiFeatures | None:
+    """Validate ``phi_source`` and build the frozen ``phi`` network it asks for, if any.
+
+    Shared by the V and Q ``td_ridge`` trunks so the three settings are defined in one place.
+
+    Args:
+        phi_source (str): One of ``'trunk'``, ``'random'``, ``'separate'``.
+        in_dim (int): Input dimension of the frozen network (see :class:`FrozenPhiFeatures`).
+        phi_hidden_sizes (list of int): Hidden sizes, used by ``'separate'`` only.
+        sr_dim (int): Dimensionality of ``phi``.
+        activation (Activation): Activation function.
+        weight_initialization_mode (InitFunction): Weight initialization mode.
+
+    Returns:
+        The frozen network, or ``None`` for ``'trunk'`` (which reads ``phi`` off the shared trunk
+        via a trainable ``phi_head`` instead).
+    """
+    if phi_source == 'trunk':
+        return None
+    if phi_source == 'random':
+        # Pinned to depth 0 rather than reading phi_hidden_sizes: 'random' names one specific
+        # experimental condition (a fixed random linear projection of the raw input), and a
+        # stray phi_hidden_sizes in a sweep config should not silently redefine what it means.
+        hidden_sizes: list[int] = []
+    elif phi_source == 'separate':
+        hidden_sizes = list(phi_hidden_sizes)
+    else:
+        raise NotImplementedError(
+            f'Unknown sr_cfgs.phi_source "{phi_source}". '
+            'Available phi sources are: "trunk", "random", "separate".',
+        )
+    return FrozenPhiFeatures(
+        in_dim=in_dim,
+        hidden_sizes=hidden_sizes,
+        sr_dim=sr_dim,
+        activation=activation,
+        weight_initialization_mode=weight_initialization_mode,
+    )
+
+
 class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
     """phi / psi bundle for the literal successor-representation (``td_ridge``) mode.
 
@@ -215,6 +329,11 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         sr_dim (int): Dimensionality of ``phi`` and ``psi``.
         activation (Activation): Activation function.
         weight_initialization_mode (InitFunction): Weight initialization mode.
+        phi_source (str): Where ``phi`` comes from -- ``'trunk'`` (a trainable linear read-out of
+            the trunk shared with ``psi``), or ``'random'`` / ``'separate'`` (a frozen map of the
+            raw observation, see :func:`build_frozen_phi`).
+        phi_hidden_sizes (list of int): Hidden sizes of the standalone ``phi`` network, used by
+            ``phi_source='separate'`` only.
     """
 
     def __init__(
@@ -224,6 +343,8 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         sr_dim: int,
         activation: Activation,
         weight_initialization_mode: InitFunction,
+        phi_source: str = 'trunk',
+        phi_hidden_sizes: list[int] | None = None,
     ) -> None:
         """Initialize an instance of :class:`TDRidgeSuccessorRepresentationTrunk`."""
         super().__init__(sr_dim)
@@ -238,8 +359,20 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
             if hidden_sizes
             else nn.Identity()
         )
-        self.phi_head = nn.Linear(trunk_out, sr_dim)
-        initialize_layer(weight_initialization_mode, self.phi_head)
+        phi_net = build_frozen_phi(
+            phi_source,
+            in_dim=obs_dim,
+            phi_hidden_sizes=phi_hidden_sizes or [],
+            sr_dim=sr_dim,
+            activation=activation,
+            weight_initialization_mode=weight_initialization_mode,
+        )
+        self._phi_from_trunk = phi_net is None
+        if phi_net is None:
+            self.phi_head = nn.Linear(trunk_out, sr_dim)
+            initialize_layer(weight_initialization_mode, self.phi_head)
+        else:
+            self.phi_net = phi_net
         self.psi_head = build_mlp_network(
             sizes=[trunk_out, sr_dim],
             activation=activation,
@@ -251,7 +384,14 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         return self.trunk(obs)
 
     def phi(self, obs: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
-        """L2-normalized one-step feature ``phi(s)``."""
+        """L2-normalized one-step feature ``phi(s)``.
+
+        ``z`` is the shared trunk's features, accepted so a caller that already computed them for
+        ``psi`` need not pay for them twice. It is ignored when ``phi`` comes from a frozen map of
+        the raw observation, which by construction does not read the trunk at all.
+        """
+        if not self._phi_from_trunk:
+            return self.phi_net(obs)
         z = self.features(obs) if z is None else z
         p = self.phi_head(z)
         return p / (p.norm(dim=-1, keepdim=True) + 1e-8)
@@ -417,6 +557,11 @@ class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
         num_psi_heads (int): Number of independent ``psi`` read-out heads.
         activation (Activation): Activation function.
         weight_initialization_mode (InitFunction): Weight initialization mode.
+        phi_source (str): Where ``phi`` comes from -- ``'trunk'`` (a trainable linear read-out of
+            the trunk shared with ``psi``), or ``'random'`` / ``'separate'`` (a frozen map of the
+            raw ``cat([obs, act], -1)``, see :func:`build_frozen_phi`).
+        phi_hidden_sizes (list of int): Hidden sizes of the standalone ``phi`` network, used by
+            ``phi_source='separate'`` only.
     """
 
     def __init__(
@@ -428,6 +573,8 @@ class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
         num_psi_heads: int,
         activation: Activation,
         weight_initialization_mode: InitFunction,
+        phi_source: str = 'trunk',
+        phi_hidden_sizes: list[int] | None = None,
     ) -> None:
         """Initialize an instance of :class:`TDRidgeSuccessorRepresentationQTrunk`."""
         super().__init__(sr_dim)
@@ -443,8 +590,20 @@ class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
             if hidden_sizes
             else nn.Identity()
         )
-        self.phi_head = nn.Linear(trunk_out, sr_dim)
-        initialize_layer(weight_initialization_mode, self.phi_head)
+        phi_net = build_frozen_phi(
+            phi_source,
+            in_dim=in_dim,
+            phi_hidden_sizes=phi_hidden_sizes or [],
+            sr_dim=sr_dim,
+            activation=activation,
+            weight_initialization_mode=weight_initialization_mode,
+        )
+        self._phi_from_trunk = phi_net is None
+        if phi_net is None:
+            self.phi_head = nn.Linear(trunk_out, sr_dim)
+            initialize_layer(weight_initialization_mode, self.phi_head)
+        else:
+            self.phi_net = phi_net
         self.psi_heads = nn.ModuleList(
             build_mlp_network(
                 sizes=[trunk_out, sr_dim],
@@ -464,7 +623,14 @@ class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
         act: torch.Tensor,
         z: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """L2-normalized one-step feature ``phi(s, a)``."""
+        """L2-normalized one-step feature ``phi(s, a)``.
+
+        ``z`` is the shared trunk's features, accepted so a caller that already computed them for
+        ``psi`` need not pay for them twice. It is ignored when ``phi`` comes from a frozen map of
+        the raw input, which by construction does not read the trunk at all.
+        """
+        if not self._phi_from_trunk:
+            return self.phi_net(torch.cat([obs, act], dim=-1))
         z = self.features(obs, act) if z is None else z
         p = self.phi_head(z)
         return p / (p.norm(dim=-1, keepdim=True) + 1e-8)

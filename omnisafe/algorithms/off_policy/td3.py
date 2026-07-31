@@ -97,6 +97,9 @@ class TD3(DDPG):
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             for param in self._actor_critic.reward_critic.parameters():
+                if not param.requires_grad:
+                    # frozen phi network (sr_cfgs.phi_source); a no-op otherwise
+                    continue
                 loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coeff
 
         self._actor_critic.reward_critic_optimizer.zero_grad()

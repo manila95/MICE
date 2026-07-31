@@ -135,6 +135,10 @@ class ConstraintActorCritic(ActorCritic):
         # effective rank below sr_dim (wasted capacity in shared_trunk mode; a rank-deficient,
         # exactly-singular-without-regularization ridge Gram matrix in td_ridge mode).
         hidden_sizes = [sr_cfgs.sr_dim] * len(sr_cfgs.hidden_sizes)
+        # Same convention for the standalone phi network of sr_cfgs.phi_source='separate': only
+        # the configured depth is used, every width is sr_dim. Its depth is independent of the
+        # trunk's, which is the point of that mode.
+        phi_hidden_sizes = [sr_cfgs.sr_dim] * len(sr_cfgs.get('phi_hidden_sizes', []) or [])
 
         if self._sr_mode == 'shared_trunk':
             trunk = SuccessorRepresentationTrunk(
@@ -171,6 +175,8 @@ class ConstraintActorCritic(ActorCritic):
                 sr_dim=sr_cfgs.sr_dim,
                 activation=sr_cfgs.activation,
                 weight_initialization_mode=model_cfgs.weight_initialization_mode,
+                phi_source=sr_cfgs.get('phi_source', 'trunk'),
+                phi_hidden_sizes=phi_hidden_sizes,
             )
             self.reward_critic = SuccessorRepresentationLinearReadout(
                 obs_space,
@@ -188,8 +194,10 @@ class ConstraintActorCritic(ActorCritic):
             )
             self.sr_trunk = trunk
             # w_r / w_c are buffers (ridge-solved), so the trunk's own parameters (trunk +
-            # phi_head + psi_head) are the complete set of SGD-trainable SR parameters.
-            trainable_params = trunk.parameters()
+            # phi_head + psi_head) are the complete set of SGD-trainable SR parameters. The
+            # requires_grad filter drops the frozen phi network under phi_source='random' /
+            # 'separate'; it is a no-op under phi_source='trunk', where nothing is frozen.
+            trainable_params = (param for param in trunk.parameters() if param.requires_grad)
         else:
             raise NotImplementedError(
                 f'Unknown sr_cfgs.sr_mode "{self._sr_mode}". '
