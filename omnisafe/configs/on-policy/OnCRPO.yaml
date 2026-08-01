@@ -164,6 +164,17 @@ defaults:
       ridge_kappa: 0.001
       # EMA smoothing coefficient for w_r / w_c across iterations, 1.0 = no smoothing (td_ridge mode only)
       ema_tau: 1.0
+      # read-out weight learning (td_ridge mode): 'ridge' (closed-form each epoch) or 'sgd'
+      # (gradient descent over a persistent cross-epoch replay buffer; principled with a frozen
+      # phi_source: random / separate). On-policy 'sgd' keeps its own buffer since the rollout
+      # buffer is wiped every epoch, so w is still fit over all past experience.
+      readout: ridge
+      # learning rate for the sgd read-out weights (readout: sgd only); null = reuse sr_cfgs.lr
+      w_lr: ~
+      # capacity of the persistent sgd read-out replay buffer (readout: sgd only)
+      readout_buffer_size: 1000000
+      # gradient steps taken on w_r / w_c per epoch (readout: sgd only)
+      readout_grad_steps: 50
       # where phi comes from (td_ridge mode only). In the off-policy Q flavors "s" below is
       # really the raw (obs, act) pair, since the ridge regresses the immediate reward onto phi.
       #   'trunk'    : phi = normalize(Linear(trunk(s))), a read-out of the same trunk psi is

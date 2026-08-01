@@ -147,6 +147,17 @@ defaults:
       ridge_kappa: 0.001
       # EMA smoothing coefficient for w_r / w_c across iterations, 1.0 = no smoothing (td_ridge mode only)
       ema_tau: 1.0
+      # how the reward/cost read-out weights w_r / w_c are learned (td_ridge mode only):
+      #   'ridge': closed-form ridge regression of the immediate reward/cost onto phi each batch
+      #            (uses ridge_kappa / ema_tau above; w_r / w_c are buffers).
+      #   'sgd'  : learn w_r / w_c by gradient descent on the same regression. Since the read-out
+      #            r(s,a) ~= phi(s,a) . w is policy-independent, it accumulates over the whole
+      #            replay buffer; principled when phi is frozen (phi_source: random / separate),
+      #            where the regression target is stationary. w_r / w_c become parameters tracked
+      #            onto the target trunk by polyak (no ridge_kappa / ema_tau sync).
+      readout: ridge
+      # learning rate for the sgd read-out weights (readout: sgd only); null = reuse sr_cfgs.lr
+      w_lr: ~
       # where phi comes from (td_ridge mode only). In the off-policy Q flavors "s" below is
       # really the raw (obs, act) pair, since the ridge regresses the immediate reward onto phi.
       #   'trunk'    : phi = normalize(Linear(trunk(s))), a read-out of the same trunk psi is

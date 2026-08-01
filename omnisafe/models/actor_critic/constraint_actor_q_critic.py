@@ -211,6 +211,9 @@ class ConstraintActorQCritic(ActorQCritic):
                 self.cost_critic.heads.parameters(),
             )
         elif self._sr_mode == 'td_ridge':
+            # Read-out weight learning: 'ridge' (closed-form buffers) or 'sgd' (learned params).
+            self._sr_readout: str = sr_cfgs.get('readout', 'ridge')
+            learnable_readout = self._sr_readout == 'sgd'
             trunk = TDRidgeSuccessorRepresentationQTrunk(
                 obs_dim=obs_dim,
                 act_dim=act_dim,
@@ -221,6 +224,7 @@ class ConstraintActorQCritic(ActorQCritic):
                 weight_initialization_mode=model_cfgs.weight_initialization_mode,
                 phi_source=sr_cfgs.get('phi_source', 'trunk'),
                 phi_hidden_sizes=phi_hidden_sizes,
+                learnable_readout=learnable_readout,
             )
             self.reward_critic = SuccessorRepresentationQLinearReadout(
                 obs_space,
@@ -238,11 +242,19 @@ class ConstraintActorQCritic(ActorQCritic):
                 [0],
                 model_cfgs.weight_initialization_mode,
             )
-            # w_r / w_c are buffers (ridge-solved), so the trunk's own parameters (trunk +
-            # phi_head + psi_heads) are the complete set of SGD-trainable SR parameters. The
-            # requires_grad filter drops the frozen phi network under phi_source='random' /
-            # 'separate'; it is a no-op under phi_source='trunk', where nothing is frozen.
-            trainable_params = (param for param in trunk.parameters() if param.requires_grad)
+            # The trunk parameters (trunk body + phi_head + psi_heads) are trained by the value /
+            # SR-feature losses through the shared sr_optimizer. Under readout='sgd', w_r / w_c are
+            # also parameters but are trained by their own regression loss on a separate optimizer,
+            # so they are excluded here. The requires_grad filter additionally drops the frozen phi
+            # network under phi_source='random' / 'separate' (a no-op under 'trunk').
+            readout_weight_ids = (
+                {id(trunk.w_r), id(trunk.w_c)} if learnable_readout else set()
+            )
+            trainable_params = [
+                param
+                for param in trunk.parameters()
+                if param.requires_grad and id(param) not in readout_weight_ids
+            ]
         else:
             raise NotImplementedError(
                 f'Unknown sr_cfgs.sr_mode "{self._sr_mode}". '
@@ -268,6 +280,13 @@ class ConstraintActorQCritic(ActorQCritic):
             self.reward_critic_optimizer: optim.Optimizer = sr_optimizer
             self.cost_critic_optimizer: optim.Optimizer = sr_optimizer
             self.sr_optimizer: optim.Optimizer = sr_optimizer
+            # Under readout='sgd', w_r / w_c get their own optimizer so their regression loss
+            # never shares Adam state with (or steps) the representation parameters.
+            if self._sr_mode == 'td_ridge' and self._sr_readout == 'sgd':
+                w_lr = sr_cfgs.get('w_lr', None) or sr_cfgs.lr
+                self.sr_readout_optimizer: optim.Optimizer = optim.Adam(
+                    [self.sr_trunk.w_r, self.sr_trunk.w_c], lr=w_lr,
+                )
 
     def sr_features(
         self,

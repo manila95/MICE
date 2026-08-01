@@ -159,23 +159,79 @@ class SuccessorRepresentationReadout(Critic):
 
 
 class RidgeSolvedReadoutWeights(nn.Module):
-    """Owns the ridge-solved ``w_r`` / ``w_c`` read-out weights of a ``td_ridge`` trunk.
+    """Owns the ``w_r`` / ``w_c`` read-out weights of a ``td_ridge`` trunk.
 
     Factored out of the trunks themselves so the state-only (V) and action-conditioned (Q)
-    flavors share one implementation of the closed-form solve.
+    flavors share one implementation. Two ways of learning the weights are supported, selected by
+    ``learnable_readout`` (``model_cfgs.sr_cfgs.readout``):
+
+    * ``learnable_readout=False`` (``readout='ridge'``, the default): ``w_r`` / ``w_c`` are
+      **buffers** refreshed in closed form by :meth:`ridge_update` -- the exact ridge solution of
+      the immediate reward/cost onto ``phi`` on each batch.
+    * ``learnable_readout=True`` (``readout='sgd'``): ``w_r`` / ``w_c`` are **parameters** trained
+      by gradient descent on the same regression (:meth:`regression_loss`). Because the reward/cost
+      read-out ``r(s,a) ~= phi(s,a) . w`` is policy-independent, this can be learned over the whole
+      replay buffer; it is the natural choice when ``phi`` is frozen (``phi_source`` ``random`` /
+      ``separate``), where the regression target is stationary. The weights are then ordinary
+      parameters, so :meth:`ConstraintActorQCritic.polyak_update` tracks them onto the target trunk
+      (no ``sync_sr_readout_weights`` needed).
 
     Args:
         sr_dim (int): Dimensionality of ``phi``, and hence of ``w_r`` / ``w_c``.
+        learnable_readout (bool): Register ``w_r`` / ``w_c`` as SGD-trained parameters instead of
+            ridge-solved buffers. Defaults to ``False``.
     """
 
-    def __init__(self, sr_dim: int) -> None:
+    def __init__(self, sr_dim: int, learnable_readout: bool = False) -> None:
         """Initialize an instance of :class:`RidgeSolvedReadoutWeights`."""
         super().__init__()
         self.sr_dim = sr_dim
-        # w_r / w_c are solved by closed-form ridge regression (see ridge_update), never by
-        # SGD, so they are buffers rather than parameters.
-        self.register_buffer('w_r', torch.zeros(sr_dim))
-        self.register_buffer('w_c', torch.zeros(sr_dim))
+        self.learnable_readout = learnable_readout
+        if learnable_readout:
+            # Learned by SGD on the reward/cost regression (see regression_loss).
+            self.w_r = nn.Parameter(torch.zeros(sr_dim))
+            self.w_c = nn.Parameter(torch.zeros(sr_dim))
+        else:
+            # Solved by closed-form ridge regression (see ridge_update), never by SGD.
+            self.register_buffer('w_r', torch.zeros(sr_dim))
+            self.register_buffer('w_c', torch.zeros(sr_dim))
+
+    def regression_loss(
+        self,
+        phi: torch.Tensor,
+        reward: torch.Tensor,
+        cost: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        r"""SGD counterpart of :meth:`ridge_update`: MSE of ``phi . w`` onto reward / cost.
+
+        Fits the same linear read-out ``r(s,a) ~= phi(s,a) . w_r`` / ``c(s,a) ~= phi(s,a) . w_c``
+        the ridge solve targets, but by gradient descent so it accumulates over many replay
+        batches instead of being re-solved from scratch each batch. ``phi`` must be passed already
+        detached (it is a fixed basis here -- this loss trains ``w`` only, never the representation).
+
+        Args:
+            phi (torch.Tensor): One-step features of shape ``(N, sr_dim)`` (detached).
+            reward (torch.Tensor): One-step rewards of shape ``(N,)``.
+            cost (torch.Tensor): One-step costs of shape ``(N,)``.
+
+        Returns:
+            The scalar regression loss to back-propagate, and a dict of logging statistics whose
+            keys match :meth:`ridge_update` (``GramCond`` is not defined for the SGD path).
+        """
+        assert self.learnable_readout, 'regression_loss requires learnable (sgd) read-out weights.'
+        pred_r = (phi * self.w_r).sum(-1)
+        pred_c = (phi * self.w_c).sum(-1)
+        loss_r = nn.functional.mse_loss(pred_r, reward.reshape(-1))
+        loss_c = nn.functional.mse_loss(pred_c, cost.reshape(-1))
+        loss = loss_r + loss_c
+        stats = {
+            'Misc/RidgeResidualReward': loss_r.detach().sqrt().item(),
+            'Misc/RidgeResidualCost': loss_c.detach().sqrt().item(),
+            'Misc/WrNorm': self.w_r.detach().norm().item(),
+            'Misc/WcNorm': self.w_c.detach().norm().item(),
+            'Misc/GramCond': 0.0,  # not defined for the SGD read-out
+        }
+        return loss, stats
 
     @torch.no_grad()
     def ridge_update(
@@ -345,9 +401,10 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         weight_initialization_mode: InitFunction,
         phi_source: str = 'trunk',
         phi_hidden_sizes: list[int] | None = None,
+        learnable_readout: bool = False,
     ) -> None:
         """Initialize an instance of :class:`TDRidgeSuccessorRepresentationTrunk`."""
-        super().__init__(sr_dim)
+        super().__init__(sr_dim, learnable_readout=learnable_readout)
         trunk_out = hidden_sizes[-1] if hidden_sizes else obs_dim
         self.trunk: nn.Module = (
             build_mlp_network(
@@ -438,9 +495,14 @@ class SuccessorRepresentationLinearReadout(Critic):
         self._weight_name = weight_name
 
     def forward(self, obs: torch.Tensor) -> list[torch.Tensor]:
-        """Read out a scalar value as ``psi(s)^T w``, with gradient flowing into ``psi`` only."""
+        """Read out a scalar value as ``psi(s)^T w``, with gradient flowing into ``psi`` only.
+
+        ``w`` is detached so the value-target loss never trains it: it is a buffer under
+        ``readout='ridge'`` (detach is a no-op) and an SGD parameter under ``readout='sgd'``
+        (trained solely by :meth:`RidgeSolvedReadoutWeights.regression_loss`).
+        """
         psi = self.trunk.psi(obs)
-        weight = getattr(self.trunk, self._weight_name)
+        weight = getattr(self.trunk, self._weight_name).detach()
         value = (psi * weight).sum(-1)
         return [value]
 
@@ -575,9 +637,10 @@ class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
         weight_initialization_mode: InitFunction,
         phi_source: str = 'trunk',
         phi_hidden_sizes: list[int] | None = None,
+        learnable_readout: bool = False,
     ) -> None:
         """Initialize an instance of :class:`TDRidgeSuccessorRepresentationQTrunk`."""
-        super().__init__(sr_dim)
+        super().__init__(sr_dim, learnable_readout=learnable_readout)
         in_dim = obs_dim + act_dim
         trunk_out = hidden_sizes[-1] if hidden_sizes else in_dim
         self.trunk: nn.Module = (
@@ -688,7 +751,12 @@ class SuccessorRepresentationQLinearReadout(Critic):
         self._head_indices = list(head_indices)
 
     def forward(self, obs: torch.Tensor, act: torch.Tensor) -> list[torch.Tensor]:
-        """Read out ``psi_i(s, a)^T w``, with gradient flowing into ``psi`` only."""
+        """Read out ``psi_i(s, a)^T w``, with gradient flowing into ``psi`` only.
+
+        ``w`` is detached so the critic/actor losses never train it: it is a buffer under
+        ``readout='ridge'`` (detach is a no-op) and an SGD parameter under ``readout='sgd'``
+        (trained solely by :meth:`RidgeSolvedReadoutWeights.regression_loss`).
+        """
         psi = self.trunk.psi(obs, act)
-        weight = getattr(self.trunk, self._weight_name)
+        weight = getattr(self.trunk, self._weight_name).detach()
         return [(psi[idx] * weight).sum(-1) for idx in self._head_indices]

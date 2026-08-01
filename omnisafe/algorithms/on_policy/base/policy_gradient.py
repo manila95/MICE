@@ -29,6 +29,7 @@ from omnisafe.adapter import OnPolicyAdapter
 from omnisafe.algorithms import registry
 from omnisafe.algorithms.base_algo import BaseAlgo
 from omnisafe.common.buffer import VectorOnPolicyBuffer
+from omnisafe.common.buffer.readout_buffer import ReadoutReplayBuffer
 from omnisafe.common.logger import Logger
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
 from omnisafe.utils import distributed
@@ -121,6 +122,11 @@ class PolicyGradient(BaseAlgo):
             'sr_mode',
             'shared_trunk',
         ) == 'td_ridge'
+        # How the td_ridge read-out weights w_r / w_c are learned: 'ridge' (closed-form on the
+        # fresh epoch) or 'sgd' (gradient descent over a persistent cross-epoch replay buffer).
+        self._sr_readout: str = (
+            self._cfgs.model_cfgs.sr_cfgs.get('readout', 'ridge') if self._sr_td_ridge else 'ridge'
+        )
 
         self._buf: VectorOnPolicyBuffer = VectorOnPolicyBuffer(
             obs_space=self._env.observation_space,
@@ -141,6 +147,17 @@ class PolicyGradient(BaseAlgo):
             lam_sr=self._cfgs.model_cfgs.sr_cfgs.get('lam_sr', 0.95) if self._sr_td_ridge else 0.95,
             gamma_sr=self._cfgs.model_cfgs.sr_cfgs.get('gamma_sr', None) if self._sr_td_ridge else None,
         )
+
+        # Persistent cross-epoch buffer for the sgd read-out regression (readout='sgd' only). The
+        # rollout buffer above is wiped each epoch; this one accumulates the whole history so w_r /
+        # w_c can be fit over all past experience (the read-out is policy-independent).
+        self._sr_readout_buf: ReadoutReplayBuffer | None = None
+        if self._sr_td_ridge and self._sr_readout == 'sgd':
+            self._sr_readout_buf = ReadoutReplayBuffer(
+                obs_dim=self._env.observation_space.shape[0],
+                size=int(self._cfgs.model_cfgs.sr_cfgs.get('readout_buffer_size', 1_000_000)),
+                device=self._device,
+            )
 
     def _init_log(self) -> None:
         """Log info about epoch.
@@ -400,7 +417,10 @@ class PolicyGradient(BaseAlgo):
         train_data, val_data = self._make_train_val_split(data)
 
         if self._sr_td_ridge:
-            self._ridge_update_successor_weights(train_data)
+            if self._sr_readout == 'ridge':
+                self._ridge_update_successor_weights(train_data)
+            else:  # 'sgd': fit w_r / w_c over the persistent cross-epoch buffer
+                self._sgd_update_readout_weights(data)
             target_sr = train_data['target_sr']
 
         obs, act, logp, target_value_r, target_value_c, adv_r, adv_c = (
@@ -770,6 +790,47 @@ class PolicyGradient(BaseAlgo):
             ema_tau=sr_cfgs.get('ema_tau', 1.0),
         )
         self._logger.store(stats)
+
+    def _sgd_update_readout_weights(self, data: dict[str, torch.Tensor]) -> None:
+        r"""Fit the ``readout='sgd'`` read-out weights ``w_r`` / ``w_c`` by gradient descent.
+
+        The on-policy analogue of :meth:`_ridge_update_successor_weights`. Rather than re-solving
+        the ``phi -> reward/cost`` regression in closed form on the fresh epoch (and then throwing
+        that data away), it appends the epoch to a persistent replay buffer and takes several SGD
+        steps over the whole accumulated history. This is valid precisely because the read-out
+        ``r(s) \approx phi(s) . w`` is policy-independent, so stale-policy transitions are still
+        correct regression targets -- most cleanly when ``phi`` is frozen (``phi_source`` ``random``
+        / ``separate``), where the target is fully stationary.
+
+        ``phi`` is recomputed from the stored observations via :meth:`sr_features` (detached), so
+        this loss trains ``w`` only, never the representation.
+
+        Args:
+            data (dict[str, torch.Tensor]): The full (pre train/val split) epoch batch, providing
+                the ``obs`` / ``reward`` / ``cost`` fields added to the persistent buffer.
+        """
+        assert self._sr_readout_buf is not None
+        sr_cfgs = self._cfgs.model_cfgs.sr_cfgs
+        # The read-out regression is policy-independent, so all of the epoch's data is valid.
+        self._sr_readout_buf.add(data['obs'], data['reward'], data['cost'])
+
+        grad_steps = int(sr_cfgs.get('readout_grad_steps', 50))
+        batch_size = self._cfgs.algo_cfgs.batch_size
+        stats: dict[str, float] = {}
+        for _ in range(grad_steps):
+            obs_b, reward_b, cost_b = self._sr_readout_buf.sample(batch_size)
+            phi_b, _ = self._actor_critic.sr_features(obs_b)  # detached: trains w only
+            loss, stats = self._actor_critic.sr_trunk.regression_loss(phi_b, reward_b, cost_b)
+            self._actor_critic.sr_readout_optimizer.zero_grad()
+            loss.backward()
+            if self._cfgs.algo_cfgs.use_max_grad_norm:
+                clip_grad_norm_(
+                    [self._actor_critic.sr_trunk.w_r, self._actor_critic.sr_trunk.w_c],
+                    self._cfgs.algo_cfgs.max_grad_norm,
+                )
+            self._actor_critic.sr_readout_optimizer.step()
+        if stats:
+            self._logger.store(stats)
 
     def _update_successor_features(self, obs: torch.Tensor, target_sr: torch.Tensor) -> None:
         r"""Update the ``td_ridge`` successor-representation trunk under a double for loop.

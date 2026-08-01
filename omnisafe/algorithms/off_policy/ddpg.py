@@ -138,6 +138,11 @@ class DDPG(BaseAlgo):
         self._sr_td_ridge: bool = (
             use_sr and self._cfgs.model_cfgs.sr_cfgs.get('sr_mode', 'shared_trunk') == 'td_ridge'
         )
+        # How the td_ridge read-out weights w_r / w_c are learned: 'ridge' (closed-form each
+        # batch) or 'sgd' (gradient descent over the replay buffer).
+        self._sr_readout: str = (
+            self._cfgs.model_cfgs.sr_cfgs.get('readout', 'ridge') if self._sr_td_ridge else 'ridge'
+        )
 
     def _init_log(self) -> None:
         """Log info about epoch.
@@ -417,7 +422,7 @@ class DDPG(BaseAlgo):
                 data['next_obs'],
             )
 
-            if self._sr_td_ridge:
+            if self._sr_td_ridge and self._sr_readout == 'ridge':
                 # Refresh w_r / w_c before the critic losses consume them, mirroring how the
                 # on-policy path solves the ridge on the fresh batch before its minibatch loop.
                 self._ridge_update_successor_weights(obs, act, reward, cost)
@@ -427,6 +432,11 @@ class DDPG(BaseAlgo):
                 self._update_cost_critic(obs, act, cost, done, next_obs)
             if self._sr_td_ridge:
                 self._update_successor_features(obs, act, done, next_obs)
+                if self._sr_readout == 'sgd':
+                    # Take one gradient step on the SGD read-out weights. Order relative to the
+                    # critic losses is irrelevant: w is detached in the critic read-out, so it is
+                    # trained only here, and the target trunk tracks it via polyak_update.
+                    self._sgd_update_readout_weights(obs, act, reward, cost)
 
             if self._update_count % self._cfgs.algo_cfgs.policy_delay == 0:
                 self._update_actor(obs)
@@ -467,6 +477,45 @@ class DDPG(BaseAlgo):
             ema_tau=sr_cfgs.get('ema_tau', 1.0),
         )
         self._actor_critic.sync_sr_readout_weights()
+        self._logger.store(stats)
+
+    def _sgd_update_readout_weights(
+        self,
+        obs: torch.Tensor,
+        act: torch.Tensor,
+        reward: torch.Tensor,
+        cost: torch.Tensor,
+    ) -> None:
+        """Take one SGD step on the ``readout='sgd'`` read-out weights ``w_r`` / ``w_c``.
+
+        The gradient-descent analogue of :meth:`_ridge_update_successor_weights`: instead of
+        re-solving the ``phi -> reward/cost`` regression from scratch each batch, it fits the same
+        regression by gradient descent, so ``w`` accumulates over the whole replay buffer. Because
+        the reward/cost read-out is policy-independent, every past transition is valid training
+        data -- this is the setting the mode is meant for, most cleanly with a frozen ``phi``
+        (``phi_source`` ``random`` / ``separate``), where the regression target is stationary.
+
+        ``phi`` is taken from :meth:`sr_features`, i.e. detached, so this loss trains ``w`` only,
+        never the representation. Unlike the ridge path there is no target sync: ``w`` is now a
+        parameter, so ``polyak_update`` tracks it onto the target trunk like any other.
+
+        Args:
+            obs (torch.Tensor): The ``observation`` sampled from buffer.
+            act (torch.Tensor): The ``action`` sampled from buffer.
+            reward (torch.Tensor): The ``reward`` sampled from buffer.
+            cost (torch.Tensor): The ``cost`` sampled from buffer.
+        """
+        phi, _ = self._actor_critic.sr_features(obs, act)  # detached: trains w only
+        loss, stats = self._actor_critic.sr_trunk.regression_loss(phi, reward, cost)
+
+        self._actor_critic.sr_readout_optimizer.zero_grad()
+        loss.backward()
+        if self._cfgs.algo_cfgs.max_grad_norm:
+            clip_grad_norm_(
+                [self._actor_critic.sr_trunk.w_r, self._actor_critic.sr_trunk.w_c],
+                self._cfgs.algo_cfgs.max_grad_norm,
+            )
+        self._actor_critic.sr_readout_optimizer.step()
         self._logger.store(stats)
 
     def _update_successor_features(
