@@ -815,7 +815,7 @@ class PolicyGradient(BaseAlgo):
         self._sr_readout_buf.add(data['obs'], data['reward'], data['cost'])
 
         grad_steps = int(sr_cfgs.get('readout_grad_steps', 50))
-        batch_size = self._cfgs.algo_cfgs.batch_size
+        batch_size = sr_cfgs.get('readout_batch_size', None) or self._cfgs.algo_cfgs.batch_size
         stats: dict[str, float] = {}
         for _ in range(grad_steps):
             obs_b, reward_b, cost_b = self._sr_readout_buf.sample(batch_size)

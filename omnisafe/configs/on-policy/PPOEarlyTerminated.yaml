@@ -167,6 +167,12 @@ defaults:
       readout_buffer_size: 1000000
       # gradient steps taken on w_r / w_c per epoch (readout: sgd only)
       readout_grad_steps: 50
+      # L2 weight decay on the sgd read-out weights (readout: sgd only) -- the SGD analogue of the
+      # ridge kappa; raise it if w_r / w_c overfit (e.g. rank-deficient phi under phi_source: random)
+      w_weight_decay: 0.0
+      # minibatch size for the sgd read-out regression (readout: sgd only), sampled from the
+      # persistent buffer independently of the policy update; null = reuse algo_cfgs.batch_size
+      readout_batch_size: ~
       # where phi comes from (td_ridge mode only). In the off-policy Q flavors "s" below is
       # really the raw (obs, act) pair, since the ridge regresses the immediate reward onto phi.
       #   'trunk'    : phi = normalize(Linear(trunk(s))), a read-out of the same trunk psi is

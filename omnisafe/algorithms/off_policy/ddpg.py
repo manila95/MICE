@@ -436,7 +436,7 @@ class DDPG(BaseAlgo):
                     # Take one gradient step on the SGD read-out weights. Order relative to the
                     # critic losses is irrelevant: w is detached in the critic read-out, so it is
                     # trained only here, and the target trunk tracks it via polyak_update.
-                    self._sgd_update_readout_weights(obs, act, reward, cost)
+                    self._sgd_update_readout_weights()
 
             if self._update_count % self._cfgs.algo_cfgs.policy_delay == 0:
                 self._update_actor(obs)
@@ -479,13 +479,7 @@ class DDPG(BaseAlgo):
         self._actor_critic.sync_sr_readout_weights()
         self._logger.store(stats)
 
-    def _sgd_update_readout_weights(
-        self,
-        obs: torch.Tensor,
-        act: torch.Tensor,
-        reward: torch.Tensor,
-        cost: torch.Tensor,
-    ) -> None:
+    def _sgd_update_readout_weights(self) -> None:
         """Take one SGD step on the ``readout='sgd'`` read-out weights ``w_r`` / ``w_c``.
 
         The gradient-descent analogue of :meth:`_ridge_update_successor_weights`: instead of
@@ -495,16 +489,16 @@ class DDPG(BaseAlgo):
         data -- this is the setting the mode is meant for, most cleanly with a frozen ``phi``
         (``phi_source`` ``random`` / ``separate``), where the regression target is stationary.
 
+        A fresh minibatch of ``sr_cfgs.readout_batch_size`` transitions is sampled from the replay
+        buffer (independent of the critics' batch, so the read-out can use a different size).
         ``phi`` is taken from :meth:`sr_features`, i.e. detached, so this loss trains ``w`` only,
         never the representation. Unlike the ridge path there is no target sync: ``w`` is now a
         parameter, so ``polyak_update`` tracks it onto the target trunk like any other.
-
-        Args:
-            obs (torch.Tensor): The ``observation`` sampled from buffer.
-            act (torch.Tensor): The ``action`` sampled from buffer.
-            reward (torch.Tensor): The ``reward`` sampled from buffer.
-            cost (torch.Tensor): The ``cost`` sampled from buffer.
         """
+        sr_cfgs = self._cfgs.model_cfgs.sr_cfgs
+        batch_size = sr_cfgs.get('readout_batch_size', None) or self._cfgs.algo_cfgs.batch_size
+        data = self._buf.sample_batch(batch_size)
+        obs, act, reward, cost = data['obs'], data['act'], data['reward'], data['cost']
         phi, _ = self._actor_critic.sr_features(obs, act)  # detached: trains w only
         loss, stats = self._actor_critic.sr_trunk.regression_loss(phi, reward, cost)
 

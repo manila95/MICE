@@ -281,11 +281,14 @@ class ConstraintActorQCritic(ActorQCritic):
             self.cost_critic_optimizer: optim.Optimizer = sr_optimizer
             self.sr_optimizer: optim.Optimizer = sr_optimizer
             # Under readout='sgd', w_r / w_c get their own optimizer so their regression loss
-            # never shares Adam state with (or steps) the representation parameters.
+            # never shares Adam state with (or steps) the representation parameters. Its
+            # weight_decay is the SGD analogue of the ridge kappa -- explicit L2 on w_r / w_c.
             if self._sr_mode == 'td_ridge' and self._sr_readout == 'sgd':
                 w_lr = sr_cfgs.get('w_lr', None) or sr_cfgs.lr
                 self.sr_readout_optimizer: optim.Optimizer = optim.Adam(
-                    [self.sr_trunk.w_r, self.sr_trunk.w_c], lr=w_lr,
+                    [self.sr_trunk.w_r, self.sr_trunk.w_c],
+                    lr=w_lr,
+                    weight_decay=sr_cfgs.get('w_weight_decay', 0.0),
                 )
 
     def sr_features(
