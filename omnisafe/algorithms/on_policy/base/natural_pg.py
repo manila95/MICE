@@ -198,7 +198,10 @@ class NaturalPG(PolicyGradient):
         train_data, val_data = self._make_train_val_split(data)
 
         if self._sr_td_ridge:
-            self._ridge_update_successor_weights(train_data)
+            if self._sr_readout == 'ridge':
+                self._ridge_update_successor_weights(train_data)
+            else:  # 'sgd': fit w_r / w_c over the persistent cross-epoch buffer
+                self._sgd_update_readout_weights(data)
             target_sr = train_data['target_sr']
 
         obs, act, logp, target_value_r, target_value_c, adv_r, adv_c = (
