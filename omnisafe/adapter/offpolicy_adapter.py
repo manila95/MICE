@@ -25,6 +25,7 @@ from omnisafe.common.buffer import VectorOffPolicyBuffer
 from omnisafe.common.logger import Logger
 from omnisafe.models.actor_critic.constraint_actor_q_critic import ConstraintActorQCritic
 from omnisafe.utils.config import Config
+from omnisafe.utils.value_eval import estimate_true_q_value
 
 
 class OffPolicyAdapter(OnlineAdapter):
@@ -102,6 +103,50 @@ class OffPolicyAdapter(OnlineAdapter):
                     'Metrics/TestEpLen': ep_len,
                 },
             )
+
+    def eval_value_function(  # pylint: disable=too-many-arguments
+        self,
+        agent: ConstraintActorQCritic,
+        discount_r: float,
+        discount_c: float,
+        eval_episodes: int,
+        epoch: int,
+        deterministic: bool = False,
+    ) -> None:
+        """Compare the Q-critics against Monte-Carlo returns of the current policy.
+
+        Runs on the *training* environment (not ``_eval_env``) so that the observation, reward
+        and cost normalizers are exactly the ones the critics were fit under -- the same choice
+        the on-policy path makes in :meth:`PolicyGradient.learn`.
+
+        .. warning::
+            Borrowing the training environment consumes it: the episode that :meth:`rollout` had
+            in flight is destroyed. The environment is therefore reset afterwards and the partial
+            episode's ``EpRet`` / ``EpCost`` / ``EpLen`` accumulators are dropped rather than
+            logged as if they were a complete episode.
+
+        Args:
+            agent (ConstraintActorQCritic): Constraint actor-critic, including actor, reward
+                critic, and cost critic.
+            discount_r (float): The discount factor used for the reward critic's targets.
+            discount_c (float): The discount factor used for the cost critic's targets.
+            eval_episodes (int): Number of complete episodes to roll out.
+            epoch (int): Current epoch, used as the wandb step.
+            deterministic (bool): Whether to evaluate the deterministic policy. Defaults to
+                False, matching how training transitions are generated.
+        """
+        estimate_true_q_value(
+            agent=agent,
+            env=self._env,
+            cfgs=self._cfgs,
+            discount_r=discount_r,
+            discount_c=discount_c,
+            eval_episodes=eval_episodes,
+            epoch=epoch,
+            deterministic=deterministic,
+        )
+        self._current_obs, _ = self.reset()
+        self._reset_log()
 
     def rollout(  # pylint: disable=too-many-locals
         self,

@@ -16,11 +16,98 @@ def estimate_true_value(agent, env, cfgs, discount_r, discount_c, eval_episodes=
     - Eval_s0: initial state of each episode — V(s_0) vs. G_0.
     - Eval_all: every visited state — V(s_t) vs. G_t (MC return from step t).
     """
+
+    def _predict(obs):
+        act, est_r, est_c, _ = agent.step(obs)
+        return act, est_r, est_c
+
+    return _rollout_and_report(
+        predict=_predict,
+        env=env,
+        cfgs=cfgs,
+        discount_r=discount_r,
+        discount_c=discount_c,
+        eval_episodes=eval_episodes,
+        epoch=epoch,
+        value_symbol='V',
+    )
+
+
+def estimate_true_q_value(
+    agent,
+    env,
+    cfgs,
+    discount_r,
+    discount_c,
+    eval_episodes=100,
+    epoch=None,
+    deterministic=False,
+):
+    """Off-policy counterpart of :func:`estimate_true_value` for Q-critics.
+
+    Identical protocol -- roll the *current* policy out for whole episodes on the (already
+    wrapped) training environment and compare the critic's prediction at each visited state
+    against the Monte-Carlo return from that state -- except that the estimate is
+    ``Q(s_t, a_t)`` for the action actually taken rather than ``V(s_t)``. That is the right
+    pairing: the MC return is the return of the trajectory that follows ``a_t``, so it is an
+    unbiased sample of ``Q^pi(s_t, a_t)``.
+
+    Actions are sampled from the stochastic policy by default (``deterministic=False``),
+    matching how transitions are generated during training; the MC return must come from the
+    same policy the critic is being fit to.
+
+    .. note::
+        For SAC-style agents the reward critic is trained toward an *entropy-augmented*
+        target, so ``Q_r`` estimates the soft return, whereas the MC return here is the plain
+        discounted reward sum. The gap between the two is the discounted entropy term
+        ``alpha * sum_t gamma^t H(pi(.|s_t))``, i.e. ``Eval_*/EstimationError_r`` carries a
+        systematic offset of that size at nonzero ``alpha``. The correlations, and every cost
+        statistic (the cost critic has no entropy bonus), are unaffected.
+    """
+    use_cost = cfgs.algo_cfgs.use_cost
+
+    def _predict(obs):
+        with torch.no_grad():
+            act = agent.step(obs, deterministic=deterministic)
+            q_r = list(agent.reward_critic(obs, act))
+            # Twin critics: the min is what the actor loss and the TD target actually consume,
+            # so it is the estimate worth calibrating.
+            est_r = torch.min(torch.stack(q_r, dim=0), dim=0).values if len(q_r) > 1 else q_r[0]
+            est_c = agent.cost_critic(obs, act)[0] if use_cost else torch.zeros_like(est_r)
+        return act, est_r.reshape(-1), est_c.reshape(-1)
+
+    return _rollout_and_report(
+        predict=_predict,
+        env=env,
+        cfgs=cfgs,
+        discount_r=discount_r,
+        discount_c=discount_c,
+        eval_episodes=eval_episodes,
+        epoch=epoch,
+        value_symbol='Q',
+    )
+
+
+def _rollout_and_report(  # pylint: disable=too-many-locals,too-many-statements
+    predict,
+    env,
+    cfgs,
+    discount_r,
+    discount_c,
+    eval_episodes,
+    epoch,
+    value_symbol,
+):
+    """Roll ``predict``'s policy out for ``eval_episodes`` episodes and log the calibration stats.
+
+    ``predict(obs)`` returns ``(action, estimate_r, estimate_c)``, where the estimates are the
+    critic's prediction for the state (V) or the state-action pair (Q) about to be stepped.
+    """
     device = torch.device(cfgs.train_cfgs.device)
     num_envs = env.num_envs
 
     obs, _ = env.reset()
-    act, cur_est_r, cur_est_c, _ = agent.step(obs)
+    act, cur_est_r, cur_est_c = predict(obs)
 
     # Per-env episode history: each entry is (est_r, est_c, reward, cost) at step t
     ep_history = [[] for _ in range(num_envs)]
@@ -95,7 +182,7 @@ def estimate_true_value(agent, env, cfgs, discount_r, discount_c, eval_episodes=
             progress.update(task, advance=newly_done)
 
             obs = next_obs
-            act, cur_est_r, cur_est_c, _ = agent.step(obs)
+            act, cur_est_r, cur_est_c = predict(obs)
 
     def _to_tensor(lst):
         return torch.tensor(lst, device=device, dtype=torch.float32)
@@ -144,10 +231,11 @@ def estimate_true_value(agent, env, cfgs, discount_r, discount_c, eval_episodes=
         all_c_np = all_true_c_t.cpu().numpy(); all_ec_np = all_est_c_t.cpu().numpy()
         all_r_np = all_true_r_t.cpu().numpy(); all_er_np = all_est_r_t.cpu().numpy()
 
-        fig_s0_c   = _scatter_fig(s0_c_np,  s0_ec_np,  'C', 'steelblue',  'C-Values: True vs Estimated (s0)')
-        fig_s0_r   = _scatter_fig(s0_r_np,  s0_er_np,  'R', 'darkorange', 'R-Values: True vs Estimated (s0)')
-        fig_all_c  = _scatter_fig(all_c_np, all_ec_np, 'C', 'steelblue',  'C-Values: True vs Estimated (all states)')
-        fig_all_r  = _scatter_fig(all_r_np, all_er_np, 'R', 'darkorange', 'R-Values: True vs Estimated (all states)')
+        word = 'Values' if value_symbol == 'V' else 'Q-Values'
+        fig_s0_c   = _scatter_fig(s0_c_np,  s0_ec_np,  'C', 'steelblue',  f'C-{word}: True vs Estimated (s0)')
+        fig_s0_r   = _scatter_fig(s0_r_np,  s0_er_np,  'R', 'darkorange', f'R-{word}: True vs Estimated (s0)')
+        fig_all_c  = _scatter_fig(all_c_np, all_ec_np, 'C', 'steelblue',  f'C-{word}: True vs Estimated (all states)')
+        fig_all_r  = _scatter_fig(all_r_np, all_er_np, 'R', 'darkorange', f'R-{word}: True vs Estimated (all states)')
 
         wandb.log({
             # Scatter plots

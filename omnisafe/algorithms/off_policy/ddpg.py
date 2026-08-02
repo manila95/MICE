@@ -340,6 +340,7 @@ class DDPG(BaseAlgo):
                 agent=self._actor_critic,
                 logger=self._logger,
             )
+            self._eval_value_function(epoch)
             eval_time = time.time() - eval_start
             print(f'Epoch {epoch} done — rollout: {rollout_time:.1f}s  update: {update_time:.1f}s  eval: {eval_time:.1f}s')
 
@@ -377,6 +378,51 @@ class DDPG(BaseAlgo):
         self._env.close()
 
         return ep_ret, ep_cost, ep_len
+
+    def _eval_value_function(self, epoch: int) -> None:
+        """Evaluate the Q-critics against Monte-Carlo returns of the current policy.
+
+        The off-policy counterpart of the value-function evaluation :class:`PolicyGradient` runs
+        each epoch, with the same config knobs and the same ``Eval_s0`` / ``Eval_all`` wandb
+        keys: ``test_estimate`` turns it off, ``early_eval_freq`` sets the cadence for the first
+        100 epochs and ``value_eval_freq`` thereafter, and ``value_eval_episodes`` sets how many
+        complete episodes each evaluation rolls out.
+
+        Skipped while the agent is still taking uniform-random warm-up actions, where the
+        rollout would measure the critics against a policy that is not yet driving the
+        environment.
+
+        Unlike the on-policy version, ``test_estimate`` defaults to *off* when the config does
+        not mention it, so only configs that opt in (currently ``SACPID.yaml``) pay for it. An
+        off-policy epoch collects far fewer env steps than an on-policy one -- 2000 against
+        20000 -- so a 100-episode evaluation would cost many times the epoch it is measuring.
+
+        Args:
+            epoch (int): Current epoch.
+        """
+        if not getattr(self._cfgs.algo_cfgs, 'test_estimate', False):
+            return
+        eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
+        early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
+        effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
+        if epoch % effective_eval_freq != 0:
+            return
+        if (epoch + 1) * self._cfgs.algo_cfgs.steps_per_epoch <= (
+            self._cfgs.algo_cfgs.start_learning_steps
+        ):
+            return
+
+        gamma = self._cfgs.algo_cfgs.gamma
+        self._env.eval_value_function(
+            agent=self._actor_critic,
+            # The off-policy cost critic bootstraps with ``gamma`` too (see
+            # :meth:`_update_cost_critic`), so ``cost_gamma`` only takes effect if a config
+            # sets it; it is read for parity with the on-policy call site.
+            discount_r=gamma,
+            discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', gamma),
+            eval_episodes=getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100),
+            epoch=epoch,
+        )
 
     def _update(self) -> None:
         """Update actor, critic.

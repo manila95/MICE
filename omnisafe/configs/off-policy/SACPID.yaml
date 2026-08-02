@@ -78,6 +78,15 @@ defaults:
     use_cost: True
     # warm up epoch
     warmup_epochs: 100
+    # whether to evaluate the Q-critics against Monte-Carlo returns of the current policy
+    test_estimate: True
+    # eval frequency for the first 100 epochs (higher cadence for early monitoring)
+    early_eval_freq: 5
+    value_eval_freq: 5
+    # complete episodes rolled out per evaluation. Each one costs up to max_episode_steps env
+    # steps, so 20 episodes is already ~10x an epoch's rollout (steps_per_epoch: 2000); raise it
+    # for a less noisy Eval_s0 correlation (Eval_all is well sampled either way) at that price.
+    value_eval_episodes: 20
   # logger configurations
   logger_cfgs:
     # use wandb for logging
