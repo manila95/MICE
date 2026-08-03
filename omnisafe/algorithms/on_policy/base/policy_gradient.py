@@ -143,7 +143,10 @@ class PolicyGradient(BaseAlgo):
             device=self._device,
             cost_gamma=getattr(self._cfgs.algo_cfgs, 'cost_gamma', None),
             cost_advantage_estimator=getattr(self._cfgs.algo_cfgs, 'cost_adv_estimation_method', None),
-            sr_dim=self._cfgs.model_cfgs.sr_cfgs.sr_dim if self._sr_td_ridge else None,
+            # Read off the built trunk (_init_model runs before _init) rather than from the
+            # config: under sr_cfgs.phi_source='identity' phi is the observation itself, so the
+            # true feature width is obs_dim and not the configured sr_dim.
+            sr_dim=self._actor_critic.sr_trunk.sr_dim if self._sr_td_ridge else None,
             lam_sr=self._cfgs.model_cfgs.sr_cfgs.get('lam_sr', 0.95) if self._sr_td_ridge else 0.95,
             gamma_sr=self._cfgs.model_cfgs.sr_cfgs.get('gamma_sr', None) if self._sr_td_ridge else None,
         )

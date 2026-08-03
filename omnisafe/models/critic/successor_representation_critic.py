@@ -51,6 +51,17 @@ Within ``td_ridge``, ``model_cfgs.sr_cfgs.phi_source`` selects where ``phi`` com
   ``phi(s)`` still drifts every update because the trunk beneath it is trained by the ``psi`` TD
   loss and the value losses. ``psi`` is therefore regressed onto a feature stream that moves
   during the very updates that are fitting it, and the ridge basis shifts under ``w_r`` / ``w_c``.
+* ``identity``: ``phi(s) = s``. The observation *is* the feature, so ``psi(s)`` becomes the
+  discounted occupancy of each observation coordinate -- the textbook successor representation
+  over state variables, and the only mode with no parameters in ``phi`` at all. Stationary for
+  free, full rank by construction, and the reward model ``r ~= s . w_r`` is directly readable.
+  Two consequences to keep in mind. Its feature width is fixed at ``obs_dim`` (``obs_dim +
+  act_dim`` in the Q flavor), so ``sr_cfgs.sr_dim`` is ignored for ``phi`` / ``psi`` widths and
+  governs only the trunk's hidden layers. And it is the one mode that is not l2-normalized --
+  normalizing would make it something other than the identity -- so ``||phi||`` varies with the
+  state instead of being pinned to 1, which changes the scale of the ``psi`` targets and of the
+  ridge Gram matrix. Keep ``algo_cfgs.obs_normalize`` on, or ``||phi||`` inherits whatever scale
+  the raw observation happens to have.
 * ``random``: ``phi = normalize(W s + b)`` with ``W``, ``b`` frozen at initialization -- a fixed
   random projection, the classic successor-feature setting. Stationary, but note that an affine
   map cannot raise rank: ``phi``'s effective rank is capped at ``obs_dim + 1`` no matter how large
@@ -336,16 +347,17 @@ def build_frozen_phi(
     sr_dim: int,
     activation: Activation,
     weight_initialization_mode: InitFunction,
-) -> FrozenPhiFeatures | None:
+) -> nn.Module | None:
     """Validate ``phi_source`` and build the frozen ``phi`` network it asks for, if any.
 
-    Shared by the V and Q ``td_ridge`` trunks so the three settings are defined in one place.
+    Shared by the V and Q ``td_ridge`` trunks so the four settings are defined in one place.
 
     Args:
-        phi_source (str): One of ``'trunk'``, ``'random'``, ``'separate'``.
+        phi_source (str): One of ``'trunk'``, ``'identity'``, ``'random'``, ``'separate'``.
         in_dim (int): Input dimension of the frozen network (see :class:`FrozenPhiFeatures`).
         phi_hidden_sizes (list of int): Hidden sizes, used by ``'separate'`` only.
-        sr_dim (int): Dimensionality of ``phi``.
+        sr_dim (int): Dimensionality of ``phi``. Ignored by ``'identity'``, whose feature
+            dimension is dictated by the input instead -- see :func:`phi_feature_dim`.
         activation (Activation): Activation function.
         weight_initialization_mode (InitFunction): Weight initialization mode.
 
@@ -355,6 +367,12 @@ def build_frozen_phi(
     """
     if phi_source == 'trunk':
         return None
+    if phi_source == 'identity':
+        # phi(s) = s. No parameters at all, so it is stationary for free, and full rank by
+        # construction. Deliberately *not* l2-normalized, unlike every other mode: normalizing
+        # would make it something other than the identity. See phi_feature_dim on the dimension,
+        # and the module docstring on what the missing normalization costs.
+        return nn.Identity()
     if phi_source == 'random':
         # Pinned to depth 0 rather than reading phi_hidden_sizes: 'random' names one specific
         # experimental condition (a fixed random linear projection of the raw input), and a
@@ -365,7 +383,7 @@ def build_frozen_phi(
     else:
         raise NotImplementedError(
             f'Unknown sr_cfgs.phi_source "{phi_source}". '
-            'Available phi sources are: "trunk", "random", "separate".',
+            'Available phi sources are: "trunk", "identity", "random", "separate".',
         )
     return FrozenPhiFeatures(
         in_dim=in_dim,
@@ -374,6 +392,29 @@ def build_frozen_phi(
         activation=activation,
         weight_initialization_mode=weight_initialization_mode,
     )
+
+
+def phi_feature_dim(phi_source: str, in_dim: int, sr_dim: int) -> int:
+    """The dimensionality of ``phi``, and therefore of ``psi``, ``w_r`` and ``w_c``.
+
+    Every mode but ``'identity'`` projects to the configured ``sr_dim``. ``'identity'`` passes its
+    input straight through, so its feature dimension is the input's: ``obs_dim`` for the V flavor,
+    ``obs_dim + act_dim`` for the Q flavor. ``sr_dim`` is ignored there rather than validated
+    against, because the correct value is environment-dependent and a config file cannot know it.
+
+    Only the *output* width of ``psi`` follows this; the trunk's hidden widths keep following
+    ``sr_dim``, so ``psi`` retains its configured capacity under ``'identity'`` and merely ends in
+    a narrower (or wider) layer.
+
+    Args:
+        phi_source (str): One of ``'trunk'``, ``'identity'``, ``'random'``, ``'separate'``.
+        in_dim (int): Dimensionality of the raw input ``phi`` would read.
+        sr_dim (int): The configured successor-feature dimensionality.
+
+    Returns:
+        The dimensionality ``phi`` actually produces.
+    """
+    return in_dim if phi_source == 'identity' else sr_dim
 
 
 class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
@@ -386,8 +427,8 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         activation (Activation): Activation function.
         weight_initialization_mode (InitFunction): Weight initialization mode.
         phi_source (str): Where ``phi`` comes from -- ``'trunk'`` (a trainable linear read-out of
-            the trunk shared with ``psi``), or ``'random'`` / ``'separate'`` (a frozen map of the
-            raw observation, see :func:`build_frozen_phi`).
+            the trunk shared with ``psi``), or ``'identity'`` / ``'random'`` / ``'separate'``
+            (a frozen map of the raw observation, see :func:`build_frozen_phi`).
         phi_hidden_sizes (list of int): Hidden sizes of the standalone ``phi`` network, used by
             ``phi_source='separate'`` only.
     """
@@ -404,7 +445,10 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         learnable_readout: bool = False,
     ) -> None:
         """Initialize an instance of :class:`TDRidgeSuccessorRepresentationTrunk`."""
-        super().__init__(sr_dim, learnable_readout=learnable_readout)
+        # phi's width, which psi and w_r / w_c must match. Equal to sr_dim except under
+        # phi_source='identity', where phi is the observation itself.
+        feature_dim = phi_feature_dim(phi_source, obs_dim, sr_dim)
+        super().__init__(feature_dim, learnable_readout=learnable_readout)
         trunk_out = hidden_sizes[-1] if hidden_sizes else obs_dim
         self.trunk: nn.Module = (
             build_mlp_network(
@@ -426,12 +470,12 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         )
         self._phi_from_trunk = phi_net is None
         if phi_net is None:
-            self.phi_head = nn.Linear(trunk_out, sr_dim)
+            self.phi_head = nn.Linear(trunk_out, feature_dim)
             initialize_layer(weight_initialization_mode, self.phi_head)
         else:
             self.phi_net = phi_net
         self.psi_head = build_mlp_network(
-            sizes=[trunk_out, sr_dim],
+            sizes=[trunk_out, feature_dim],
             activation=activation,
             weight_initialization_mode=weight_initialization_mode,
         )
@@ -620,8 +664,8 @@ class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
         activation (Activation): Activation function.
         weight_initialization_mode (InitFunction): Weight initialization mode.
         phi_source (str): Where ``phi`` comes from -- ``'trunk'`` (a trainable linear read-out of
-            the trunk shared with ``psi``), or ``'random'`` / ``'separate'`` (a frozen map of the
-            raw ``cat([obs, act], -1)``, see :func:`build_frozen_phi`).
+            the trunk shared with ``psi``), or ``'identity'`` / ``'random'`` / ``'separate'``
+            (a frozen map of the raw ``cat([obs, act], -1)``, see :func:`build_frozen_phi`).
         phi_hidden_sizes (list of int): Hidden sizes of the standalone ``phi`` network, used by
             ``phi_source='separate'`` only.
     """
@@ -640,8 +684,11 @@ class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
         learnable_readout: bool = False,
     ) -> None:
         """Initialize an instance of :class:`TDRidgeSuccessorRepresentationQTrunk`."""
-        super().__init__(sr_dim, learnable_readout=learnable_readout)
         in_dim = obs_dim + act_dim
+        # phi's width, which psi and w_r / w_c must match. Equal to sr_dim except under
+        # phi_source='identity', where phi is the raw (obs, act) pair itself.
+        feature_dim = phi_feature_dim(phi_source, in_dim, sr_dim)
+        super().__init__(feature_dim, learnable_readout=learnable_readout)
         trunk_out = hidden_sizes[-1] if hidden_sizes else in_dim
         self.trunk: nn.Module = (
             build_mlp_network(
@@ -663,13 +710,13 @@ class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
         )
         self._phi_from_trunk = phi_net is None
         if phi_net is None:
-            self.phi_head = nn.Linear(trunk_out, sr_dim)
+            self.phi_head = nn.Linear(trunk_out, feature_dim)
             initialize_layer(weight_initialization_mode, self.phi_head)
         else:
             self.phi_net = phi_net
         self.psi_heads = nn.ModuleList(
             build_mlp_network(
-                sizes=[trunk_out, sr_dim],
+                sizes=[trunk_out, feature_dim],
                 activation=activation,
                 weight_initialization_mode=weight_initialization_mode,
             )

@@ -184,6 +184,13 @@ defaults:
       #                beneath it is trained by the psi TD loss and the value losses -- so psi is
       #                fit against a feature stream that moves during the fit, and the ridge
       #                basis shifts out from under the w_r / w_c solved on it.
+      #   'identity' : phi = s. The observation itself is the feature, so psi is the discounted
+      #                occupancy of each observation coordinate -- the textbook SR over state
+      #                variables. No parameters, stationary for free, full rank, and r ~= s . w_r
+      #                is directly readable. Fixes the feature width at obs_dim (obs_dim +
+      #                act_dim for Q), so sr_dim below governs only the trunk's hidden layers.
+      #                The one mode that is NOT l2-normalized (normalizing it would not be the
+      #                identity), so ||phi|| varies with the state -- keep obs_normalize on.
       #   'random'   : phi = normalize(Linear(s)), frozen at init -- a fixed random projection of
       #                the raw input. Stationary, but an affine map cannot raise rank: phi's
       #                effective rank is capped at obs_dim + 1 however large sr_dim is (measured
