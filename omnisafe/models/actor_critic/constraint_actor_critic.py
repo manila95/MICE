@@ -25,6 +25,8 @@ from omnisafe.models.actor_critic.actor_critic import ActorCritic
 from omnisafe.models.base import Critic
 from omnisafe.models.critic.critic_builder import CriticBuilder
 from omnisafe.models.critic.successor_representation_critic import (
+    ForwardBackwardReadout,
+    ForwardBackwardTrunk,
     SuccessorRepresentationLinearReadout,
     SuccessorRepresentationReadout,
     SuccessorRepresentationTrunk,
@@ -158,7 +160,11 @@ class ConstraintActorCritic(ActorCritic):
                 sr_cfgs.sr_dim,
                 model_cfgs.weight_initialization_mode,
             )
-            self.sr_trunk: SuccessorRepresentationTrunk | TDRidgeSuccessorRepresentationTrunk = trunk
+            self.sr_trunk: (
+                SuccessorRepresentationTrunk
+                | TDRidgeSuccessorRepresentationTrunk
+                | ForwardBackwardTrunk
+            ) = trunk
             trainable_params = itertools.chain(
                 trunk.parameters(),
                 self.reward_critic.head.parameters(),
@@ -190,10 +196,39 @@ class ConstraintActorCritic(ActorCritic):
             # w_r / w_c are buffers (ridge-solved), so the trunk's own parameters (trunk +
             # phi_head + psi_head) are the complete set of SGD-trainable SR parameters.
             trainable_params = trunk.parameters()
+        elif self._sr_mode == 'fb':
+            trunk = ForwardBackwardTrunk(
+                obs_dim=obs_dim,
+                hidden_sizes=hidden_sizes,
+                sr_dim=sr_cfgs.sr_dim,
+                activation=sr_cfgs.activation,
+                weight_initialization_mode=model_cfgs.weight_initialization_mode,
+                shared_body=bool(sr_cfgs.get('fb_shared_body', False)),
+                normalize_b=bool(sr_cfgs.get('fb_normalize_b', False)),
+            )
+            self.reward_critic = ForwardBackwardReadout(
+                obs_space,
+                act_space,
+                trunk,
+                'z_r',
+                model_cfgs.weight_initialization_mode,
+            )
+            self.cost_critic = ForwardBackwardReadout(
+                obs_space,
+                act_space,
+                trunk,
+                'z_c',
+                model_cfgs.weight_initialization_mode,
+            )
+            self.sr_trunk = trunk
+            # z_r / z_c are buffers (Monte-Carlo expectations) and the F/B target networks are
+            # frozen copies, so the online F/B bodies and heads are the complete set of
+            # SGD-trainable FB parameters.
+            trainable_params = (p for p in trunk.parameters() if p.requires_grad)
         else:
             raise NotImplementedError(
                 f'Unknown sr_cfgs.sr_mode "{self._sr_mode}". '
-                'Available successor-representation modes are: "shared_trunk", "td_ridge".',
+                'Available successor-representation modes are: "shared_trunk", "td_ridge", "fb".',
             )
 
         self.add_module('reward_critic', self.reward_critic)
@@ -224,6 +259,24 @@ class ConstraintActorCritic(ActorCritic):
             phi = self.sr_trunk.phi(obs, z=z)
             psi = self.sr_trunk.psi(obs, z=z)
         return phi, psi
+
+    def fb_features(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(F(obs), B(obs))`` forward-backward features (``fb`` mode only).
+
+        Args:
+            obs (torch.Tensor): Observation from environments.
+
+        Returns:
+            f: The forward map of the observation.
+            b: The backward map of the observation.
+        """
+        assert self._sr_mode == 'fb', (
+            'fb_features() is only available when model_cfgs.sr_cfgs.sr_mode == "fb".'
+        )
+        with torch.no_grad():
+            f = self.sr_trunk.forward_map(obs)
+            b = self.sr_trunk.backward_map(obs)
+        return f, b
 
     def step(
         self,

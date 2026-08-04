@@ -144,6 +144,12 @@ defaults:
       # 'td_ridge': literal successor representation -- phi/psi trained by TD (using the same
       # estimator machinery above, applied to a vector feature stream), with the reward/cost
       # read-out weights solved by closed-form ridge regression each update.
+      # 'fb': forward-backward representations -- F and B jointly factorize the policy's
+      # successor measure w.r.t. the on-policy state distribution rho, M(s, ds') ~=
+      # F(s)^T B(s') rho(ds'), trained by a measure-Bellman residual plus a B-orthonormality
+      # regulariser. Reward/cost values are read out as V_g(s) = F(s)^T z_g with
+      # z_g = E_rho[B(s) g(s)] -- an expectation, not a regression, so there is no ridge
+      # residual capping the critic's accuracy.
       sr_mode: shared_trunk
       # dimensionality of the shared successor-feature vector
       sr_dim: 64
@@ -162,8 +168,28 @@ defaults:
       gamma_sr: ~
       # ridge regression L2 regularization coefficient for solving w_r / w_c (td_ridge mode only)
       ridge_kappa: 0.001
-      # EMA smoothing coefficient for w_r / w_c across iterations, 1.0 = no smoothing (td_ridge mode only)
+      # EMA smoothing coefficient for w_r / w_c (td_ridge) or z_r / z_c (fb) across
+      # iterations, 1.0 = no smoothing
       ema_tau: 1.0
+      # --- fb mode only ---
+      # weight on the B-orthonormality regulariser ||cov(B) - I||_F^2. Not optional: only the
+      # product F B^T is identified, so without it F and B drift along the F -> FA,
+      # B -> BA^-T degeneracy and the z_g = E_rho[B g] read-out stops being correct.
+      fb_ortho_coef: 1.0
+      # Polyak coefficient for the F / B target networks; 1.0 == plain stop-gradient
+      fb_target_tau: 0.01
+      # 'expectation' (z = E_rho[B(s) g(s)]) or 'ridge' (that expectation whitened by cov(B),
+      # reusing the td_ridge float64 solve with ridge_kappa above)
+      fb_z_estimator: expectation
+      # size of the independent marginal-state minibatch; null -> algo_cfgs.batch_size
+      fb_marginal_batch_size: ~
+      # give F and B a shared feature body (ties F(s) and B(s), which play different roles)
+      fb_shared_body: False
+      # rescale B rows to norm sqrt(sr_dim); off, since fb_ortho_coef already controls scale
+      fb_normalize_b: False
+      # also take the ordinary value-target MSE gradient into F, reproducing td_ridge's
+      # behaviour of training one trunk with several competing objectives
+      fb_train_critic_mse: False
   # controller configurations
   control_cfgs:
     # The Kp of PID controller

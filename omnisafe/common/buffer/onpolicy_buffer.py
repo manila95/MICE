@@ -99,6 +99,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         sr_dim: int | None = None,
         lam_sr: float = 0.95,
         gamma_sr: float | None = None,
+        fb_dim: int | None = None,
     ) -> None:
         """Initialize an instance of :class:`OnPolicyBuffer`."""
         super().__init__(obs_space, act_space, size, device)
@@ -145,6 +146,15 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             self.data['phi'] = torch.zeros((size, sr_dim), dtype=torch.float32, device=device)
             self.data['psi'] = torch.zeros((size, sr_dim), dtype=torch.float32, device=device)
             self.data['target_sr'] = torch.zeros((size, sr_dim), dtype=torch.float32, device=device)
+
+        # forward-backward (``fb`` mode) extra fields. Unlike ``td_ridge``, FB is a minibatch
+        # loss over (s, s+) transition pairs rather than a rollout-time lambda-return, so it
+        # needs no ``finish_path`` work at all -- only the successor state and its termination
+        # flag, stored as they are collected.
+        self._fb_dim: int | None = fb_dim
+        if self._fb_dim is not None:
+            self.add_field('next_obs', obs_space.shape, torch.float32)
+            self.add_field('terminated', (), torch.float32)
 
     @property
     def standardized_adv_r(self) -> bool:
@@ -291,6 +301,11 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         if self._sr_dim is not None:
             data['phi'] = self.data['phi']
             data['target_sr'] = self.data['target_sr']
+            data['reward'] = self.data['reward']
+            data['cost'] = self.data['cost']
+        if self._fb_dim is not None:
+            data['next_obs'] = self.data['next_obs']
+            data['terminated'] = self.data['terminated']
             data['reward'] = self.data['reward']
             data['cost'] = self.data['cost']
 

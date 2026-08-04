@@ -70,6 +70,7 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
         sr_dim: int | None = None,
         lam_sr: float = 0.95,
         gamma_sr: float | None = None,
+        fb_dim: int | None = None,
     ) -> None:
         """Initialize an instance of :class:`VectorOnPolicyBuffer`."""
         self._num_buffers: int = num_envs
@@ -94,6 +95,7 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
                 sr_dim=sr_dim,
                 lam_sr=lam_sr,
                 gamma_sr=gamma_sr,
+                fb_dim=fb_dim,
             )
             for _ in range(num_envs)
         ]

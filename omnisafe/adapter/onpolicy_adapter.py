@@ -69,6 +69,15 @@ class OnPolicyAdapter(OnlineAdapter):
         use_sr = bool(self._cfgs.model_cfgs.get('use_successor_representation', False))
         return use_sr and self._cfgs.model_cfgs.sr_cfgs.get('sr_mode', 'shared_trunk') == 'td_ridge'
 
+    @property
+    def _sr_fb(self) -> bool:
+        """Whether the ``fb`` forward-backward successor-representation mode is active.
+
+        Computed on the fly for the same reason as :meth:`_sr_td_ridge`.
+        """
+        use_sr = bool(self._cfgs.model_cfgs.get('use_successor_representation', False))
+        return use_sr and self._cfgs.model_cfgs.sr_cfgs.get('sr_mode', 'shared_trunk') == 'fb'
+
     def rollout(  # pylint: disable=too-many-locals
         self,
         steps_per_epoch: int,
@@ -119,6 +128,20 @@ class OnPolicyAdapter(OnlineAdapter):
             }
             if self._sr_td_ridge:
                 store_kwargs.update(phi=phi, psi=psi)
+            if self._sr_fb:
+                # Under the AutoReset wrapper, ``next_obs`` at an episode boundary is already the
+                # *reset* observation; storing it verbatim would teach FB a spurious transition
+                # into the reset distribution. Substitute the true final observation, the same
+                # correction the td_ridge bootstrap below performs. ``terminated`` (not
+                # ``truncated``) is stored, so time-limit cut-offs still bootstrap.
+                stored_next_obs = next_obs.clone()
+                for idx, (done, time_out) in enumerate(zip(terminated, truncated)):
+                    if done or time_out:
+                        stored_next_obs[idx] = info['final_observation'][idx]
+                store_kwargs.update(
+                    next_obs=stored_next_obs,
+                    terminated=terminated.float(),
+                )
             buffer.store(**store_kwargs)
 
             obs = next_obs

@@ -117,10 +117,15 @@ class PolicyGradient(BaseAlgo):
             ...     self._model = CustomModel()
         """
         use_sr = bool(self._cfgs.model_cfgs.get('use_successor_representation', False))
-        self._sr_td_ridge: bool = use_sr and self._cfgs.model_cfgs.sr_cfgs.get(
-            'sr_mode',
-            'shared_trunk',
-        ) == 'td_ridge'
+        sr_mode = self._cfgs.model_cfgs.sr_cfgs.get('sr_mode', 'shared_trunk') if use_sr else None
+        self._sr_td_ridge: bool = sr_mode == 'td_ridge'
+        self._sr_fb: bool = sr_mode == 'fb'
+        # Set by :meth:`_update`; :meth:`learn` uses it to catch algorithms whose own ``_update``
+        # never reaches PolicyGradient's loop, where the FB training step lives.
+        self._fb_update_ran: bool = False
+
+        if self._sr_fb:
+            self._check_fb_supported()
 
         self._buf: VectorOnPolicyBuffer = VectorOnPolicyBuffer(
             obs_space=self._env.observation_space,
@@ -140,7 +145,36 @@ class PolicyGradient(BaseAlgo):
             sr_dim=self._cfgs.model_cfgs.sr_cfgs.sr_dim if self._sr_td_ridge else None,
             lam_sr=self._cfgs.model_cfgs.sr_cfgs.get('lam_sr', 0.95) if self._sr_td_ridge else 0.95,
             gamma_sr=self._cfgs.model_cfgs.sr_cfgs.get('gamma_sr', None) if self._sr_td_ridge else None,
+            fb_dim=self._cfgs.model_cfgs.sr_cfgs.sr_dim if self._sr_fb else None,
         )
+
+    def _check_fb_supported(self) -> None:
+        r"""Validate the discount setup for ``sr_mode: fb``.
+
+        FB represents *one* successor measure and therefore one discount factor. If
+        ``cost_gamma`` differs from ``gamma_sr`` (which itself defaults to ``gamma``), ``V_r``
+        and ``V_c`` cannot both be read out from the same ``F``, and the cost critic would be
+        quietly wrong rather than obviously broken.
+
+        The other way ``fb`` can silently do nothing -- an algorithm whose ``_update`` replaces
+        :meth:`PolicyGradient._update` instead of delegating to it -- cannot be detected
+        reliably from the class alone (:class:`PPOLag`, for instance, overrides ``_update`` but
+        still calls ``super()._update()``), so it is checked at runtime in :meth:`learn` via
+        :attr:`_fb_update_ran`.
+        """
+        gamma = self._cfgs.algo_cfgs.gamma
+        gamma_sr = self._cfgs.model_cfgs.sr_cfgs.get('gamma_sr', None)
+        gamma_sr = gamma if gamma_sr is None else gamma_sr
+        cost_gamma = getattr(self._cfgs.algo_cfgs, 'cost_gamma', None)
+        cost_gamma = gamma if cost_gamma is None else cost_gamma
+        if abs(cost_gamma - gamma_sr) > 1e-12:
+            raise ValueError(
+                f'model_cfgs.sr_cfgs.sr_mode = "fb" requires a single discount factor, but '
+                f'algo_cfgs.cost_gamma ({cost_gamma}) != gamma_sr ({gamma_sr}). FB factorizes '
+                'one successor measure, so the reward and cost values are both read out from '
+                'the same F(s) at the same gamma; two different discounts would make the cost '
+                'critic quietly wrong. Set them equal, or use sr_mode "td_ridge".',
+            )
 
     def _init_log(self) -> None:
         """Log info about epoch.
@@ -258,6 +292,18 @@ class PolicyGradient(BaseAlgo):
             self._logger.register_key('Misc/WcNorm')
             self._logger.register_key('Misc/GramCond')
 
+        if self._sr_fb:
+            # log information about the forward-backward successor-representation critic
+            self._logger.register_key('Loss/Loss_fb', delta=True)
+            self._logger.register_key('Loss/Loss_fb_ortho')
+            self._logger.register_key('Misc/RidgeResidualReward')
+            self._logger.register_key('Misc/RidgeResidualCost')
+            self._logger.register_key('Misc/ZrNorm')
+            self._logger.register_key('Misc/ZcNorm')
+            self._logger.register_key('Misc/BCovErr')
+            self._logger.register_key('Misc/GramCond')
+            self._logger.register_key('Misc/FNorm')
+
         self._logger.register_key('Time/Total')
         self._logger.register_key('Time/Rollout')
         self._logger.register_key('Time/Update')
@@ -318,6 +364,16 @@ class PolicyGradient(BaseAlgo):
             update_time = time.time()
             self._current_epoch = epoch
             self._update()
+            if self._sr_fb and not self._fb_update_ran:
+                raise NotImplementedError(
+                    f'model_cfgs.sr_cfgs.sr_mode = "fb" is not supported by '
+                    f'{type(self).__name__}: its _update() never called _sr_extra_columns() / '
+                    '_sr_minibatch_update(), so F and B would stay at their initialization and '
+                    'both critics would be meaningless. Any algorithm with its own _update() '
+                    'must route the successor-representation work through those two hooks (see '
+                    'PolicyGradient._update, NaturalPG._update or FOCOPS._update for the '
+                    'pattern). Until then, use sr_mode "shared_trunk" or "td_ridge".',
+                )
             total_cost += self._env._epoch_cost_sum
             self._logger.store({'Metrics/TotalCost': total_cost})
             self._logger.store({'Time/Update': time.time() - update_time})
@@ -399,9 +455,7 @@ class PolicyGradient(BaseAlgo):
         data = self._buf.get()
         train_data, val_data = self._make_train_val_split(data)
 
-        if self._sr_td_ridge:
-            self._ridge_update_successor_weights(train_data)
-            target_sr = train_data['target_sr']
+        sr_extras = self._sr_extra_columns(train_data)
 
         obs, act, logp, target_value_r, target_value_c, adv_r, adv_c = (
             train_data['obs'],
@@ -416,42 +470,31 @@ class PolicyGradient(BaseAlgo):
         original_obs = obs
         old_distribution = self._actor_critic.actor(obs)
 
-        if self._sr_td_ridge:
-            dataloader = DataLoader(
-                dataset=TensorDataset(
-                    obs,
-                    act,
-                    logp,
-                    target_value_r,
-                    target_value_c,
-                    adv_r,
-                    adv_c,
-                    target_sr,
-                ),
-                batch_size=self._cfgs.algo_cfgs.batch_size,
-                shuffle=True,
-            )
-        else:
-            dataloader = DataLoader(
-                dataset=TensorDataset(obs, act, logp, target_value_r, target_value_c, adv_r, adv_c),
-                batch_size=self._cfgs.algo_cfgs.batch_size,
-                shuffle=True,
-            )
+        dataloader = DataLoader(
+            dataset=TensorDataset(
+                obs,
+                act,
+                logp,
+                target_value_r,
+                target_value_c,
+                adv_r,
+                adv_c,
+                *sr_extras,
+            ),
+            batch_size=self._cfgs.algo_cfgs.batch_size,
+            shuffle=True,
+        )
 
         update_counts = 0
         final_kl = 0.0
 
         for i in track(range(self._cfgs.algo_cfgs.update_iters), description='Updating...'):
             for batch in dataloader:
-                if self._sr_td_ridge:
-                    obs, act, logp, target_value_r, target_value_c, adv_r, adv_c, target_sr = batch
-                else:
-                    obs, act, logp, target_value_r, target_value_c, adv_r, adv_c = batch
+                obs, act, logp, target_value_r, target_value_c, adv_r, adv_c = batch[:7]
                 self._update_reward_critic(obs, target_value_r)
                 if self._cfgs.algo_cfgs.use_cost:
                     self._update_cost_critic(obs, target_value_c)
-                if self._sr_td_ridge:
-                    self._update_successor_features(obs, target_sr)
+                self._sr_minibatch_update(obs, batch[7:], original_obs)
                 self._update_actor(obs, act, logp, adv_r, adv_c)
 
             new_distribution = self._actor_critic.actor(original_obs)
@@ -683,6 +726,15 @@ class PolicyGradient(BaseAlgo):
             obs (torch.Tensor): The ``observation`` sampled from buffer.
             target_value_r (torch.Tensor): The ``target_value_r`` sampled from buffer.
         """
+        if self._skip_value_mse_step():
+            self._log_value_mse_only(
+                self._actor_critic.reward_critic,
+                obs,
+                target_value_r,
+                'Loss/Loss_reward_critic',
+            )
+            return
+
         self._actor_critic.reward_critic_optimizer.zero_grad()
         loss = nn.functional.mse_loss(self._actor_critic.reward_critic(obs)[0], target_value_r)
 
@@ -723,6 +775,15 @@ class PolicyGradient(BaseAlgo):
             obs (torch.Tensor): The ``observation`` sampled from buffer.
             target_value_c (torch.Tensor): The ``target_value_c`` sampled from buffer.
         """
+        if self._skip_value_mse_step():
+            self._log_value_mse_only(
+                self._actor_critic.cost_critic,
+                obs,
+                target_value_c,
+                'Loss/Loss_cost_critic',
+            )
+            return
+
         self._actor_critic.cost_critic_optimizer.zero_grad()
         loss = nn.functional.mse_loss(self._actor_critic.cost_critic(obs)[0], target_value_c)
 
@@ -741,6 +802,251 @@ class PolicyGradient(BaseAlgo):
         self._actor_critic.cost_critic_optimizer.step()
 
         self._logger.store({'Loss/Loss_cost_critic': loss.mean().item()})
+
+    def _skip_value_mse_step(self) -> bool:
+        """Whether to skip the ordinary value-target MSE optimizer step.
+
+        In ``fb`` mode the reward/cost values are read out as ``F(s)^T z``, so a value-MSE
+        gradient would flow into ``F`` and fight the measure-Bellman objective that defines it
+        -- the same "one trunk pulled by three losses" problem the ``td_ridge`` mode has. By
+        default FB therefore trains ``F`` from its own loss only. Set
+        ``sr_cfgs.fb_train_critic_mse: True`` to restore the ``td_ridge``-style behaviour for
+        ablation.
+        """
+        if not self._sr_fb:
+            return False
+        return not bool(self._cfgs.model_cfgs.sr_cfgs.get('fb_train_critic_mse', False))
+
+    def _log_value_mse_only(
+        self,
+        critic: torch.nn.Module,
+        obs: torch.Tensor,
+        target_value: torch.Tensor,
+        key: str,
+    ) -> None:
+        """Compute the value-target MSE for logging only -- no ``backward``, no ``step``.
+
+        Keeps ``Loss/Loss_reward_critic`` / ``Loss/Loss_cost_critic`` populated and comparable
+        across ``sr_mode`` settings (the logger raises on a registered-but-unfilled key) while
+        the critic itself is trained by another objective.
+
+        Args:
+            critic (torch.nn.Module): The critic to evaluate.
+            obs (torch.Tensor): The ``observation`` sampled from buffer.
+            target_value (torch.Tensor): The value target for ``obs``.
+            key (str): The logger key to store the MSE under.
+        """
+        with torch.no_grad():
+            loss = nn.functional.mse_loss(critic(obs)[0], target_value)
+        self._logger.store({key: loss.mean().item()})
+
+    def _sr_extra_columns(self, train_data: dict[str, torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        """Per-epoch successor-representation work, plus the extra minibatch columns it needs.
+
+        Called once per ``_update()``, before the minibatch loop, by every algorithm that has
+        its own update loop. Returns the tensors to append to that loop's ``TensorDataset``;
+        :meth:`_sr_minibatch_update` consumes them in the same order. Returns ``()`` when no
+        successor-representation mode is active, which is what keeps the non-SR and
+        ``shared_trunk`` paths byte-for-byte unchanged.
+
+        Args:
+            train_data (dict[str, torch.Tensor]): The training-split epoch batch.
+
+        Returns:
+            The extra ``TensorDataset`` columns for the active mode.
+        """
+        if self._sr_td_ridge:
+            self._ridge_update_successor_weights(train_data)
+            return (train_data['target_sr'],)
+        if self._sr_fb:
+            self._fb_update_ran = True
+            self._fb_update_task_vectors(train_data)
+            return (train_data['next_obs'], train_data['terminated'])
+        return ()
+
+    def _sr_minibatch_update(
+        self,
+        obs: torch.Tensor,
+        sr_batch: tuple[torch.Tensor, ...],
+        all_obs: torch.Tensor,
+    ) -> None:
+        """Run the active successor-representation mode's per-minibatch training step.
+
+        The counterpart to :meth:`_sr_extra_columns`: ``sr_batch`` is that method's return
+        value sliced out of the current minibatch, in the same order.
+
+        Args:
+            obs (torch.Tensor): The minibatch ``observation``.
+            sr_batch (tuple of torch.Tensor): The extra minibatch columns for the active mode.
+            all_obs (torch.Tensor): The full training-split ``obs``, used by ``fb`` to draw a
+                marginal-state batch independently of this minibatch.
+        """
+        if self._sr_td_ridge:
+            (target_sr,) = sr_batch
+            self._update_successor_features(obs, target_sr)
+        elif self._sr_fb:
+            next_obs, terminated = sr_batch
+            self._update_fb_representation(
+                obs,
+                next_obs,
+                terminated,
+                self._fb_sample_marginal(all_obs),
+            )
+
+    def _fb_sample_marginal(self, all_obs: torch.Tensor) -> torch.Tensor:
+        r"""Draw a marginal-state batch from the on-policy distribution ``rho``.
+
+        Sampled from the full training split, independently of whichever transition minibatch
+        it will be paired with -- that independence is what makes the FB loss an unbiased
+        estimate of the measure-Bellman residual against ``rho``.
+
+        Args:
+            all_obs (torch.Tensor): The full training-split ``obs``.
+
+        Returns:
+            ``fb_marginal_batch_size`` rows of ``all_obs`` (default ``algo_cfgs.batch_size``).
+        """
+        size = self._cfgs.model_cfgs.sr_cfgs.get('fb_marginal_batch_size', None)
+        size = size or self._cfgs.algo_cfgs.batch_size
+        idx = torch.randint(
+            0,
+            all_obs.shape[0],
+            (min(size, all_obs.shape[0]),),
+            device=all_obs.device,
+        )
+        return all_obs[idx]
+
+    def _fb_update_task_vectors(self, train_data: dict[str, torch.Tensor]) -> None:
+        r"""Refresh the ``fb`` read-out vectors ``z_r`` / ``z_c``.
+
+        ``z_g = E_{s \sim \rho}[B(s) g(s)]`` is a plain expectation over the on-policy state
+        distribution, evaluated once per :meth:`_update` call on the fresh epoch's *training*
+        split -- the FB analogue of :meth:`_ridge_update_successor_weights`, and like it kept
+        away from the held-out validation episodes.
+
+        Args:
+            train_data (dict[str, torch.Tensor]): The training-split epoch batch (post
+                :meth:`_make_train_val_split`), including the ``obs``, ``reward`` and ``cost``
+                fields.
+        """
+        sr_cfgs = self._cfgs.model_cfgs.sr_cfgs
+        with torch.no_grad():
+            b = self._actor_critic.sr_trunk.backward_map(train_data['obs'])
+        stats = self._actor_critic.sr_trunk.update_task_vectors(
+            b,
+            train_data['reward'],
+            train_data['cost'],
+            ema_tau=sr_cfgs.get('ema_tau', 1.0),
+            estimator=sr_cfgs.get('fb_z_estimator', 'expectation'),
+            ridge_kappa=sr_cfgs.get('ridge_kappa', 1e-3),
+        )
+        self._logger.store(stats)
+
+    def _update_fb_representation(
+        self,
+        obs: torch.Tensor,
+        next_obs: torch.Tensor,
+        terminated: torch.Tensor,
+        marginal_obs: torch.Tensor,
+    ) -> None:
+        r"""Update the forward-backward maps by the measure-Bellman residual.
+
+        The successor measure is taken in the ``t >= 0`` convention,
+
+        .. math::
+
+            M^\pi(s, X) = \sum_{t \ge 0} \gamma^t \Pr(s_t \in X \mid s_0 = s)
+                        = \mathbb{1}[s \in X] + \gamma\, \mathbb{E}_{s^+}[M^\pi(s^+, X)],
+
+        i.e. the atom sits on ``s`` itself rather than on its successor. This differs from the
+        ``t >= 1`` convention of Touati & Ollivier, and it is the one that matters here: it makes
+        the read-out :math:`F(s)^T z_g` *equal* to the value function
+        :math:`V_g(s) = \mathbb{E}[\sum_t \gamma^t g(s_t)]` that GAE consumes. The ``t >= 1``
+        convention would instead yield :math:`(V_g(s) - g(s)) / \gamma`, which is not a drop-in
+        critic. Concretely, the only difference in the loss is that the "diagonal" term below is
+        evaluated at :math:`s_i` rather than at :math:`s_i^+`.
+
+        With a transition minibatch :math:`\{(s_i, s_i^+, d_i)\}` of size ``n`` and an
+        independent marginal minibatch :math:`\{s'_j\} \sim \rho` of size ``m``:
+
+        .. math::
+
+            M &= F(S) B(S')^T \\
+            \bar{M} &= \gamma (1 - d) \odot \big( \bar{F}(S^+) \bar{B}(S')^T \big) \\
+            L_{fb} &= \mathrm{mean}\big((M - \bar{M})^2\big)
+                      - 2\, \mathrm{mean}_i\big(F(s_i)^T B(s_i)\big) \\
+            L_{ortho} &= \big\| \tfrac{1}{m} B(S')^T B(S') - I_d \big\|_F^2
+
+        The second term of :math:`L_{fb}` is the atom :math:`\mathbb{1}[s \in X]`, which the
+        outer-product residual cannot see; it is what puts mass on each state's own occupancy.
+        The ``(1 - d)`` factor makes a terminal state's measure the atom alone, with no future
+        mass -- time-limit truncations are stored as ``0.0`` in ``terminated``, so they still
+        bootstrap.
+
+        :math:`L_{ortho}` is not optional. Only the product :math:`F B^T` is identified, so
+        without it ``F`` and ``B`` drift along the :math:`F \to FA,\; B \to BA^{-T}`
+        degeneracy and the read-out :math:`z_g = E_\rho[B g]` -- which assumes
+        :math:`E_\rho[B B^T] \approx I` -- stops being correct.
+
+        Args:
+            obs (torch.Tensor): The ``observation`` sampled from buffer.
+            next_obs (torch.Tensor): The successor of ``obs`` (AutoReset-corrected in the
+                adapter, so it is the true final observation at episode boundaries).
+            terminated (torch.Tensor): 1.0 where the episode genuinely terminated at ``obs``
+                (time-limit truncations are 0.0 and therefore still bootstrap).
+            marginal_obs (torch.Tensor): States drawn independently from the on-policy
+                distribution ``rho``.
+        """
+        sr_cfgs = self._cfgs.model_cfgs.sr_cfgs
+        trunk = self._actor_critic.sr_trunk
+        gamma = sr_cfgs.get('gamma_sr', None)
+        gamma = self._cfgs.algo_cfgs.gamma if gamma is None else gamma
+
+        self._actor_critic.sr_optimizer.zero_grad()
+
+        f = trunk.forward_map(obs)  # (n, d)
+        b_marginal = trunk.backward_map(marginal_obs)  # (m, d)
+        b_diag = trunk.backward_map(obs)  # (n, d), the atom at s (see the t >= 0 convention above)
+
+        with torch.no_grad():
+            f_next_target = trunk.forward_map(next_obs, target=True)
+            b_marginal_target = trunk.backward_map(marginal_obs, target=True)
+            not_done = (1.0 - terminated).unsqueeze(-1)  # (n, 1)
+            m_target = gamma * not_done * (f_next_target @ b_marginal_target.T)  # (n, m)
+
+        m_online = f @ b_marginal.T  # (n, m)
+        loss_fb = (m_online - m_target).pow(2).mean() - 2.0 * (f * b_diag).sum(-1).mean()
+
+        cov = b_marginal.T @ b_marginal / b_marginal.shape[0]
+        loss_ortho = (cov - torch.eye(trunk.sr_dim, device=cov.device)).pow(2).sum()
+
+        loss = loss_fb + sr_cfgs.get('fb_ortho_coef', 1.0) * loss_ortho
+
+        if self._cfgs.algo_cfgs.use_critic_norm:
+            for param in trunk.parameters():
+                if param.requires_grad:
+                    loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coef
+
+        loss.backward()
+
+        if self._cfgs.algo_cfgs.use_max_grad_norm:
+            clip_grad_norm_(
+                [p for p in trunk.parameters() if p.requires_grad],
+                self._cfgs.algo_cfgs.max_grad_norm,
+            )
+        distributed.avg_grads(trunk)
+        self._actor_critic.sr_optimizer.step()
+        trunk.soft_update_targets(sr_cfgs.get('fb_target_tau', 0.01))
+
+        # Log the measure-Bellman term alone, so that Loss/Loss_fb and Loss/Loss_fb_ortho are
+        # independent diagnostics rather than one containing the other.
+        self._logger.store(
+            {
+                'Loss/Loss_fb': loss_fb.item(),
+                'Loss/Loss_fb_ortho': loss_ortho.item(),
+                'Misc/FNorm': f.norm(dim=-1).mean().item(),
+            },
+        )
 
     def _ridge_update_successor_weights(self, train_data: dict[str, torch.Tensor]) -> None:
         """Refresh the ``td_ridge`` successor-representation read-out weights.
