@@ -32,7 +32,7 @@ from omnisafe.common.buffer import VectorOnPolicyBuffer
 from omnisafe.common.buffer.readout_buffer import ReadoutReplayBuffer
 from omnisafe.common.logger import Logger
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
-from omnisafe.utils import distributed
+from omnisafe.utils import distributed, sr_diagnostics
 from omnisafe.utils.value_eval import estimate_true_value
 
 
@@ -46,6 +46,19 @@ class PolicyGradient(BaseAlgo):
         - Authors: Richard S. Sutton, David McAllester, Satinder Singh, Yishay Mansour.
         - URL: `PG <https://proceedings.neurips.cc/paper/1999/file64d828b85b0bed98e80ade0a5c43b0f-Paper.pdf>`_
     """
+
+    # Successor-representation state, declared at class level rather than only in :meth:`_init`
+    # because subclasses may replace ``_init`` outright to build their own buffer (MICE does) and
+    # still inherit ``_init_log`` / ``_update``, which read these. Without the defaults such an
+    # algorithm dies with an AttributeError before its first rollout.
+    _sr_td_ridge: bool = False
+    _sr_readout: str = 'ridge'
+    _sr_readout_buf: ReadoutReplayBuffer | None = None
+    _sr_probe_size: int = 0
+    _sr_diag_max_samples: int = 0
+    _sr_probe_fixed_obs: torch.Tensor | None = None
+    _sr_probe_fresh_obs: torch.Tensor | None = None
+    _sr_snapshot: dict[str, torch.Tensor] | None = None
 
     def _init_env(self) -> None:
         """Initialize the environment.
@@ -118,13 +131,13 @@ class PolicyGradient(BaseAlgo):
             ...     self._model = CustomModel()
         """
         use_sr = bool(self._cfgs.model_cfgs.get('use_successor_representation', False))
-        self._sr_td_ridge: bool = use_sr and self._cfgs.model_cfgs.sr_cfgs.get(
+        self._sr_td_ridge = use_sr and self._cfgs.model_cfgs.sr_cfgs.get(
             'sr_mode',
             'shared_trunk',
         ) == 'td_ridge'
         # How the td_ridge read-out weights w_r / w_c are learned: 'ridge' (closed-form on the
         # fresh epoch) or 'sgd' (gradient descent over a persistent cross-epoch replay buffer).
-        self._sr_readout: str = (
+        self._sr_readout = (
             self._cfgs.model_cfgs.sr_cfgs.get('readout', 'ridge') if self._sr_td_ridge else 'ridge'
         )
 
@@ -151,13 +164,35 @@ class PolicyGradient(BaseAlgo):
         # Persistent cross-epoch buffer for the sgd read-out regression (readout='sgd' only). The
         # rollout buffer above is wiped each epoch; this one accumulates the whole history so w_r /
         # w_c can be fit over all past experience (the read-out is policy-independent).
-        self._sr_readout_buf: ReadoutReplayBuffer | None = None
+        self._sr_readout_buf = None
         if self._sr_td_ridge and self._sr_readout == 'sgd':
             self._sr_readout_buf = ReadoutReplayBuffer(
                 obs_dim=self._env.observation_space.shape[0],
                 size=int(self._cfgs.model_cfgs.sr_cfgs.get('readout_buffer_size', 1_000_000)),
                 device=self._device,
             )
+
+        # --- SR diagnostic state (td_ridge only); see _log_sr_diagnostics -------------------
+        # Two probe sets of observations on which phi / psi drift is measured. The Fixed probe is
+        # drawn once and reused for the whole run, so its drift series is a clean measure of how
+        # much the feature map itself moved; the Fresh probe is redrawn from each epoch's rollout,
+        # so its drift is measured on the states the policy actually visits now. Neither alone is
+        # enough: the Fixed one slides off-distribution as the policy improves, the Fresh one
+        # confounds feature drift with distribution shift. Their divergence is the signal.
+        # Read behind the mode check: some on-policy configs (MICE.yaml) omit the sr_cfgs block
+        # entirely, and it is only reachable once use_successor_representation is on.
+        self._sr_probe_size = (
+            int(self._cfgs.model_cfgs.sr_cfgs.get('probe_size', 512)) if self._sr_td_ridge else 0
+        )
+        self._sr_diag_max_samples = (
+            int(self._cfgs.model_cfgs.sr_cfgs.get('diag_max_samples', 4096))
+            if self._sr_td_ridge
+            else 0
+        )
+        self._sr_probe_fixed_obs = None
+        self._sr_probe_fresh_obs = None
+        # Pre-update snapshots, taken in _make_train_val_split and consumed in _log_sr_diagnostics.
+        self._sr_snapshot = None
 
     def _init_log(self) -> None:
         """Log info about epoch.
@@ -274,6 +309,7 @@ class PolicyGradient(BaseAlgo):
             self._logger.register_key('Misc/WrNorm')
             self._logger.register_key('Misc/WcNorm')
             self._logger.register_key('Misc/GramCond')
+            self._register_sr_diagnostic_keys(_splits)
 
         self._logger.register_key('Time/Total')
         self._logger.register_key('Time/Rollout')
@@ -286,6 +322,69 @@ class PolicyGradient(BaseAlgo):
         # register environment specific keys
         for env_spec_key in self._env.env_spec_keys:
             self.logger.register_key(env_spec_key)
+
+    def _register_sr_diagnostic_keys(self, splits: tuple[str, ...]) -> None:
+        """Register the ``td_ridge`` successor-representation diagnostic keys.
+
+        The metrics themselves are described in :meth:`_log_sr_diagnostics`; this only declares
+        them with the logger. Like the value-critic diagnostics they are throttled to eval epochs,
+        so the un-evaluated epochs record ``nan`` -- the same convention the ``Value/...`` keys
+        already follow.
+
+        Args:
+            splits (tuple of str): The data splits in use -- ``('Train',)``, or
+                ``('Train', 'Val')`` when ``algo_cfgs.n_val_episodes`` is positive.
+        """
+        for split in splits:
+            # Layer 0 -- can phi's span express the one-step reward/cost, and how many
+            # directions does it actually use?
+            self._logger.register_key(f'SR/{split}/RidgeR2Reward')
+            self._logger.register_key(f'SR/{split}/RidgeR2Cost')
+            self._logger.register_key(f'SR/{split}/PhiEffRank')
+            self._logger.register_key(f'SR/{split}/PhiStableRank')
+            self._logger.register_key(f'SR/{split}/PhiDeadDims')
+            self._logger.register_key(f'SR/{split}/PsiEffRank')
+
+            # Layer 1 -- does psi match its target, before and after this epoch's update?
+            for stage in ('BeforeUpdate', 'AfterUpdate'):
+                self._logger.register_key(f'SR/{split}/{stage}/TDExplainedVar')
+                self._logger.register_key(f'SR/{split}/{stage}/MCExplainedVar')
+                self._logger.register_key(f'SR/{split}/{stage}/CosSim')
+                self._logger.register_key(f'SR/{split}/{stage}/NormRatio')
+                self._logger.register_key(f'SR/{split}/{stage}/PerDimEVMin')
+                self._logger.register_key(f'SR/{split}/{stage}/PerDimEVMedian')
+            self._logger.register_key(f'SR/{split}/TargetTrueEV')
+
+            # Layer 3 -- the psi x w attribution grid (see _log_sr_diagnostics).
+            for stream in ('Reward', 'Cost'):
+                self._logger.register_key(f'SR/{split}/V{stream}Corr')
+                self._logger.register_key(f'SR/{split}/PsiOracle{stream}Corr')
+                self._logger.register_key(f'SR/{split}/WOracle{stream}Corr')
+                self._logger.register_key(f'SR/{split}/Ceiling{stream}Corr')
+
+        if 'Val' in splits:
+            # Train - Val, logged directly so overfitting is one series rather than a
+            # subtraction the reader has to do by eye.
+            for key in (
+                'RidgeR2Reward',
+                'RidgeR2Cost',
+                'BeforeUpdate/TDExplainedVar',
+                'AfterUpdate/TDExplainedVar',
+                'AfterUpdate/MCExplainedVar',
+                'CeilingRewardCorr',
+                'CeilingCostCorr',
+            ):
+                self._logger.register_key(f'SR/Gap/{key}')
+
+        # Layer 2 -- non-stationarity of the pieces the fit assumes are fixed.
+        for probe in ('Fixed', 'Fresh'):
+            for feature in ('Phi', 'Psi'):
+                self._logger.register_key(f'SR/{feature}Drift/{probe}/Rel')
+                self._logger.register_key(f'SR/{feature}Drift/{probe}/Cos')
+                self._logger.register_key(f'SR/{feature}Drift/{probe}/Subspace')
+        for stream in ('R', 'C'):
+            self._logger.register_key(f'SR/WDrift/Rel{stream}')
+            self._logger.register_key(f'SR/WDrift/Cos{stream}')
 
     def learn(self) -> tuple[float, float, float]:
         """This is main function for algorithm update.
@@ -507,12 +606,29 @@ class PolicyGradient(BaseAlgo):
 
         Returns ``(train_data, val_data)``.  ``val_data`` is ``None`` when
         ``n_val_episodes == 0`` (default), preserving the existing behaviour.
+
+        Under ``td_ridge`` this also carries two extra pieces of bookkeeping for the SR
+        diagnostics, because it is the one hook every ``_update`` implementation calls exactly
+        once, immediately after ``self._buf.get()`` and before any gradient step:
+
+        * each returned dict gains an ``'_episode_lengths'`` entry (a plain list, not a tensor, so
+          it passes through the mask untouched), needed to rebuild the Monte-Carlo successor
+          feature per episode after the update;
+        * :meth:`_sr_capture_pre_update` snapshots ``phi`` / ``psi`` / ``w`` while they are still
+          at their pre-update values, which is what the drift metrics are measured against.
         """
         n_val = getattr(self._cfgs.algo_cfgs, 'n_val_episodes', 0)
+        need_slices = self._sr_td_ridge or n_val > 0
+        episode_slices = self._buf.get_episode_slices() if need_slices else []
+
+        if self._sr_td_ridge:
+            self._sr_capture_pre_update(data)
+
         if n_val <= 0:
+            if self._sr_td_ridge:
+                data['_episode_lengths'] = [e - s for s, e in episode_slices]
             return data, None
 
-        episode_slices = self._buf.get_episode_slices()
         n_total = len(episode_slices)
         n_val = min(n_val, n_total - 1)  # always keep at least 1 episode for training
 
@@ -534,7 +650,17 @@ class PolicyGradient(BaseAlgo):
                 for k, v in data.items()
             }
 
-        return _apply(train_mask), _apply(val_mask)
+        train_data, val_data = _apply(train_mask), _apply(val_mask)
+        if self._sr_td_ridge:
+            # Episodes are contiguous blocks assigned whole to one split, so masking preserves
+            # their order and contiguity -- the lengths alone are enough to recover the boundaries.
+            train_data['_episode_lengths'] = [
+                e - s for i, (s, e) in enumerate(episode_slices) if i not in val_ep_idx
+            ]
+            val_data['_episode_lengths'] = [
+                e - s for i, (s, e) in enumerate(episode_slices) if i in val_ep_idx
+            ]
+        return train_data, val_data
 
     def _log_critic_diagnostics_splits(
         self,
@@ -562,6 +688,380 @@ class PolicyGradient(BaseAlgo):
                 preupdate_pred_r=val_data['value_r'].flatten(),
                 preupdate_pred_c=val_data['value_c'].flatten(),
                 split='Val',
+            )
+        if self._sr_td_ridge:
+            self._log_sr_diagnostics(train_data, val_data)
+
+    def _is_sr_eval_epoch(self) -> bool:
+        """Whether this epoch runs the (expensive) diagnostic pass.
+
+        Reuses the same throttle as the value-critic diagnostics -- ``early_eval_freq`` for the
+        first 100 epochs, ``value_eval_freq`` after -- so every diagnostic series in the run
+        shares one set of sample points and can be read side by side.
+        """
+        epoch = getattr(self, '_current_epoch', 0)
+        eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
+        early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
+        effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
+        return epoch % effective_eval_freq == 0
+
+    @torch.no_grad()
+    def _sr_capture_pre_update(self, data: dict) -> None:
+        """Snapshot ``phi`` / ``psi`` / ``w`` before this epoch's update, for the drift metrics.
+
+        Called from :meth:`_make_train_val_split`, i.e. after the rollout but before both the
+        ridge re-solve and the gradient loop, so the recorded ``w`` is the one the epoch *started*
+        with and ``SR/WDrift/*`` measures the movement this epoch's re-solve caused.
+
+        Args:
+            data (dict): The full (pre train/val split) epoch batch, used to draw the probe
+                observations.
+        """
+        if not self._is_sr_eval_epoch():
+            self._sr_snapshot = None
+            return
+
+        obs = data['obs']
+        n_probe = min(self._sr_probe_size, obs.shape[0])
+        if self._sr_probe_fixed_obs is None:
+            self._sr_probe_fixed_obs = obs[torch.randperm(obs.shape[0])[:n_probe]].clone()
+        self._sr_probe_fresh_obs = obs[torch.randperm(obs.shape[0])[:n_probe]].clone()
+
+        phi_fixed, psi_fixed = self._actor_critic.sr_features(self._sr_probe_fixed_obs)
+        phi_fresh, psi_fresh = self._actor_critic.sr_features(self._sr_probe_fresh_obs)
+        self._sr_snapshot = {
+            'phi_fixed': phi_fixed.clone(),
+            'psi_fixed': psi_fixed.clone(),
+            'phi_fresh': phi_fresh.clone(),
+            'psi_fresh': psi_fresh.clone(),
+            'w_r': self._actor_critic.sr_trunk.w_r.detach().clone(),
+            'w_c': self._actor_critic.sr_trunk.w_c.detach().clone(),
+        }
+
+    @torch.no_grad()
+    def _sr_prepare_split(self, data: dict) -> dict[str, torch.Tensor] | None:
+        """Assemble every tensor the SR metrics for one split are computed from.
+
+        The one non-obvious piece is ``mc_after``. ``psi`` is *defined* as the discounted sum of
+        the ``phi`` stream, so scoring the post-update ``psi`` against a Monte-Carlo target built
+        from the pre-update ``phi`` would fold ``phi``'s drift into what is meant to be a
+        regression-quality number. Recomputing the target from the current ``phi`` keeps Layer 1
+        (does ``psi`` fit?) and Layer 2 (did ``phi`` move?) measuring separate things.
+
+        Args:
+            data (dict): One split of the epoch batch, carrying ``'_episode_lengths'``.
+
+        Returns:
+            A dict of aligned, subsampled tensors, or ``None`` if the split is too small to
+            produce meaningful statistics.
+        """
+        lengths = data.get('_episode_lengths')
+        obs = data['obs']
+        if lengths is None or obs.shape[0] < 2:
+            return None
+
+        # Same fallback rule as OnPolicyBuffer, so the recomputed Monte-Carlo target uses exactly
+        # the discount the buffer's stored one did.
+        gamma_sr = self._cfgs.model_cfgs.sr_cfgs.get('gamma_sr', None)
+        gamma_sr = self._cfgs.algo_cfgs.gamma if gamma_sr is None else gamma_sr
+        phi_after, psi_after = self._actor_critic.sr_features(obs)
+        mc_after = sr_diagnostics.discount_cumsum_segments(phi_after, lengths, gamma_sr)
+
+        prepared = {
+            'phi_roll': data['phi'],
+            'psi_roll': data['psi'],
+            'target_sr': data['target_sr'],
+            'mc_roll': data['discounted_sr'],
+            'phi_after': phi_after,
+            'psi_after': psi_after,
+            'mc_after': mc_after,
+            'reward': data['reward'].flatten(),
+            'cost': data['cost'].flatten(),
+            'true_r': data['discounted_ret'].flatten(),
+            'true_c': data['discounted_cost_ret'].flatten(),
+        }
+
+        n = obs.shape[0]
+        if n > self._sr_diag_max_samples:
+            idx = torch.randperm(n, device=obs.device)[: self._sr_diag_max_samples]
+            prepared = {k: v[idx] for k, v in prepared.items()}
+        return prepared
+
+    def _sr_stage_metrics(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+        """Score one ``psi`` prediction against one target, as four complementary numbers.
+
+        Explained variance is the headline (the vector-valued stand-in for the scalar critics'
+        correlation), but on its own it cannot say *how* a fit fails: the cosine and norm-ratio
+        pair separates a wrong direction from a merely mis-scaled one, and the per-dimension
+        spread separates a representation that is uniformly mediocre from one carrying all its
+        accuracy in a few coordinates.
+
+        Args:
+            pred (torch.Tensor): Predicted successor features of shape ``(N, sr_dim)``.
+            target (torch.Tensor): Target successor features of the same shape.
+
+        Returns:
+            A dict of metric-suffix to value, to be prefixed with the split and stage.
+        """
+        cos, norm_ratio = sr_diagnostics.cosine_norm_stats(pred, target)
+        per_dim = sr_diagnostics.per_dim_explained_variance(pred, target)
+        finite = per_dim[torch.isfinite(per_dim)]
+        return {
+            'TDExplainedVar': sr_diagnostics.explained_variance(pred, target),
+            'CosSim': cos,
+            'NormRatio': norm_ratio,
+            'PerDimEVMin': finite.min().item() if finite.numel() else float('nan'),
+            'PerDimEVMedian': finite.median().item() if finite.numel() else float('nan'),
+        }
+
+    def _log_sr_diagnostics(self, train_data: dict, val_data: dict | None) -> None:
+        r"""Measure each link of the SR factorization separately, on both splits.
+
+        The critic factors the value function as
+        ``V(s) = psi(s) . w`` with ``psi(s) ~= sum_k gamma^k phi(s_{t+k})``, and the composite
+        ``Value/{split}/...`` correlations cannot say which of the three fitted pieces -- the
+        basis ``phi``, the successor regression ``psi``, or the read-out ``w`` -- is responsible
+        when ``V`` is poor. These metrics can, in four groups:
+
+        **Layer 0, basis quality** (``SR/{split}/RidgeR2*``, ``Phi*Rank``, ``PhiDeadDims``).
+        Whether ``phi``'s span expresses the one-step reward/cost out of sample, and how many of
+        its ``sr_dim`` directions carry signal. The ridge is solved on the training split only, so
+        the ``Train`` / ``Val`` gap in ``RidgeR2*`` is the read-out's generalization gap directly.
+
+        **Layer 1, regression quality** (``SR/{split}/{stage}/*``). How well ``psi`` matches its
+        bootstrapped target and the Monte-Carlo truth, on both splits and both before and after
+        the epoch's gradient steps. ``Train`` improving while ``Val`` does not is ``psi``
+        memorizing the on-policy batch -- the failure this whole pass exists to detect.
+
+        **Layer 2, non-stationarity** (``SR/PhiDrift/*``, ``PsiDrift/*``, ``WDrift/*``). ``psi``'s
+        target and the ridge's basis are both defined in terms of ``phi``, so a ``phi`` that moves
+        during the fit makes both stale. ``Subspace`` is the discriminating one: ``w`` is solved
+        against ``phi``'s *span*, so a rotation inside a fixed span is recoverable by a re-solve
+        and a tilt of the span itself is not.
+
+        **Layer 3, attribution** (``SR/{split}/{V,PsiOracle,WOracle,Ceiling}*Corr``). A 2x2 over
+        {current ``psi``, Monte-Carlo ``psi``} x {current ``w``, oracle ``w`` fitted on the
+        training split}, each correlated against the true discounted return:
+
+        +----------------+--------------------+--------------------+
+        |                | current w          | oracle w*          |
+        +================+====================+====================+
+        | current psi    | ``V*Corr``         | ``WOracle*Corr``   |
+        +----------------+--------------------+--------------------+
+        | Monte-Carlo psi| ``PsiOracle*Corr`` | ``Ceiling*Corr``   |
+        +----------------+--------------------+--------------------+
+
+        ``Ceiling*Corr`` is the ceiling of the factorization itself -- perfect successor features
+        and the best possible read-out on top of them. If it is low, ``phi`` cannot express the
+        value function and no amount of fitting ``psi`` or ``w`` will help; if it is high while
+        ``V*Corr`` is low, whichever oracle recovers the correlation names the broken piece.
+
+        Args:
+            train_data (dict): The training-split epoch batch.
+            val_data (dict or None): The held-out split, or ``None`` when ``n_val_episodes`` is 0.
+        """
+        if not self._is_sr_eval_epoch():
+            return
+
+        prepared: dict[str, dict[str, torch.Tensor]] = {}
+        train_prepared = self._sr_prepare_split(train_data)
+        if train_prepared is None:
+            return
+        prepared['Train'] = train_prepared
+        if val_data is not None:
+            val_prepared = self._sr_prepare_split(val_data)
+            if val_prepared is not None:
+                prepared['Val'] = val_prepared
+
+        # Oracle read-outs are fitted on the training split and applied to both, so the Val
+        # column is a genuine held-out test of the read-out rather than an in-sample refit.
+        kappa = self._cfgs.model_cfgs.sr_cfgs.get('ridge_kappa', 1e-3)
+        oracle_w = {
+            f'{feat}_{stream}': sr_diagnostics.ridge_fit(
+                train_prepared[feat],
+                train_prepared[target],
+                kappa,
+            )
+            for feat in ('psi_after', 'mc_after')
+            for stream, target in (('r', 'true_r'), ('c', 'true_c'))
+        }
+
+        scalars: dict[str, dict[str, float]] = {}
+        for split, prep in prepared.items():
+            scalars[split] = self._sr_split_scalars(prep, oracle_w)
+            self._logger.store({f'SR/{split}/{k}': v for k, v in scalars[split].items()})
+
+        if 'Val' in scalars:
+            for key in (
+                'RidgeR2Reward',
+                'RidgeR2Cost',
+                'BeforeUpdate/TDExplainedVar',
+                'AfterUpdate/TDExplainedVar',
+                'AfterUpdate/MCExplainedVar',
+                'CeilingRewardCorr',
+                'CeilingCostCorr',
+            ):
+                self._logger.store({f'SR/Gap/{key}': scalars['Train'][key] - scalars['Val'][key]})
+
+        self._log_sr_drift()
+        self._log_sr_scatters(prepared, oracle_w)
+
+    def _sr_split_scalars(
+        self,
+        prep: dict[str, torch.Tensor],
+        oracle_w: dict[str, torch.Tensor],
+    ) -> dict[str, float]:
+        """Compute the Layer 0, 1 and 3 metrics for a single split.
+
+        Args:
+            prep (dict): The split's tensors, as returned by :meth:`_sr_prepare_split`.
+            oracle_w (dict): Oracle read-out weights fitted on the training split, keyed
+                ``'{psi_after,mc_after}_{r,c}'``.
+
+        Returns:
+            A dict of key-suffix to value, to be prefixed with ``SR/{split}/``.
+        """
+        w_r = self._actor_critic.sr_trunk.w_r.detach()
+        w_c = self._actor_critic.sr_trunk.w_c.detach()
+        out: dict[str, float] = {}
+
+        # --- Layer 0: is phi a usable basis? -------------------------------------------------
+        # Measured on the rollout-time phi and the live w, which is exactly the pair the ridge
+        # solved for this epoch, so Train is in-sample fit and Val is its generalization.
+        out['RidgeR2Reward'] = sr_diagnostics.r2_score(prep['phi_roll'] @ w_r, prep['reward'])
+        out['RidgeR2Cost'] = sr_diagnostics.r2_score(prep['phi_roll'] @ w_c, prep['cost'])
+        out['PhiEffRank'] = sr_diagnostics.effective_rank(prep['phi_roll'])
+        out['PhiStableRank'] = sr_diagnostics.stable_rank(prep['phi_roll'])
+        out['PhiDeadDims'] = sr_diagnostics.dead_dim_fraction(prep['phi_roll'])
+        out['PsiEffRank'] = sr_diagnostics.effective_rank(prep['psi_roll'])
+
+        # --- Layer 1: does psi fit the successor recursion? ----------------------------------
+        # BeforeUpdate reads psi straight off the rollout (the SR counterpart of value_r/value_c);
+        # AfterUpdate re-queries the live network. Both are scored against the same fixed
+        # target_sr, so the pair isolates what this epoch's gradient steps achieved.
+        for stage, psi, mc_target in (
+            ('BeforeUpdate', prep['psi_roll'], prep['mc_roll']),
+            ('AfterUpdate', prep['psi_after'], prep['mc_after']),
+        ):
+            for name, value in self._sr_stage_metrics(psi, prep['target_sr']).items():
+                out[f'{stage}/{name}'] = value
+            out[f'{stage}/MCExplainedVar'] = sr_diagnostics.explained_variance(psi, mc_target)
+        out['TargetTrueEV'] = sr_diagnostics.explained_variance(prep['target_sr'], prep['mc_roll'])
+
+        # --- Layer 3: which piece is responsible for V's error? ------------------------------
+        for stream, weight, true in (('Reward', w_r, 'true_r'), ('Cost', w_c, 'true_c')):
+            suffix = 'r' if stream == 'Reward' else 'c'
+            out[f'V{stream}Corr'] = sr_diagnostics.correlation(
+                prep['psi_after'] @ weight,
+                prep[true],
+            )
+            out[f'PsiOracle{stream}Corr'] = sr_diagnostics.correlation(
+                prep['mc_after'] @ weight,
+                prep[true],
+            )
+            out[f'WOracle{stream}Corr'] = sr_diagnostics.correlation(
+                prep['psi_after'] @ oracle_w[f'psi_after_{suffix}'],
+                prep[true],
+            )
+            out[f'Ceiling{stream}Corr'] = sr_diagnostics.correlation(
+                prep['mc_after'] @ oracle_w[f'mc_after_{suffix}'],
+                prep[true],
+            )
+        return out
+
+    @torch.no_grad()
+    def _log_sr_drift(self) -> None:
+        """Log how far ``phi`` / ``psi`` / ``w`` moved over this epoch's update.
+
+        Consumes the snapshot :meth:`_sr_capture_pre_update` took before the gradient loop. The
+        two probe sets are reported separately because they answer different questions: ``Fixed``
+        holds the input distribution constant so its drift is purely the feature map moving, while
+        ``Fresh`` tracks the states the current policy visits.
+        """
+        snapshot = self._sr_snapshot
+        if snapshot is None:
+            return
+
+        for probe, probe_obs in (
+            ('Fixed', self._sr_probe_fixed_obs),
+            ('Fresh', self._sr_probe_fresh_obs),
+        ):
+            if probe_obs is None:
+                continue
+            phi_now, psi_now = self._actor_critic.sr_features(probe_obs)
+            for feature, now, before in (
+                ('Phi', phi_now, snapshot[f'phi_{probe.lower()}']),
+                ('Psi', psi_now, snapshot[f'psi_{probe.lower()}']),
+            ):
+                self._logger.store(
+                    {
+                        f'SR/{feature}Drift/{probe}/Rel': sr_diagnostics.relative_change(
+                            now,
+                            before,
+                        ),
+                        f'SR/{feature}Drift/{probe}/Cos': sr_diagnostics.mean_cosine(now, before),
+                        f'SR/{feature}Drift/{probe}/Subspace': sr_diagnostics.subspace_distance(
+                            now,
+                            before,
+                        ),
+                    },
+                )
+
+        for stream, name in (('R', 'w_r'), ('C', 'w_c')):
+            now = getattr(self._actor_critic.sr_trunk, name).detach()
+            before = snapshot[name]
+            self._logger.store(
+                {
+                    f'SR/WDrift/Rel{stream}': sr_diagnostics.relative_change(now, before),
+                    f'SR/WDrift/Cos{stream}': sr_diagnostics.mean_cosine(now, before),
+                },
+            )
+
+    def _log_sr_scatters(
+        self,
+        prepared: dict[str, dict[str, torch.Tensor]],
+        oracle_w: dict[str, torch.Tensor],
+    ) -> None:
+        """Log the scatter plots behind the SR scalars.
+
+        Three per split. The first two show the ``psi`` fit flattened over ``(sample, dimension)``
+        pairs -- against its bootstrapped target and against the Monte-Carlo truth -- which
+        separate a residual that is uniform noise from one that is structured bias, something no
+        single explained-variance number can. The third plots the ceiling prediction against the
+        true return, the picture behind ``SR/{split}/CeilingRewardCorr``: a cloud that fails to
+        line up there is ``phi`` failing, not ``psi`` or ``w``.
+
+        Args:
+            prepared (dict): Per-split tensors, as returned by :meth:`_sr_prepare_split`.
+            oracle_w (dict): Oracle read-out weights fitted on the training split.
+        """
+        for split, prep in prepared.items():
+            psi, target = prep['psi_after'], prep['target_sr']
+            flat_n = psi.numel()
+            idx = torch.randperm(flat_n, device=psi.device)[: min(flat_n, 4000)]
+            self._logger.log_scatter_image(
+                f'SR/{split}/PsiTargetScatter',
+                x_values=target.reshape(-1)[idx],
+                y_values=psi.reshape(-1)[idx],
+                xlabel='Target psi (per dim)',
+                ylabel='Predicted psi (per dim)',
+            )
+            self._logger.log_scatter_image(
+                f'SR/{split}/PsiMonteCarloScatter',
+                x_values=prep['mc_after'].reshape(-1)[idx],
+                y_values=psi.reshape(-1)[idx],
+                xlabel='Monte-Carlo psi (per dim)',
+                ylabel='Predicted psi (per dim)',
+            )
+
+            n = prep['true_r'].shape[0]
+            row_idx = torch.randperm(n, device=psi.device)[: min(n, 2000)]
+            self._logger.log_scatter_image(
+                f'SR/{split}/CeilingRewardScatter',
+                x_values=prep['true_r'][row_idx],
+                y_values=(prep['mc_after'] @ oracle_w['mc_after_r'])[row_idx],
+                xlabel='True G_r',
+                ylabel='Monte-Carlo psi . oracle w_r',
             )
 
     def _log_critic_diagnostics(

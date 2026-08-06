@@ -198,6 +198,15 @@ defaults:
       # depth of the standalone phi network (phi_source: 'separate' only); as with sr_cfgs.
       # hidden_sizes above, only the number of layers is used -- every width becomes sr_dim
       phi_hidden_sizes: [64, 64]
+      # --- SR diagnostics (td_ridge mode only; see PolicyGradient._log_sr_diagnostics) ---
+      # number of observations in each phi/psi drift probe set. One probe is drawn once and held
+      # for the whole run (drift with the input distribution held constant), the other is redrawn
+      # from each epoch's rollout (drift on the states the current policy actually visits).
+      probe_size: 512
+      # cap on the rows used per split by the diagnostic pass, which runs SVDs and ridge solves
+      # over the epoch batch; the metrics are all per-row averages, so subsampling only costs
+      # precision, never bias
+      diag_max_samples: 4096
   # lagrangian configurations
   lagrange_cfgs:
     # Tolerance of constraint violation

@@ -55,6 +55,13 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
     | logp           | (size,) | torch.float32 | The log probability of the action.     |
     +----------------+---------+---------------+----------------------------------------+
 
+    In ``td_ridge`` successor-representation mode (``sr_dim`` not ``None``) four more fields hold
+    the vector-valued feature stream, all of shape ``(size, sr_dim)``: ``phi`` and ``psi`` are the
+    one-step and successor features as evaluated during the rollout, ``target_sr`` is the
+    bootstrapped lambda-target ``psi`` is trained against, and ``discounted_sr`` is the
+    Monte-Carlo successor feature -- the vector counterpart of ``discounted_ret``, used only by
+    the diagnostics in :mod:`omnisafe.utils.sr_diagnostics`.
+
     Args:
         obs_space (OmnisafeSpace): The observation space.
         act_space (OmnisafeSpace): The action space.
@@ -145,6 +152,14 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             self.data['phi'] = torch.zeros((size, sr_dim), dtype=torch.float32, device=device)
             self.data['psi'] = torch.zeros((size, sr_dim), dtype=torch.float32, device=device)
             self.data['target_sr'] = torch.zeros((size, sr_dim), dtype=torch.float32, device=device)
+            # Monte-Carlo successor feature: the vector-valued counterpart of ``discounted_ret``,
+            # and the ground truth the bootstrapped ``target_sr`` is scored against by the SR
+            # diagnostics. Diagnostic-only -- nothing trains on it.
+            self.data['discounted_sr'] = torch.zeros(
+                (size, sr_dim),
+                dtype=torch.float32,
+                device=device,
+            )
 
     @property
     def standardized_adv_r(self) -> bool:
@@ -254,6 +269,13 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
                 gamma=self._gamma_sr,
             )
             self.data['target_sr'][path_slice] = target_sr
+            # Mirrors ``discounted_ret`` exactly -- a plain Monte-Carlo sum over the path with no
+            # truncation bootstrap -- so the two "true" quantities carry the same bias and the SR
+            # and value diagnostics stay comparable.
+            self.data['discounted_sr'][path_slice] = discount_cumsum(
+                self.data['phi'][path_slice],
+                self._gamma_sr,
+            )
 
         self._episode_slices.append((self.path_start_idx, self.ptr))
         self.path_start_idx = self.ptr
@@ -293,6 +315,11 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             data['target_sr'] = self.data['target_sr']
             data['reward'] = self.data['reward']
             data['cost'] = self.data['cost']
+            # ``psi`` is the rollout-time successor feature, the SR counterpart of ``value_r`` /
+            # ``value_c``: it gives the diagnostics a pre-update prediction for free, without
+            # having to snapshot the network before the gradient loop.
+            data['psi'] = self.data['psi']
+            data['discounted_sr'] = self.data['discounted_sr']
 
         adv_mean, adv_std, *_ = distributed.dist_statistics_scalar(data['adv_r'])
         cadv_mean, *_ = distributed.dist_statistics_scalar(data['adv_c'])
