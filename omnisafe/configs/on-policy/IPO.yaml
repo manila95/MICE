@@ -78,6 +78,11 @@ defaults:
     penalty_coef: 0.0
     # use cost
     use_cost: True
+    # fixed per-transition cost advantage used in place of a learned cost critic's adv_c;
+    # null (~) keeps the standard learned cost-critic advantage. When set, the cost critic
+    # is never trained (it plays no role) and every adv_c fed to the policy update is this
+    # constant instead.
+    fixed_adv_c: ~
     # the coefficient of cost penalty
     kappa: 0.01
     # the max of cost penalty

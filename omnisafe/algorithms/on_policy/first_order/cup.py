@@ -151,6 +151,10 @@ class CUP(PPO):
             data['logp'],
             data['adv_c'],
         )
+        if self._fixed_adv_c is not None:
+            # Same substitution as PolicyGradient._update; this second stage re-fetches adv_c
+            # from the buffer directly rather than reusing what super()._update() computed.
+            adv_c = torch.full_like(adv_c, self._fixed_adv_c)
         original_obs = obs
         with torch.no_grad():
             old_distribution = self._actor_critic.actor(obs)

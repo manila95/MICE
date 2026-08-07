@@ -60,6 +60,13 @@ class PolicyGradient(BaseAlgo):
     _sr_probe_fresh_obs: torch.Tensor | None = None
     _sr_snapshot: dict[str, torch.Tensor] | None = None
 
+    # Fixed cost-advantage override (algo_cfgs.fixed_adv_c). When set, every ``adv_c`` fed to the
+    # actor update is this constant instead of the buffer's learned-critic GAE, and the cost
+    # critic is never trained -- see ``_update`` and ``_update_cost_critic``'s call sites. Declared
+    # at class level for the same reason as the SR state above: subclasses with their own ``_init``
+    # (or ``_update``, e.g. FOCOPS) still need a safe default before ``_init`` has run.
+    _fixed_adv_c: float | None = None
+
     def _init_env(self) -> None:
         """Initialize the environment.
 
@@ -130,6 +137,10 @@ class PolicyGradient(BaseAlgo):
             ...     self._buffer = CustomBuffer()
             ...     self._model = CustomModel()
         """
+        # When set, replaces the learned cost-critic advantage with this constant everywhere
+        # adv_c is used, and the cost critic itself is never trained (see _update).
+        self._fixed_adv_c = getattr(self._cfgs.algo_cfgs, 'fixed_adv_c', None)
+
         use_sr = bool(self._cfgs.model_cfgs.get('use_successor_representation', False))
         self._sr_td_ridge = use_sr and self._cfgs.model_cfgs.sr_cfgs.get(
             'sr_mode',
@@ -531,6 +542,10 @@ class PolicyGradient(BaseAlgo):
             train_data['adv_r'],
             train_data['adv_c'],
         )
+        if self._fixed_adv_c is not None:
+            # Replace the learned-critic cost advantage with the fixed constant everywhere
+            # downstream (dataloader, _update_actor, _compute_adv_surrogate) reads adv_c.
+            adv_c = torch.full_like(adv_c, self._fixed_adv_c)
 
         original_obs = obs
         old_distribution = self._actor_critic.actor(obs)
@@ -567,7 +582,7 @@ class PolicyGradient(BaseAlgo):
                 else:
                     obs, act, logp, target_value_r, target_value_c, adv_r, adv_c = batch
                 self._update_reward_critic(obs, target_value_r)
-                if self._cfgs.algo_cfgs.use_cost:
+                if self._cfgs.algo_cfgs.use_cost and self._fixed_adv_c is None:
                     self._update_cost_critic(obs, target_value_c)
                 if self._sr_td_ridge:
                     self._update_successor_features(obs, target_sr)

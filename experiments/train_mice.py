@@ -216,6 +216,14 @@ if __name__ == '__main__':
         choices=['td_zero', 'td_zero_gae', 'gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce'],
         help='Advantage estimation method for cost; defaults to --adv-estimation-method if unset',
     )
+    parser.add_argument(
+        '--fixed-adv-c',
+        type=float,
+        default=None,
+        metavar='ADV_C',
+        help='fixed cost advantage used in place of a learned cost critic (the cost critic is '
+        'then never trained); default None keeps the learned cost-critic advantage',
+    )
     args, unparsed_args = parser.parse_known_args()
     # Handle both '--key value' and '--key=value' (wandb sweep format).
     # Keys may use '.' or ':' as hierarchy separator, and '-' or '_' between words.
@@ -260,6 +268,7 @@ if __name__ == '__main__':
     steps_per_epoch = args.steps_per_epoch
     early_eval_freq = args.early_eval_freq
     lidar_bins = args.lidar_bins
+    fixed_adv_c = args.fixed_adv_c
     opt = vars(args)
     del opt["seed"]
     del opt["constant_cost"]
@@ -283,6 +292,7 @@ if __name__ == '__main__':
     del opt["steps_per_epoch"]
     del opt["early_eval_freq"]
     del opt["lidar_bins"]
+    del opt["fixed_adv_c"]
     custom_cfgs = {}
     for k, v in unparsed_args.items():
         update_dict(custom_cfgs, custom_cfgs_to_dict(k, v))
@@ -338,6 +348,8 @@ if __name__ == '__main__':
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:early_eval_freq', str(early_eval_freq)))
     if lidar_bins is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('env_cfgs:lidar_num_bins', str(lidar_bins)))
+    if fixed_adv_c is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:fixed_adv_c', str(fixed_adv_c)))
 
     agent = omnisafe.Agent(
         args.algo,

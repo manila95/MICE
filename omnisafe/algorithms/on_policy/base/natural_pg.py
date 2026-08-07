@@ -213,6 +213,10 @@ class NaturalPG(PolicyGradient):
             train_data['adv_r'],
             train_data['adv_c'],
         )
+        if self._fixed_adv_c is not None:
+            # Replace the learned-critic cost advantage with the fixed constant everywhere
+            # downstream (dataloader, _update_actor, _compute_adv_surrogate) reads adv_c.
+            adv_c = torch.full_like(adv_c, self._fixed_adv_c)
         self._update_actor(obs, act, logp, adv_r, adv_c)
 
         if self._sr_td_ridge:
@@ -235,7 +239,7 @@ class NaturalPG(PolicyGradient):
                 else:
                     obs, target_value_r, target_value_c = batch
                 self._update_reward_critic(obs, target_value_r)
-                if self._cfgs.algo_cfgs.use_cost:
+                if self._cfgs.algo_cfgs.use_cost and self._fixed_adv_c is None:
                     self._update_cost_critic(obs, target_value_c)
                 if self._sr_td_ridge:
                     self._update_successor_features(obs, target_sr)
