@@ -53,6 +53,7 @@ class PolicyGradient(BaseAlgo):
     # algorithm dies with an AttributeError before its first rollout.
     _sr_td_ridge: bool = False
     _sr_readout: str = 'ridge'
+    _sr_ridge_data: str = 'epoch'
     _sr_readout_buf: ReadoutReplayBuffer | None = None
     _sr_probe_size: int = 0
     _sr_diag_max_samples: int = 0
@@ -140,6 +141,20 @@ class PolicyGradient(BaseAlgo):
         self._sr_readout = (
             self._cfgs.model_cfgs.sr_cfgs.get('readout', 'ridge') if self._sr_td_ridge else 'ridge'
         )
+        # Which transitions the closed-form ridge is solved on (readout='ridge' only): 'epoch' --
+        # the fresh epoch's training split, or 'buffer' -- the persistent cross-epoch history. This
+        # is deliberately a separate axis from ``readout`` above, which selects only *how* w is fit;
+        # holding one fixed while varying the other is what makes the two comparable.
+        self._sr_ridge_data = (
+            self._cfgs.model_cfgs.sr_cfgs.get('ridge_data', 'epoch')
+            if self._sr_td_ridge
+            else 'epoch'
+        )
+        if self._sr_ridge_data not in ('epoch', 'buffer'):
+            raise NotImplementedError(
+                f'Unknown sr_cfgs.ridge_data "{self._sr_ridge_data}". '
+                'Available ridge data sources are: "epoch", "buffer".',
+            )
 
         self._buf: VectorOnPolicyBuffer = VectorOnPolicyBuffer(
             obs_space=self._env.observation_space,
@@ -161,11 +176,12 @@ class PolicyGradient(BaseAlgo):
             gamma_sr=self._cfgs.model_cfgs.sr_cfgs.get('gamma_sr', None) if self._sr_td_ridge else None,
         )
 
-        # Persistent cross-epoch buffer for the sgd read-out regression (readout='sgd' only). The
-        # rollout buffer above is wiped each epoch; this one accumulates the whole history so w_r /
-        # w_c can be fit over all past experience (the read-out is policy-independent).
+        # Persistent cross-epoch buffer for the read-out regression. The rollout buffer above is
+        # wiped each epoch; this one accumulates the whole history so w_r / w_c can be fit over all
+        # past experience (the read-out is policy-independent). Used by readout='sgd' always, and
+        # by readout='ridge' under ridge_data='buffer'.
         self._sr_readout_buf = None
-        if self._sr_td_ridge and self._sr_readout == 'sgd':
+        if self._sr_td_ridge and (self._sr_readout == 'sgd' or self._sr_ridge_data == 'buffer'):
             self._sr_readout_buf = ReadoutReplayBuffer(
                 obs_dim=self._env.observation_space.shape[0],
                 size=int(self._cfgs.model_cfgs.sr_cfgs.get('readout_buffer_size', 1_000_000)),
@@ -309,6 +325,9 @@ class PolicyGradient(BaseAlgo):
             self._logger.register_key('Misc/WrNorm')
             self._logger.register_key('Misc/WcNorm')
             self._logger.register_key('Misc/GramCond')
+            # How many transitions w_r / w_c were actually fitted over this epoch -- constant under
+            # ridge_data='epoch', but rising then plateauing at the buffer capacity otherwise.
+            self._logger.register_key('Misc/RidgeFitSamples')
             self._register_sr_diagnostic_keys(_splits)
 
         self._logger.register_key('Time/Total')
@@ -1271,10 +1290,21 @@ class PolicyGradient(BaseAlgo):
     def _ridge_update_successor_weights(self, train_data: dict[str, torch.Tensor]) -> None:
         """Refresh the ``td_ridge`` successor-representation read-out weights.
 
-        Solves ``w_r`` / ``w_c`` in closed form on the fresh epoch's *training* split, once per
-        :meth:`_update` call (not per minibatch) -- mirroring how the buffer's GAE targets are
-        also computed once per epoch from the just-collected data. Uses ``train_data`` (not the
-        full pre-split batch) so the ridge fit never sees the held-out validation episodes.
+        Solves ``w_r`` / ``w_c`` in closed form once per :meth:`_update` call (not per minibatch)
+        -- mirroring how the buffer's GAE targets are also computed once per epoch from the
+        just-collected data. Either way the fit sees only ``train_data``, never the held-out
+        validation episodes, so the ``SR/Gap/RidgeR2*`` series stays a genuine held-out test.
+
+        ``sr_cfgs.ridge_data`` selects the design matrix:
+
+        * ``'epoch'`` (default): the fresh epoch's training split, using the ``phi`` the rollout
+            already stored.
+        * ``'buffer'``: the persistent cross-epoch history. The read-out ``r(s) ~= phi(s) . w`` is
+            policy-independent, so stale-policy transitions remain correct regression data, and
+            pooling them widens the state coverage the Gram matrix is built from -- which is what
+            conditions the solve when ``phi`` is rank-deficient (``phi_source='random'``). ``phi``
+            is recomputed from the stored observations rather than cached, so the basis is always
+            the current one even when it drifts under ``phi_source='trunk'``.
 
         Args:
             train_data (dict[str, torch.Tensor]): The training-split epoch batch (post
@@ -1282,13 +1312,28 @@ class PolicyGradient(BaseAlgo):
                 fields used for the ridge solve.
         """
         sr_cfgs = self._cfgs.model_cfgs.sr_cfgs
+        if self._sr_ridge_data == 'buffer':
+            assert self._sr_readout_buf is not None
+            # Only the training split is retained, so held-out episodes never enter the fit --
+            # neither this epoch's nor, once they have aged into the history, any earlier one's.
+            self._sr_readout_buf.add(train_data['obs'], train_data['reward'], train_data['cost'])
+            n_samples = sr_cfgs.get('ridge_buffer_samples', None)
+            if n_samples is None or int(n_samples) >= len(self._sr_readout_buf):
+                obs, reward, cost = self._sr_readout_buf.all()
+            else:
+                obs, reward, cost = self._sr_readout_buf.sample(int(n_samples))
+            phi, _ = self._actor_critic.sr_features(obs)  # detached; recomputed under current phi
+        else:
+            phi, reward, cost = train_data['phi'], train_data['reward'], train_data['cost']
+
         stats = self._actor_critic.sr_trunk.ridge_update(
-            train_data['phi'],
-            train_data['reward'],
-            train_data['cost'],
+            phi,
+            reward,
+            cost,
             ridge_kappa=sr_cfgs.get('ridge_kappa', 1e-3),
             ema_tau=sr_cfgs.get('ema_tau', 1.0),
         )
+        stats['Misc/RidgeFitSamples'] = float(phi.shape[0])
         self._logger.store(stats)
 
     def _sgd_update_readout_weights(self, data: dict[str, torch.Tensor]) -> None:
@@ -1330,6 +1375,8 @@ class PolicyGradient(BaseAlgo):
                 )
             self._actor_critic.sr_readout_optimizer.step()
         if stats:
+            # Counterpart of the same key on the ridge path: the history w was fitted over.
+            stats['Misc/RidgeFitSamples'] = float(len(self._sr_readout_buf))
             self._logger.store(stats)
 
     def _update_successor_features(self, obs: torch.Tensor, target_sr: torch.Tensor) -> None:

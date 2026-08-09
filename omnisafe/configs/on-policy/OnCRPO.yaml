@@ -169,6 +169,17 @@ defaults:
       # phi_source: random / separate). On-policy 'sgd' keeps its own buffer since the rollout
       # buffer is wiped every epoch, so w is still fit over all past experience.
       readout: ridge
+      # which transitions the closed-form ridge is solved on (readout: ridge only).
+      #   'epoch'  : the fresh epoch's training split (the rollout's own phi).
+      #   'buffer' : the persistent cross-epoch history, recomputing phi under the current basis.
+      #              Valid because the read-out r(s) ~= phi(s).w is policy-independent; widens the
+      #              state coverage the Gram is built from, which is what conditions the solve when
+      #              phi is rank-deficient (phi_source: random). Held-out val episodes are never
+      #              added, so SR/Gap/RidgeR2* stays a genuine generalization test.
+      ridge_data: epoch
+      # how many buffered transitions to draw for the solve (ridge_data: buffer only);
+      # null = use the entire buffer. Cost is O(N * sr_dim^2), linear in N.
+      ridge_buffer_samples: ~
       # learning rate for the sgd read-out weights (readout: sgd only); null = reuse sr_cfgs.lr
       w_lr: ~
       # capacity of the persistent sgd read-out replay buffer (readout: sgd only)

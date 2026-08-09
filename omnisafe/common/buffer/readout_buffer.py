@@ -76,6 +76,21 @@ class ReadoutReplayBuffer:
             self._full = True
         self._ptr = (self._ptr + n) % self._size
 
+    def all(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return every stored transition, in insertion order.
+
+        The closed-form ridge counterpart of :meth:`sample`. The ridge solve consumes the whole
+        design matrix at once rather than a stream of minibatches, and it wants each transition
+        exactly once -- :meth:`sample` draws *with replacement*, which would duplicate some rows
+        and drop others, biasing the Gram matrix for no benefit.
+
+        Returns:
+            ``(obs, reward, cost)`` with shapes ``(len(self), obs_dim)``, ``(len(self),)``,
+            ``(len(self),)``.
+        """
+        high = len(self)
+        return self._obs[:high], self._reward[:high], self._cost[:high]
+
     def sample(self, batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample a uniform minibatch (with replacement) of stored transitions.
 
