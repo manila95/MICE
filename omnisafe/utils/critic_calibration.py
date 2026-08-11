@@ -40,6 +40,7 @@ import torch
 from torch import optim
 from torch.nn import functional as F
 from torch.nn.utils.clip_grad import clip_grad_norm_
+from tqdm import tqdm
 
 from omnisafe.common.buffer import VectorOnPolicyBuffer
 from omnisafe.models.critic.critic_builder import CriticBuilder
@@ -368,7 +369,14 @@ def train_critic(  # pylint: disable=too-many-arguments,too-many-locals
     val_loss_r = val_loss_c = float('nan')
     epochs_run = 0
 
-    for epoch in range(epochs_cap):
+    epoch_bar = tqdm(
+        range(epochs_cap),
+        desc=f'  critic train ({target_mode}, {stopping})',
+        unit='epoch',
+        leave=False,
+        position=1,
+    )
+    for epoch in epoch_bar:
         epochs_run = epoch + 1
         perm = train_idx[torch.randperm(train_idx.shape[0], device=device)]
         losses_r, losses_c = [], []
@@ -396,6 +404,11 @@ def train_critic(  # pylint: disable=too-many-arguments,too-many-locals
         train_loss_r = sum(losses_r) / len(losses_r)
         train_loss_c = sum(losses_c) / len(losses_c) if losses_c else float('nan')
 
+        postfix = {'loss_r': f'{train_loss_r:.4g}'}
+        if use_cost:
+            postfix['loss_c'] = f'{train_loss_c:.4g}'
+        epoch_bar.set_postfix(postfix)
+
         if stopping == 'early_stop' and val_idx.numel() > 0:
             with torch.no_grad():
                 val_loss_r = F.mse_loss(
@@ -410,6 +423,10 @@ def train_critic(  # pylint: disable=too-many-arguments,too-many-locals
                     if use_cost
                     else float('nan')
                 )
+            postfix['val_r'] = f'{val_loss_r:.4g}'
+            if use_cost:
+                postfix['val_c'] = f'{val_loss_c:.4g}'
+            epoch_bar.set_postfix(postfix)
             monitor = val_loss_r + (val_loss_c if use_cost else 0.0)
             if monitor < best_val - min_delta:
                 best_val = monitor
@@ -425,6 +442,7 @@ def train_critic(  # pylint: disable=too-many-arguments,too-many-locals
                 patience_ctr += 1
                 if patience_ctr >= patience:
                     break
+    epoch_bar.close()
 
     if stopping == 'early_stop' and best_state is not None:
         actor_critic.reward_critic.load_state_dict(best_state['reward_critic'])

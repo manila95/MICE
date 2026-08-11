@@ -48,6 +48,7 @@ import time
 from typing import Any
 
 import torch
+from tqdm import tqdm
 
 import omnisafe
 from omnisafe.utils.critic_calibration import (
@@ -223,6 +224,8 @@ def run_phase1_pretrain(args: argparse.Namespace, custom_cfgs: dict[str, Any]) -
         f'\nPhase 1 complete. Checkpoint saved to:\n  {checkpoint_path}\n'
         f'Reuse it later with --checkpoint-path {checkpoint_path} to skip retraining.\n',
     )
+    if bool(pretrain.cfgs.logger_cfgs.use_wandb) and wandb is not None and wandb.run is not None:
+        wandb.finish()
     del pretrain
     return checkpoint_path
 
@@ -287,105 +290,115 @@ def run_sweep(  # pylint: disable=too-many-locals
 
     records: list[dict[str, Any]] = []
     sweep_idx = 0
-    for m_target in m_values:
-        for mode in modes:
-            print(f'\n--- M={m_target}  target={mode} ---')
-            reinit_critics(actor_critic, obs_space, act_space, cfgs.model_cfgs, device)
+    combos = [(m_target, mode) for m_target in m_values for mode in modes]
+    sweep_bar = tqdm(combos, desc='Phase 2 sweep', unit='combo', position=0)
+    for m_target, mode in sweep_bar:
+        sweep_bar.set_description(f'Phase 2 sweep (M={m_target}, target={mode})')
+        tqdm.write(f'\n--- M={m_target}  target={mode} ---')
+        reinit_critics(actor_critic, obs_space, act_space, cfgs.model_cfgs, device)
 
-            t0 = time.time()
-            data, episode_slices, n_collected = collect_fixed_policy_rollout(
-                adapter, actor_critic, cfgs, m_target, args.max_episode_len, device,
+        t0 = time.time()
+        data, episode_slices, n_collected = collect_fixed_policy_rollout(
+            adapter, actor_critic, cfgs, m_target, args.max_episode_len, device,
+        )
+        collect_time = time.time() - t0
+        tqdm.write(
+            f'  collected {n_collected} transitions over {len(episode_slices)} episodes '
+            f'({collect_time:.1f}s)',
+        )
+
+        t0 = time.time()
+        train_stats = train_critic(
+            actor_critic,
+            cfgs,
+            data,
+            episode_slices,
+            target_mode=mode,
+            stopping=args.stopping,
+            batch_size=args.critic_batch_size or cfgs.algo_cfgs.batch_size,
+            fixed_epochs=args.critic_train_epochs,
+            val_frac=args.critic_val_frac,
+            patience=args.early_stop_patience,
+            min_delta=args.early_stop_min_delta,
+            max_epochs=args.early_stop_max_epochs,
+        )
+        train_time = time.time() - t0
+        tqdm.write(
+            f"  trained {train_stats['epochs_run']} epochs ({train_time:.1f}s); "
+            f"final train loss r={train_stats['final_train_loss_r']:.4g} "
+            f"c={train_stats['final_train_loss_c']:.4g}",
+        )
+
+        (
+            s0_c_error, _s0_true_c_m, _s0_est_c_m, s0_corr_c,
+            s0_r_error, _s0_true_r_m, _s0_est_r_m, s0_corr_r,
+            all_c_error, _all_true_c_m, _all_est_c_m, all_corr_c,
+            all_r_error, _all_true_r_m, _all_est_r_m, all_corr_r,
+        ) = estimate_true_value(
+            agent=actor_critic,
+            env=adapter._env,  # pylint: disable=protected-access
+            cfgs=cfgs,
+            discount_r=gamma,
+            discount_c=cost_gamma,
+            eval_episodes=args.eval_episodes,
+            epoch=sweep_idx,
+        )
+
+        record = {
+            'k_epochs': args.k_epochs,
+            'M': m_target,
+            'n_collected': n_collected,
+            'n_episodes_collected': len(episode_slices),
+            'target_mode': mode,
+            'stopping': args.stopping,
+            'env_id': args.env_id,
+            'algo': args.algo,
+            'seed': args.seed,
+            'collect_time_s': collect_time,
+            'train_time_s': train_time,
+            **{f'critic_train/{k}': v for k, v in train_stats.items()},
+            'eval/s0_corr_r': s0_corr_r.item(),
+            'eval/s0_corr_c': s0_corr_c.item(),
+            'eval/s0_error_r': s0_r_error.item(),
+            'eval/s0_error_c': s0_c_error.item(),
+            'eval/all_corr_r': all_corr_r.item(),
+            'eval/all_corr_c': all_corr_c.item(),
+            'eval/all_error_r': all_r_error.item(),
+            'eval/all_error_c': all_c_error.item(),
+        }
+        records.append(record)
+        tqdm.write(
+            f"  eval: s0 corr_r={record['eval/s0_corr_r']:.3f} "
+            f"corr_c={record['eval/s0_corr_c']:.3f} | "
+            f"all corr_r={record['eval/all_corr_r']:.3f} "
+            f"corr_c={record['eval/all_corr_c']:.3f}",
+        )
+        sweep_bar.set_postfix(
+            {
+                'train_r': f"{train_stats['final_train_loss_r']:.3g}",
+                'train_c': f"{train_stats['final_train_loss_c']:.3g}",
+                'corr_r': f"{record['eval/s0_corr_r']:.2f}",
+            },
+        )
+
+        if use_wandb and wandb.run is not None:
+            wandb.log(
+                {
+                    'CriticCalib/M': m_target,
+                    'CriticCalib/n_collected': n_collected,
+                    'CriticCalib/n_episodes': len(episode_slices),
+                    'CriticCalib/epochs_run': train_stats['epochs_run'],
+                    'CriticCalib/final_train_loss_r': train_stats['final_train_loss_r'],
+                    'CriticCalib/final_train_loss_c': train_stats['final_train_loss_c'],
+                    'CriticCalib/final_val_loss_r': train_stats['final_val_loss_r'],
+                    'CriticCalib/final_val_loss_c': train_stats['final_val_loss_c'],
+                },
+                step=sweep_idx,
             )
-            collect_time = time.time() - t0
-            print(
-                f'  collected {n_collected} transitions over {len(episode_slices)} episodes '
-                f'({collect_time:.1f}s)',
-            )
 
-            t0 = time.time()
-            train_stats = train_critic(
-                actor_critic,
-                cfgs,
-                data,
-                episode_slices,
-                target_mode=mode,
-                stopping=args.stopping,
-                batch_size=args.critic_batch_size or cfgs.algo_cfgs.batch_size,
-                fixed_epochs=args.critic_train_epochs,
-                val_frac=args.critic_val_frac,
-                patience=args.early_stop_patience,
-                min_delta=args.early_stop_min_delta,
-                max_epochs=args.early_stop_max_epochs,
-            )
-            train_time = time.time() - t0
-            print(
-                f"  trained {train_stats['epochs_run']} epochs ({train_time:.1f}s); "
-                f"final train loss r={train_stats['final_train_loss_r']:.4g} "
-                f"c={train_stats['final_train_loss_c']:.4g}",
-            )
+        sweep_idx += 1
 
-            (
-                s0_c_error, _s0_true_c_m, _s0_est_c_m, s0_corr_c,
-                s0_r_error, _s0_true_r_m, _s0_est_r_m, s0_corr_r,
-                all_c_error, _all_true_c_m, _all_est_c_m, all_corr_c,
-                all_r_error, _all_true_r_m, _all_est_r_m, all_corr_r,
-            ) = estimate_true_value(
-                agent=actor_critic,
-                env=adapter._env,  # pylint: disable=protected-access
-                cfgs=cfgs,
-                discount_r=gamma,
-                discount_c=cost_gamma,
-                eval_episodes=args.eval_episodes,
-                epoch=sweep_idx,
-            )
-
-            record = {
-                'k_epochs': args.k_epochs,
-                'M': m_target,
-                'n_collected': n_collected,
-                'n_episodes_collected': len(episode_slices),
-                'target_mode': mode,
-                'stopping': args.stopping,
-                'env_id': args.env_id,
-                'algo': args.algo,
-                'seed': args.seed,
-                'collect_time_s': collect_time,
-                'train_time_s': train_time,
-                **{f'critic_train/{k}': v for k, v in train_stats.items()},
-                'eval/s0_corr_r': s0_corr_r.item(),
-                'eval/s0_corr_c': s0_corr_c.item(),
-                'eval/s0_error_r': s0_r_error.item(),
-                'eval/s0_error_c': s0_c_error.item(),
-                'eval/all_corr_r': all_corr_r.item(),
-                'eval/all_corr_c': all_corr_c.item(),
-                'eval/all_error_r': all_r_error.item(),
-                'eval/all_error_c': all_c_error.item(),
-            }
-            records.append(record)
-            print(
-                f"  eval: s0 corr_r={record['eval/s0_corr_r']:.3f} "
-                f"corr_c={record['eval/s0_corr_c']:.3f} | "
-                f"all corr_r={record['eval/all_corr_r']:.3f} "
-                f"corr_c={record['eval/all_corr_c']:.3f}",
-            )
-
-            if use_wandb and wandb.run is not None:
-                wandb.log(
-                    {
-                        'CriticCalib/M': m_target,
-                        'CriticCalib/n_collected': n_collected,
-                        'CriticCalib/n_episodes': len(episode_slices),
-                        'CriticCalib/epochs_run': train_stats['epochs_run'],
-                        'CriticCalib/final_train_loss_r': train_stats['final_train_loss_r'],
-                        'CriticCalib/final_train_loss_c': train_stats['final_train_loss_c'],
-                        'CriticCalib/final_val_loss_r': train_stats['final_val_loss_r'],
-                        'CriticCalib/final_val_loss_c': train_stats['final_val_loss_c'],
-                    },
-                    step=sweep_idx,
-                )
-
-            sweep_idx += 1
-
+    sweep_bar.close()
     return records
 
 
