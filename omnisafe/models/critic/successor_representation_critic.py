@@ -230,6 +230,7 @@ class RidgeSolvedReadoutWeights(nn.Module):
             'Misc/WrNorm': self.w_r.detach().norm().item(),
             'Misc/WcNorm': self.w_c.detach().norm().item(),
             'Misc/GramCond': 0.0,  # not defined for the SGD read-out
+            'Misc/GramCondCost': 0.0,
         }
         return loss, stats
 
@@ -241,6 +242,7 @@ class RidgeSolvedReadoutWeights(nn.Module):
         cost: torch.Tensor,
         ridge_kappa: float,
         ema_tau: float,
+        ridge_kappa_cost: float | None = None,
     ) -> dict[str, float]:
         r"""Refresh ``w_r`` and ``w_c`` by closed-form ridge regression on the fresh batch.
 
@@ -250,24 +252,41 @@ class RidgeSolvedReadoutWeights(nn.Module):
 
         solved in float64 for numerical stability, then EMA-blended into the stored buffer.
 
+        The two read-outs share one design matrix ``Phi`` but not necessarily one ``kappa``. The
+        MSE-optimal shrinkage scales with a target's noise-to-signal ratio, and reward and cost do
+        not share one: a sparse cost that the basis fits poorly generalizes far worse than a dense
+        reward at the same ``kappa`` (measured on ``SafetyPointGoal1-v0``: a train-minus-val
+        ``RidgeR2`` gap of 1.19 for cost against 0.05 for reward). ``ridge_kappa_cost`` therefore
+        regularizes the cost read-out independently; left at ``None`` both share ``ridge_kappa``
+        and the solve is bit-for-bit what it was before.
+
         Args:
             phi (torch.Tensor): One-step features of shape ``(N, sr_dim)`` for the fresh batch.
             reward (torch.Tensor): One-step rewards of shape ``(N,)``.
             cost (torch.Tensor): One-step costs of shape ``(N,)``.
-            ridge_kappa (float): Ridge regularization coefficient (scales the mean diagonal of
-                the Gram matrix).
+            ridge_kappa (float): Ridge regularization coefficient for the reward read-out (scales
+                the mean diagonal of the Gram matrix), and for the cost read-out when
+                ``ridge_kappa_cost`` is ``None``.
             ema_tau (float): EMA blending coefficient; ``1.0`` means no smoothing (replace).
+            ridge_kappa_cost (float or None): Ridge coefficient for the cost read-out only, on the
+                same mean-diagonal scale. ``None`` reuses ``ridge_kappa``. Defaults to ``None``.
 
         Returns:
             A dict of diagnostic statistics for logging.
         """
         p = phi.double()
         gram = p.T @ p
-        kappa = ridge_kappa * torch.diagonal(gram).mean().clamp(min=1e-12)
-        mat = gram + kappa * torch.eye(self.sr_dim, dtype=torch.float64, device=p.device)
+        # Both kappas scale the same Gram diagonal, so they stay comparable across bases whatever
+        # phi's magnitude is -- the ratio kappa_c / kappa_r is the quantity being tuned.
+        scale = torch.diagonal(gram).mean().clamp(min=1e-12)
+        eye = torch.eye(self.sr_dim, dtype=torch.float64, device=p.device)
+        mat_r = gram + ridge_kappa * scale * eye
+        # Reuse the reward matrix outright when the kappas coincide: same factorization, and no
+        # chance of the two solves drifting apart numerically in the shared-kappa default.
+        mat_c = mat_r if ridge_kappa_cost is None else gram + ridge_kappa_cost * scale * eye
 
-        w_r_new = torch.linalg.solve(mat, p.T @ reward.double())
-        w_c_new = torch.linalg.solve(mat, p.T @ cost.double())
+        w_r_new = torch.linalg.solve(mat_r, p.T @ reward.double())
+        w_c_new = torch.linalg.solve(mat_c, p.T @ cost.double())
         self.w_r.mul_(1.0 - ema_tau).add_(ema_tau * w_r_new.float())
         self.w_c.mul_(1.0 - ema_tau).add_(ema_tau * w_c_new.float())
 
@@ -278,7 +297,8 @@ class RidgeSolvedReadoutWeights(nn.Module):
             'Misc/RidgeResidualCost': resid_c,
             'Misc/WrNorm': self.w_r.norm().item(),
             'Misc/WcNorm': self.w_c.norm().item(),
-            'Misc/GramCond': torch.linalg.cond(mat).item(),
+            'Misc/GramCond': torch.linalg.cond(mat_r).item(),
+            'Misc/GramCondCost': torch.linalg.cond(mat_c).item(),
         }
 
 

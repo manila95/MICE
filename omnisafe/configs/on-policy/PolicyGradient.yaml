@@ -155,6 +155,12 @@ defaults:
       gamma_sr: ~
       # ridge regression L2 regularization coefficient for solving w_r / w_c (td_ridge mode only)
       ridge_kappa: 0.001
+      # ridge L2 coefficient for the COST read-out only (td_ridge mode); null = reuse
+      # ridge_kappa. Split because the MSE-optimal shrinkage scales with a target's
+      # noise-to-signal ratio, and a sparse cost generalizes far worse than a dense reward
+      # at the same kappa -- measured train-minus-val RidgeR2 gap on SafetyPointGoal1-v0 was
+      # 1.19 for cost against 0.05 for reward, i.e. one shared kappa cannot suit both.
+      ridge_kappa_cost: ~
       # EMA smoothing coefficient for w_r / w_c across iterations, 1.0 = no smoothing (td_ridge mode only)
       ema_tau: 1.0
       # read-out weight learning (td_ridge mode): 'ridge' (closed-form each epoch) or 'sgd'
@@ -182,6 +188,9 @@ defaults:
       # L2 weight decay on the sgd read-out weights (readout: sgd only) -- the SGD analogue of the
       # ridge kappa; raise it if w_r / w_c overfit (e.g. rank-deficient phi under phi_source: random)
       w_weight_decay: 0.0
+      # L2 weight decay on the sgd COST read-out weight only (readout: sgd only); null =
+      # reuse w_weight_decay. The SGD analogue of ridge_kappa_cost above.
+      w_weight_decay_cost: ~
       # minibatch size for the sgd read-out regression (readout: sgd only), sampled from the
       # persistent buffer independently of the policy update; null = reuse algo_cfgs.batch_size
       readout_batch_size: ~

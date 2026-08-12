@@ -231,10 +231,19 @@ class ConstraintActorCritic(ActorCritic):
             # weight_decay is the SGD analogue of the ridge kappa -- explicit L2 on w_r / w_c.
             if self._sr_mode == 'td_ridge' and self._sr_readout == 'sgd':
                 w_lr = sr_cfgs.get('w_lr', None) or sr_cfgs.lr
+                # Separate param groups so w_c can carry its own decay, mirroring
+                # ridge_kappa_cost on the closed-form path; None keeps both on one value.
+                wd_r = sr_cfgs.get('w_weight_decay', 0.0)
+                wd_c = sr_cfgs.get('w_weight_decay_cost', None)
                 self.sr_readout_optimizer: optim.Optimizer = optim.Adam(
-                    [self.sr_trunk.w_r, self.sr_trunk.w_c],
+                    [
+                        {'params': [self.sr_trunk.w_r], 'weight_decay': wd_r},
+                        {
+                            'params': [self.sr_trunk.w_c],
+                            'weight_decay': wd_r if wd_c is None else wd_c,
+                        },
+                    ],
                     lr=w_lr,
-                    weight_decay=sr_cfgs.get('w_weight_decay', 0.0),
                 )
 
     def sr_features(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

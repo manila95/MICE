@@ -325,6 +325,7 @@ class PolicyGradient(BaseAlgo):
             self._logger.register_key('Misc/WrNorm')
             self._logger.register_key('Misc/WcNorm')
             self._logger.register_key('Misc/GramCond')
+            self._logger.register_key('Misc/GramCondCost')
             # How many transitions w_r / w_c were actually fitted over this epoch -- constant under
             # ridge_data='epoch', but rising then plateauing at the buffer capacity otherwise.
             self._logger.register_key('Misc/RidgeFitSamples')
@@ -894,7 +895,12 @@ class PolicyGradient(BaseAlgo):
 
         # Oracle read-outs are fitted on the training split and applied to both, so the Val
         # column is a genuine held-out test of the read-out rather than an in-sample refit.
-        kappa = self._cfgs.model_cfgs.sr_cfgs.get('ridge_kappa', 1e-3)
+        # Each stream is fitted at the same kappa the training solve uses for it, so WOracle* /
+        # Ceiling* stay a measure of the read-out rather than of a regularization mismatch.
+        kappa_r = self._cfgs.model_cfgs.sr_cfgs.get('ridge_kappa', 1e-3)
+        kappa_c = self._cfgs.model_cfgs.sr_cfgs.get('ridge_kappa_cost', None)
+        if kappa_c is None:
+            kappa_c = kappa_r
         oracle_w = {
             f'{feat}_{stream}': sr_diagnostics.ridge_fit(
                 train_prepared[feat],
@@ -902,7 +908,7 @@ class PolicyGradient(BaseAlgo):
                 kappa,
             )
             for feat in ('psi_after', 'mc_after')
-            for stream, target in (('r', 'true_r'), ('c', 'true_c'))
+            for stream, target, kappa in (('r', 'true_r', kappa_r), ('c', 'true_c', kappa_c))
         }
 
         scalars: dict[str, dict[str, float]] = {}
@@ -1332,6 +1338,7 @@ class PolicyGradient(BaseAlgo):
             cost,
             ridge_kappa=sr_cfgs.get('ridge_kappa', 1e-3),
             ema_tau=sr_cfgs.get('ema_tau', 1.0),
+            ridge_kappa_cost=sr_cfgs.get('ridge_kappa_cost', None),
         )
         stats['Misc/RidgeFitSamples'] = float(phi.shape[0])
         self._logger.store(stats)

@@ -261,6 +261,7 @@ class DDPG(BaseAlgo):
             self._logger.register_key('Misc/WrNorm')
             self._logger.register_key('Misc/WcNorm')
             self._logger.register_key('Misc/GramCond')
+            self._logger.register_key('Misc/GramCondCost')
 
         self._logger.register_key('Time/Total')
         self._logger.register_key('Time/Rollout')
@@ -521,6 +522,7 @@ class DDPG(BaseAlgo):
             cost,
             ridge_kappa=sr_cfgs.get('ridge_kappa', 1e-3),
             ema_tau=sr_cfgs.get('ema_tau', 1.0),
+            ridge_kappa_cost=sr_cfgs.get('ridge_kappa_cost', None),
         )
         self._actor_critic.sync_sr_readout_weights()
         self._logger.store(stats)
@@ -808,5 +810,6 @@ class DDPG(BaseAlgo):
                     'Misc/WrNorm': 0.0,
                     'Misc/WcNorm': 0.0,
                     'Misc/GramCond': 0.0,
+                    'Misc/GramCondCost': 0.0,
                 },
             )
