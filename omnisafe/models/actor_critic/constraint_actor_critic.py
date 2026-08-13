@@ -182,6 +182,9 @@ class ConstraintActorCritic(ActorCritic):
                 phi_source=sr_cfgs.get('phi_source', 'trunk'),
                 phi_hidden_sizes=phi_hidden_sizes,
                 learnable_readout=learnable_readout,
+                phi_orthogonal_init=sr_cfgs.get('phi_orthogonal_init', False),
+                phi_rff_bandwidth=sr_cfgs.get('phi_rff_bandwidth', 1.0),
+                phi_ensemble_sources=sr_cfgs.get('phi_ensemble_sources', None),
             )
             self.reward_critic = SuccessorRepresentationLinearReadout(
                 obs_space,

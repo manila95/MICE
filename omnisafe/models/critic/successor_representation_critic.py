@@ -62,7 +62,22 @@ Within ``td_ridge``, ``model_cfgs.sr_cfgs.phi_source`` selects where ``phi`` com
   initialization -- fixed *deep* random features. Stationary like ``random`` while recovering the
   nonlinearity, and its depth is set independently of the trunk, which ``trunk`` mode cannot do
   (there ``phi`` and ``psi`` are both single linear read-outs of one shared body, so they are
-  forced to share depth).
+  forced to share depth). ``random`` and ``separate`` both accept ``phi_orthogonal_init=True`` to
+  draw their first layer's rows as an orthogonal (rather than i.i.d. Gaussian) matrix, which
+  reduces the variance of the resulting random projection and improves effective-rank utilization
+  of ``sr_dim`` for the same ``obs_dim`` -- a near-zero-cost fix for the rank cap called out above,
+  since ``phi``'s output is always re-normalized so only the projection's *directions* matter.
+* ``rff``: ``phi = normalize(cos(W s + b))`` with ``W`` drawn from the spectral density of a
+  Gaussian/RBF kernel of bandwidth ``phi_rff_bandwidth`` and ``b ~ Uniform(0, 2*pi)``, frozen at
+  initialization -- Random Fourier Features. Unlike ``separate``'s untrained MLP, this basis
+  approximates a *named, well-understood* kernel, so its capacity is one interpretable knob (the
+  bandwidth) instead of an architecture search, and the ``cos`` nonlinearity escapes ``random``'s
+  affine rank cap while staying shallower than ``separate``.
+* ``ensemble``: concatenates several independent frozen sub-bases (each one of ``random``,
+  ``separate``, or ``rff``, listed in ``phi_ensemble_sources``) into one ``sr_dim``-wide ``phi``,
+  splitting ``sr_dim`` as evenly as possible across members. Trades a single arbitrary random draw
+  for an average over several, and -- read per-member through :mod:`omnisafe.utils.sr_diagnostics`
+  -- doubles as a diagnostic for which family actually carries the reward/cost signal.
 
 The one structural difference in the Q flavors is that ``td_ridge`` carries ``num_psi_heads``
 independent ``psi`` heads over the shared trunk rather than one, so that the off-policy
@@ -72,6 +87,8 @@ solved against, and is what makes the representation shared between reward and c
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 from torch import nn
@@ -349,6 +366,70 @@ class FrozenPhiFeatures(nn.Module):
         return p / (p.norm(dim=-1, keepdim=True) + 1e-8)
 
 
+class FrozenRFFPhiFeatures(nn.Module):
+    r"""Random Fourier Features: ``phi(x) = normalize(cos(W x + b))``, fixed at initialization.
+
+    Backs ``phi_source='rff'``. ``W``'s rows are drawn i.i.d. ``N(0, 1 / bandwidth^2)`` and
+    ``b ~ Uniform(0, 2*pi)`` -- the classic Random Kitchen Sinks construction, whose inner
+    products before normalization approximate a Gaussian/RBF kernel of the given ``bandwidth``.
+    Unlike :class:`FrozenPhiFeatures` with ``hidden_sizes`` set (``phi_source='separate'``, an
+    untrained MLP with no characterizable kernel), this basis corresponds to a *named,
+    well-understood* kernel, so its capacity is one interpretable knob -- the bandwidth -- rather
+    than an architecture search, while the ``cos`` nonlinearity still escapes the affine rank cap
+    that limits ``phi_source='random'``.
+
+    Args:
+        in_dim (int): Input dimension -- ``obs_dim`` for the V flavor, ``obs_dim + act_dim`` for
+            the Q flavor.
+        sr_dim (int): Dimensionality of ``phi``.
+        bandwidth (float): RBF kernel bandwidth (:math:`\sigma`). Larger values give
+            smoother, lower-frequency features (rows of ``W`` scaled down by ``1/bandwidth``);
+            smaller values give higher-frequency, more locally-varying features.
+    """
+
+    def __init__(self, in_dim: int, sr_dim: int, bandwidth: float) -> None:
+        """Initialize an instance of :class:`FrozenRFFPhiFeatures`."""
+        super().__init__()
+        assert bandwidth > 0, f'phi_rff_bandwidth must be positive, got {bandwidth}.'
+        linear = nn.Linear(in_dim, sr_dim)
+        with torch.no_grad():
+            linear.weight.normal_(0.0, 1.0 / bandwidth)
+            linear.bias.uniform_(0.0, 2 * math.pi)
+        linear.requires_grad_(False)
+        self.linear = linear
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the l2-normalized random Fourier feature of ``x``."""
+        p = torch.cos(self.linear(x))
+        return p / (p.norm(dim=-1, keepdim=True) + 1e-8)
+
+
+class EnsemblePhiFeatures(nn.Module):
+    """Concatenates several independent frozen ``phi`` sub-bases into one.
+
+    Backs ``phi_source='ensemble'``. Turns a single arbitrary random draw (whichever family
+    ``'random'``/``'separate'``/``'rff'`` would have used alone) into an average over several,
+    without giving up stationarity -- every member is itself frozen. ``sr_dim`` is split as evenly
+    as possible across ``len(members)`` sub-bases (earlier members get the remainder row, if any),
+    each already l2-normalized on its own, and the concatenation is re-normalized as a whole.
+
+    Args:
+        members (list of nn.Module): The frozen sub-bases to concatenate, each mapping ``(B,
+            in_dim) -> (B, member_sr_dim)``.
+    """
+
+    def __init__(self, members: list[nn.Module]) -> None:
+        """Initialize an instance of :class:`EnsemblePhiFeatures`."""
+        super().__init__()
+        assert members, 'EnsemblePhiFeatures requires at least one member.'
+        self.members = nn.ModuleList(members)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the l2-normalized concatenation of every member's frozen feature of ``x``."""
+        p = torch.cat([member(x) for member in self.members], dim=-1)
+        return p / (p.norm(dim=-1, keepdim=True) + 1e-8)
+
+
 def build_frozen_phi(
     phi_source: str,
     in_dim: int,
@@ -356,18 +437,33 @@ def build_frozen_phi(
     sr_dim: int,
     activation: Activation,
     weight_initialization_mode: InitFunction,
-) -> FrozenPhiFeatures | None:
+    phi_orthogonal_init: bool = False,
+    phi_rff_bandwidth: float = 1.0,
+    phi_ensemble_sources: list[str] | None = None,
+) -> nn.Module | None:
     """Validate ``phi_source`` and build the frozen ``phi`` network it asks for, if any.
 
-    Shared by the V and Q ``td_ridge`` trunks so the three settings are defined in one place.
+    Shared by the V and Q ``td_ridge`` trunks so all settings are defined in one place. Recurses
+    into itself to build each sub-basis of ``phi_source='ensemble'``.
 
     Args:
-        phi_source (str): One of ``'trunk'``, ``'random'``, ``'separate'``.
+        phi_source (str): One of ``'trunk'``, ``'random'``, ``'separate'``, ``'rff'``,
+            ``'ensemble'``.
         in_dim (int): Input dimension of the frozen network (see :class:`FrozenPhiFeatures`).
-        phi_hidden_sizes (list of int): Hidden sizes, used by ``'separate'`` only.
+        phi_hidden_sizes (list of int): Hidden sizes, used by ``'separate'`` (and any ``'separate'``
+            entries of an ``'ensemble'``) only.
         sr_dim (int): Dimensionality of ``phi``.
         activation (Activation): Activation function.
-        weight_initialization_mode (InitFunction): Weight initialization mode.
+        weight_initialization_mode (InitFunction): Weight initialization mode, used as-is unless
+            ``phi_orthogonal_init`` overrides it.
+        phi_orthogonal_init (bool): For ``'random'`` / ``'separate'`` (including as ``'ensemble'``
+            members), draw the frozen network's layers with orthogonal rather than i.i.d. weight
+            init. Defaults to ``False``.
+        phi_rff_bandwidth (float): RBF kernel bandwidth for ``'rff'`` (including as an
+            ``'ensemble'`` member). Defaults to ``1.0``.
+        phi_ensemble_sources (list of str or None): Sub-basis families for ``'ensemble'``, each one
+            of ``'random'``, ``'separate'``, ``'rff'``. ``None``/empty falls back to one of each.
+            Unused outside ``phi_source='ensemble'``.
 
     Returns:
         The frozen network, or ``None`` for ``'trunk'`` (which reads ``phi`` off the shared trunk
@@ -375,24 +471,58 @@ def build_frozen_phi(
     """
     if phi_source == 'trunk':
         return None
+    # phi's output is always l2-normalized (FrozenPhiFeatures.forward), so only the projection's
+    # directions matter, never its raw scale -- orthogonal init is therefore a pure swap-in.
+    init_mode = 'orthogonal' if phi_orthogonal_init else weight_initialization_mode
     if phi_source == 'random':
         # Pinned to depth 0 rather than reading phi_hidden_sizes: 'random' names one specific
         # experimental condition (a fixed random linear projection of the raw input), and a
         # stray phi_hidden_sizes in a sweep config should not silently redefine what it means.
-        hidden_sizes: list[int] = []
-    elif phi_source == 'separate':
-        hidden_sizes = list(phi_hidden_sizes)
-    else:
-        raise NotImplementedError(
-            f'Unknown sr_cfgs.phi_source "{phi_source}". '
-            'Available phi sources are: "trunk", "random", "separate".',
+        return FrozenPhiFeatures(
+            in_dim=in_dim,
+            hidden_sizes=[],
+            sr_dim=sr_dim,
+            activation=activation,
+            weight_initialization_mode=init_mode,
         )
-    return FrozenPhiFeatures(
-        in_dim=in_dim,
-        hidden_sizes=hidden_sizes,
-        sr_dim=sr_dim,
-        activation=activation,
-        weight_initialization_mode=weight_initialization_mode,
+    if phi_source == 'separate':
+        return FrozenPhiFeatures(
+            in_dim=in_dim,
+            hidden_sizes=list(phi_hidden_sizes),
+            sr_dim=sr_dim,
+            activation=activation,
+            weight_initialization_mode=init_mode,
+        )
+    if phi_source == 'rff':
+        return FrozenRFFPhiFeatures(in_dim=in_dim, sr_dim=sr_dim, bandwidth=phi_rff_bandwidth)
+    if phi_source == 'ensemble':
+        # null/empty falls back to one of each family, per sr_cfgs.phi_ensemble_sources' doc.
+        sources = list(phi_ensemble_sources or ['random', 'separate', 'rff'])
+        # Split sr_dim as evenly as possible; earlier members absorb the remainder so the widths
+        # sum to exactly sr_dim regardless of len(sources).
+        base, remainder = divmod(sr_dim, len(sources))
+        members = [
+            build_frozen_phi(
+                source,
+                in_dim=in_dim,
+                phi_hidden_sizes=phi_hidden_sizes,
+                sr_dim=base + (1 if idx < remainder else 0),
+                activation=activation,
+                weight_initialization_mode=weight_initialization_mode,
+                phi_orthogonal_init=phi_orthogonal_init,
+                phi_rff_bandwidth=phi_rff_bandwidth,
+            )
+            for idx, source in enumerate(sources)
+        ]
+        for member, source in zip(members, sources):
+            assert member is not None, (
+                f'phi_ensemble_sources entry "{source}" is not a valid frozen-phi family '
+                '("trunk" and "ensemble" cannot be nested inside an ensemble).'
+            )
+        return EnsemblePhiFeatures(members)  # type: ignore[arg-type]
+    raise NotImplementedError(
+        f'Unknown sr_cfgs.phi_source "{phi_source}". '
+        'Available phi sources are: "trunk", "random", "separate", "rff", "ensemble".',
     )
 
 
@@ -406,10 +536,13 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         activation (Activation): Activation function.
         weight_initialization_mode (InitFunction): Weight initialization mode.
         phi_source (str): Where ``phi`` comes from -- ``'trunk'`` (a trainable linear read-out of
-            the trunk shared with ``psi``), or ``'random'`` / ``'separate'`` (a frozen map of the
-            raw observation, see :func:`build_frozen_phi`).
+            the trunk shared with ``psi``), or ``'random'`` / ``'separate'`` / ``'rff'`` /
+            ``'ensemble'`` (a frozen map of the raw observation, see :func:`build_frozen_phi`).
         phi_hidden_sizes (list of int): Hidden sizes of the standalone ``phi`` network, used by
             ``phi_source='separate'`` only.
+        phi_orthogonal_init (bool): See :func:`build_frozen_phi`.
+        phi_rff_bandwidth (float): See :func:`build_frozen_phi`.
+        phi_ensemble_sources (list of str or None): See :func:`build_frozen_phi`.
     """
 
     def __init__(
@@ -422,6 +555,9 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         phi_source: str = 'trunk',
         phi_hidden_sizes: list[int] | None = None,
         learnable_readout: bool = False,
+        phi_orthogonal_init: bool = False,
+        phi_rff_bandwidth: float = 1.0,
+        phi_ensemble_sources: list[str] | None = None,
     ) -> None:
         """Initialize an instance of :class:`TDRidgeSuccessorRepresentationTrunk`."""
         super().__init__(sr_dim, learnable_readout=learnable_readout)
@@ -443,6 +579,9 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
             sr_dim=sr_dim,
             activation=activation,
             weight_initialization_mode=weight_initialization_mode,
+            phi_orthogonal_init=phi_orthogonal_init,
+            phi_rff_bandwidth=phi_rff_bandwidth,
+            phi_ensemble_sources=phi_ensemble_sources,
         )
         self._phi_from_trunk = phi_net is None
         if phi_net is None:
@@ -640,10 +779,14 @@ class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
         activation (Activation): Activation function.
         weight_initialization_mode (InitFunction): Weight initialization mode.
         phi_source (str): Where ``phi`` comes from -- ``'trunk'`` (a trainable linear read-out of
-            the trunk shared with ``psi``), or ``'random'`` / ``'separate'`` (a frozen map of the
-            raw ``cat([obs, act], -1)``, see :func:`build_frozen_phi`).
+            the trunk shared with ``psi``), or ``'random'`` / ``'separate'`` / ``'rff'`` /
+            ``'ensemble'`` (a frozen map of the raw ``cat([obs, act], -1)``, see
+            :func:`build_frozen_phi`).
         phi_hidden_sizes (list of int): Hidden sizes of the standalone ``phi`` network, used by
             ``phi_source='separate'`` only.
+        phi_orthogonal_init (bool): See :func:`build_frozen_phi`.
+        phi_rff_bandwidth (float): See :func:`build_frozen_phi`.
+        phi_ensemble_sources (list of str or None): See :func:`build_frozen_phi`.
     """
 
     def __init__(
@@ -658,6 +801,9 @@ class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
         phi_source: str = 'trunk',
         phi_hidden_sizes: list[int] | None = None,
         learnable_readout: bool = False,
+        phi_orthogonal_init: bool = False,
+        phi_rff_bandwidth: float = 1.0,
+        phi_ensemble_sources: list[str] | None = None,
     ) -> None:
         """Initialize an instance of :class:`TDRidgeSuccessorRepresentationQTrunk`."""
         super().__init__(sr_dim, learnable_readout=learnable_readout)
@@ -680,6 +826,9 @@ class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
             sr_dim=sr_dim,
             activation=activation,
             weight_initialization_mode=weight_initialization_mode,
+            phi_orthogonal_init=phi_orthogonal_init,
+            phi_rff_bandwidth=phi_rff_bandwidth,
+            phi_ensemble_sources=phi_ensemble_sources,
         )
         self._phi_from_trunk = phi_net is None
         if phi_net is None:

@@ -199,10 +199,34 @@ defaults:
       #                random features. Stationary like 'random' but nonlinear, and its depth is
       #                set independently of the trunk's (which 'trunk' mode cannot do, since phi
       #                and psi are both single read-outs of one shared body there).
+      #   'rff'      : phi = normalize(cos(Linear(s))), Random Fourier Features approximating a
+      #                Gaussian/RBF kernel of bandwidth phi_rff_bandwidth. Frozen like 'random' /
+      #                'separate', but unlike 'separate' its capacity is one interpretable knob
+      #                (the bandwidth) instead of an architecture search, and unlike 'random' it
+      #                escapes the affine rank cap via the cos nonlinearity.
+      #   'ensemble' : concatenates several independent frozen sub-bases (phi_ensemble_sources,
+      #                each one of 'random' / 'separate' / 'rff') into one sr_dim-wide phi,
+      #                splitting sr_dim evenly across members. Trades one arbitrary random draw
+      #                for an average over several; also useful as a diagnostic (via
+      #                sr_diagnostics) for which family actually fits the reward/cost signal.
       phi_source: trunk
-      # depth of the standalone phi network (phi_source: 'separate' only); as with sr_cfgs.
-      # hidden_sizes above, only the number of layers is used -- every width becomes sr_dim
+      # depth of the standalone phi network (phi_source: 'separate' only, and any 'separate'
+      # entries of phi_ensemble_sources); as with sr_cfgs.hidden_sizes above, only the number of
+      # layers is used -- every width becomes sr_dim
       phi_hidden_sizes: [64, 64]
+      # draw phi_source: 'random' / 'separate' (and any such phi_ensemble_sources entries) with
+      # an orthogonal rather than i.i.d. random first-layer weight matrix (Orthogonal Random
+      # Features) -- reduces the variance of the random projection and improves effective-rank
+      # utilization of sr_dim for the same obs_dim, at ~zero cost since phi is always
+      # re-normalized, so only the projection's directions matter, not its raw scale
+      phi_orthogonal_init: false
+      # RBF kernel bandwidth (sigma) for phi_source: 'rff' (and any such phi_ensemble_sources
+      # entries); larger = smoother/lower-frequency features, smaller = higher-frequency
+      phi_rff_bandwidth: 1.0
+      # sub-basis families for phi_source: 'ensemble', each one of 'random' / 'separate' / 'rff';
+      # null falls back to one of each ['random', 'separate', 'rff']. Ignored unless
+      # phi_source: 'ensemble'
+      phi_ensemble_sources: ~
       # NOTE: the on-policy sr_cfgs also carries lam_sr, the lambda of the successor-feature
       # lambda-return. It is absent here on purpose: a replay minibatch has no trajectory
       # structure to build a lambda-return from, so the off-policy psi target is a one-step
