@@ -67,6 +67,11 @@ class OnlineAdapter:
 
         if hasattr(self._cfgs, 'env_cfgs') and self._cfgs.env_cfgs is not None:
             env_cfgs = self._cfgs.env_cfgs.todict()
+            # Drop unset (``~`` / None) entries: a null YAML value means "use the env's default",
+            # so it must be omitted rather than splatted as a kwarg. Safety-gymnasium envs pop
+            # these keys and no-op on None, but MuJoCo envs reject unknown kwargs outright (e.g.
+            # lidar_num_bins), which breaks running an on-policy config on a plain MuJoCo task.
+            env_cfgs = {k: v for k, v in env_cfgs.items() if v is not None}
 
         self._env: CMDP = make(env_id, num_envs=num_envs, device=self._device, **env_cfgs)
         self._wrapper(
