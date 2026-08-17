@@ -75,6 +75,10 @@ class MujocoEnv(CMDP):
         self._num_envs = num_envs
         self._device = torch.device(device)
 
+        # Plain gymnasium Mujoco envs have no lidar; drop it rather than
+        # forwarding it to the constructor (mirrors SafetyGymnasiumEnv).
+        kwargs.pop('lidar_num_bins', None)
+
         if num_envs > 1:
             self._env = gymnasium.vector.make(env_id, num_envs=num_envs, **kwargs)
             assert isinstance(self._env.single_action_space, Box), 'Only support Box action space.'
