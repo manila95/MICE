@@ -84,6 +84,14 @@ independent ``psi`` heads over the shared trunk rather than one, so that the off
 twin-critic (clipped double-Q) machinery in SAC/TD3 has genuinely distinct estimates to take a
 minimum over. ``phi`` stays single -- it defines the regression basis that ``w_r`` / ``w_c`` are
 solved against, and is what makes the representation shared between reward and cost.
+
+``model_cfgs.sr_cfgs.cost_only`` (``td_ridge`` only) opts out of that sharing on the reward side:
+the constraint actor-critics (:class:`~omnisafe.models.actor_critic.constraint_actor_critic.ConstraintActorCritic`,
+:class:`~omnisafe.models.actor_critic.constraint_actor_q_critic.ConstraintActorQCritic`) then
+build ``reward_critic`` as an ordinary, independently-trained critic and give this module's
+``TDRidge*Trunk`` to ``cost_critic`` alone -- the classes here are unaware of the option and need
+no changes to support it, since ``w_r`` keeps being fit exactly as before for diagnostic parity;
+it is simply never read out into an actual critic.
 """
 
 from __future__ import annotations

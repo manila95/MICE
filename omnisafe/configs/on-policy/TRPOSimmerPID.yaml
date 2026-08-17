@@ -151,6 +151,13 @@ defaults:
       # estimator machinery above, applied to a vector feature stream), with the reward/cost
       # read-out weights solved by closed-form ridge regression each update.
       sr_mode: shared_trunk
+      # when sr_mode is 'td_ridge', train the reward critic the normal way -- a plain MLP
+      # Q/V critic with its own optimizer, independent of the SR trunk -- and use the SR trunk
+      # for the cost critic only (a single psi head off-policy; no change on-policy, which
+      # already has one). The trunk still fits w_r each update for diagnostic parity with the
+      # non-cost_only run; it is simply never read out into an actual critic. Ignored (raises)
+      # under sr_mode: 'shared_trunk'.
+      cost_only: false
       # dimensionality of the shared successor-feature vector
       sr_dim: 64
       # hidden layer sizes of the shared trunk / psi network -- every layer's width is

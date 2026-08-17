@@ -78,6 +78,14 @@ class ConstraintActorQCritic(ActorQCritic):
         actor loss, the target networks) is unaffected, since both modes still expose the
         standard Q-``Critic`` interface, ``forward(obs, act) -> [value, ...]``.
 
+        When additionally ``model_cfgs.sr_cfgs.cost_only`` is ``True`` (``sr_mode: 'td_ridge'``
+        only), ``reward_critic`` is *not* part of the successor representation at all: it is
+        built and trained exactly as it would be with ``use_successor_representation: False``
+        (its own network, optimizer, and target critic), while ``cost_critic`` alone reads out
+        the SR trunk. The trunk still fits its reward read-out ``w_r`` every update for
+        diagnostic parity with the non-``cost_only`` run; it is simply never consulted by the
+        actual reward critic.
+
     Args:
         obs_space (OmnisafeSpace): The observation space.
         act_space (OmnisafeSpace): The action space.
@@ -110,6 +118,17 @@ class ConstraintActorQCritic(ActorQCritic):
         self._sr_mode: str | None = (
             model_cfgs.sr_cfgs.get('sr_mode', 'shared_trunk') if self._use_sr else None
         )
+        # sr_cfgs.cost_only: train reward_critic the normal way (a plain critic, no trunk
+        # sharing) and give the SR trunk to cost_critic alone. Only meaningful -- and only read
+        # -- under sr_mode == 'td_ridge'; see _build_successor_representation_critics.
+        self._sr_cost_only: bool = (
+            bool(model_cfgs.sr_cfgs.get('cost_only', False)) if self._use_sr else False
+        )
+        if self._sr_cost_only and self._sr_mode != 'td_ridge':
+            raise NotImplementedError(
+                'model_cfgs.sr_cfgs.cost_only is only supported under sr_mode == "td_ridge", '
+                f'got sr_mode "{self._sr_mode}".',
+            )
 
         if self._use_sr:
             self._build_successor_representation_critics(obs_space, act_space, model_cfgs)
@@ -155,6 +174,11 @@ class ConstraintActorQCritic(ActorQCritic):
         The two target critics are produced by a *single* :func:`deepcopy` of the pair, so that
         ``deepcopy``'s memo table preserves the trunk sharing: the targets read from one shared
         target trunk rather than from two independent copies of it.
+
+        Under ``sr_cfgs.cost_only`` (``sr_mode: 'td_ridge'`` only) none of the above sharing
+        happens: ``reward_critic`` is built as a standalone plain critic with its own optimizer
+        and target, exactly like the plain ``cost_critic`` branch above, and only
+        ``cost_critic`` is wired to the trunk.
 
         Args:
             obs_space (OmnisafeSpace): The observation space.
@@ -214,12 +238,16 @@ class ConstraintActorQCritic(ActorQCritic):
             # Read-out weight learning: 'ridge' (closed-form buffers) or 'sgd' (learned params).
             self._sr_readout: str = sr_cfgs.get('readout', 'ridge')
             learnable_readout = self._sr_readout == 'sgd'
+            # Under cost_only the trunk backs the cost critic alone, so it only ever needs one
+            # psi head (matching the single head_indices=[0] the cost read-out has always used);
+            # otherwise it needs one per reward-critic ensemble member, same as before.
+            num_psi_heads = 1 if self._sr_cost_only else num_critics
             trunk = TDRidgeSuccessorRepresentationQTrunk(
                 obs_dim=obs_dim,
                 act_dim=act_dim,
                 hidden_sizes=hidden_sizes,
                 sr_dim=sr_cfgs.sr_dim,
-                num_psi_heads=num_critics,
+                num_psi_heads=num_psi_heads,
                 activation=sr_cfgs.activation,
                 weight_initialization_mode=model_cfgs.weight_initialization_mode,
                 phi_source=sr_cfgs.get('phi_source', 'trunk'),
@@ -229,14 +257,28 @@ class ConstraintActorQCritic(ActorQCritic):
                 phi_rff_bandwidth=sr_cfgs.get('phi_rff_bandwidth', 1.0),
                 phi_ensemble_sources=sr_cfgs.get('phi_ensemble_sources', None),
             )
-            self.reward_critic = SuccessorRepresentationQLinearReadout(
-                obs_space,
-                act_space,
-                trunk,
-                'w_r',
-                list(range(num_critics)),
-                model_cfgs.weight_initialization_mode,
-            )
+            if self._sr_cost_only:
+                # Reward critic is a plain, independent Q critic -- see the module docstring's
+                # "cost_only" note. The trunk still fits w_r each ridge/sgd update (see
+                # DDPG._ridge_update_successor_weights), it just never backs an actual critic.
+                self.reward_critic = CriticBuilder(
+                    obs_space=obs_space,
+                    act_space=act_space,
+                    hidden_sizes=model_cfgs.critic.hidden_sizes,
+                    activation=model_cfgs.critic.activation,
+                    weight_initialization_mode=model_cfgs.weight_initialization_mode,
+                    num_critics=num_critics,
+                    use_obs_encoder=False,
+                ).build_critic('q')
+            else:
+                self.reward_critic = SuccessorRepresentationQLinearReadout(
+                    obs_space,
+                    act_space,
+                    trunk,
+                    'w_r',
+                    list(range(num_critics)),
+                    model_cfgs.weight_initialization_mode,
+                )
             self.cost_critic = SuccessorRepresentationQLinearReadout(
                 obs_space,
                 act_space,
@@ -269,20 +311,42 @@ class ConstraintActorQCritic(ActorQCritic):
         self.add_module('cost_critic', self.cost_critic)
         self.add_module('sr_trunk', self.sr_trunk)
 
-        # One deepcopy of the pair, so the shared trunk is copied once and both targets point
-        # at it. Copying them separately would give two target trunks tracking one live trunk.
-        self.target_reward_critic, self.target_cost_critic = deepcopy(
-            (self.reward_critic, self.cost_critic),
-        )
-        self.target_sr_trunk = self.target_reward_critic.trunk
-        for param in _dedup_parameters(self.target_reward_critic, self.target_cost_critic):
-            param.requires_grad = False
+        if self._sr_cost_only:
+            # reward_critic no longer shares anything with the trunk, so it gets its own
+            # independent deepcopy and target-network wiring, exactly like the plain (non-SR)
+            # cost critic built above when use_sr is False.
+            self.target_reward_critic = deepcopy(self.reward_critic)
+            for param in self.target_reward_critic.parameters():
+                param.requires_grad = False
+            self.target_cost_critic = deepcopy(self.cost_critic)
+            for param in self.target_cost_critic.parameters():
+                param.requires_grad = False
+            self.target_sr_trunk = self.target_cost_critic.trunk
+        else:
+            # One deepcopy of the pair, so the shared trunk is copied once and both targets point
+            # at it. Copying them separately would give two target trunks tracking one live trunk.
+            self.target_reward_critic, self.target_cost_critic = deepcopy(
+                (self.reward_critic, self.cost_critic),
+            )
+            self.target_sr_trunk = self.target_reward_critic.trunk
+            for param in _dedup_parameters(self.target_reward_critic, self.target_cost_critic):
+                param.requires_grad = False
 
         if sr_cfgs.lr is not None:
             sr_optimizer = optim.Adam(list(trainable_params), lr=sr_cfgs.lr)
-            self.reward_critic_optimizer: optim.Optimizer = sr_optimizer
             self.cost_critic_optimizer: optim.Optimizer = sr_optimizer
             self.sr_optimizer: optim.Optimizer = sr_optimizer
+            self.reward_critic_optimizer: optim.Optimizer
+            if self._sr_cost_only:
+                # Trained the normal way, on the standard critic learning rate -- not sr_cfgs.lr,
+                # which governs the SR trunk/cost-critic optimizer above.
+                if model_cfgs.critic.lr is not None:
+                    self.reward_critic_optimizer = optim.Adam(
+                        self.reward_critic.parameters(),
+                        lr=model_cfgs.critic.lr,
+                    )
+            else:
+                self.reward_critic_optimizer = sr_optimizer
             # Under readout='sgd', w_r / w_c get their own optimizer so their regression loss
             # never shares Adam state with (or steps) the representation parameters. Its
             # weight_decay is the SGD analogue of the ridge kappa -- explicit L2 on w_r / w_c.
@@ -348,7 +412,7 @@ class ConstraintActorQCritic(ActorQCritic):
         Args:
             tau (float): The polyak averaging factor.
         """
-        if self._use_sr:
+        if self._use_sr and not self._sr_cost_only:
             # The reward and cost critics share a trunk, so their parameters have to be
             # deduplicated before averaging -- see :func:`_dedup_parameters`.
             for param, target_param in zip(

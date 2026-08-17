@@ -57,6 +57,13 @@ class ConstraintActorCritic(ActorCritic):
         the critic training loop) is unaffected, since both modes still expose the standard
         ``Critic`` interface (``forward(obs) -> [value]``).
 
+        When additionally ``model_cfgs.sr_cfgs.cost_only`` is ``True`` (``sr_mode: 'td_ridge'``
+        only), ``reward_critic`` is *not* part of the successor representation at all: it is
+        built and trained exactly as it would be with ``use_successor_representation: False``
+        (its own network and optimizer), while ``cost_critic`` alone reads out the SR trunk. The
+        trunk still fits its reward read-out ``w_r`` every update for diagnostic parity with the
+        non-``cost_only`` run; it is simply never consulted by the actual reward critic.
+
     Args:
         obs_space (OmnisafeSpace): The observation space.
         act_space (OmnisafeSpace): The action space.
@@ -82,6 +89,17 @@ class ConstraintActorCritic(ActorCritic):
 
         self._use_sr: bool = bool(model_cfgs.get('use_successor_representation', False))
         self._sr_mode: str | None = model_cfgs.sr_cfgs.get('sr_mode', 'shared_trunk') if self._use_sr else None
+        # sr_cfgs.cost_only: train reward_critic the normal way (a plain critic, no trunk
+        # sharing) and give the SR trunk to cost_critic alone. Only meaningful -- and only read
+        # -- under sr_mode == 'td_ridge'; see _build_successor_representation_critics.
+        self._sr_cost_only: bool = (
+            bool(model_cfgs.sr_cfgs.get('cost_only', False)) if self._use_sr else False
+        )
+        if self._sr_cost_only and self._sr_mode != 'td_ridge':
+            raise NotImplementedError(
+                'model_cfgs.sr_cfgs.cost_only is only supported under sr_mode == "td_ridge", '
+                f'got sr_mode "{self._sr_mode}".',
+            )
 
         if not self._use_sr:
             self.cost_critic: Critic = CriticBuilder(
@@ -186,13 +204,28 @@ class ConstraintActorCritic(ActorCritic):
                 phi_rff_bandwidth=sr_cfgs.get('phi_rff_bandwidth', 1.0),
                 phi_ensemble_sources=sr_cfgs.get('phi_ensemble_sources', None),
             )
-            self.reward_critic = SuccessorRepresentationLinearReadout(
-                obs_space,
-                act_space,
-                trunk,
-                'w_r',
-                model_cfgs.weight_initialization_mode,
-            )
+            if self._sr_cost_only:
+                # Reward critic is a plain, independent V critic -- see the class docstring's
+                # "cost_only" note. The trunk still fits w_r each ridge/sgd update (see
+                # PolicyGradient._ridge_update_successor_weights), it just never backs an actual
+                # critic.
+                self.reward_critic = CriticBuilder(
+                    obs_space=obs_space,
+                    act_space=act_space,
+                    hidden_sizes=model_cfgs.critic.hidden_sizes,
+                    activation=model_cfgs.critic.activation,
+                    weight_initialization_mode=model_cfgs.weight_initialization_mode,
+                    num_critics=1,
+                    use_obs_encoder=False,
+                ).build_critic('v')
+            else:
+                self.reward_critic = SuccessorRepresentationLinearReadout(
+                    obs_space,
+                    act_space,
+                    trunk,
+                    'w_r',
+                    model_cfgs.weight_initialization_mode,
+                )
             self.cost_critic = SuccessorRepresentationLinearReadout(
                 obs_space,
                 act_space,
@@ -226,9 +259,19 @@ class ConstraintActorCritic(ActorCritic):
 
         if sr_cfgs.lr is not None:
             sr_optimizer = optim.Adam(list(trainable_params), lr=sr_cfgs.lr)
-            self.reward_critic_optimizer: optim.Optimizer = sr_optimizer
             self.cost_critic_optimizer: optim.Optimizer = sr_optimizer
             self.sr_optimizer: optim.Optimizer = sr_optimizer
+            self.reward_critic_optimizer: optim.Optimizer
+            if self._sr_cost_only:
+                # Trained the normal way, on the standard critic learning rate -- not sr_cfgs.lr,
+                # which governs the SR trunk/cost-critic optimizer above.
+                if model_cfgs.critic.lr is not None:
+                    self.reward_critic_optimizer = optim.Adam(
+                        self.reward_critic.parameters(),
+                        lr=model_cfgs.critic.lr,
+                    )
+            else:
+                self.reward_critic_optimizer = sr_optimizer
             # Under readout='sgd', w_r / w_c get their own optimizer so their regression loss
             # never shares Adam state with (or steps) the representation parameters. Its
             # weight_decay is the SGD analogue of the ridge kappa -- explicit L2 on w_r / w_c.
