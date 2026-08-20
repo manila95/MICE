@@ -55,6 +55,7 @@ class PolicyGradient(BaseAlgo):
     _sr_readout: str = 'ridge'
     _sr_ridge_data: str = 'epoch'
     _sr_readout_buf: ReadoutReplayBuffer | None = None
+    _sr_cost_readout_buf: ReadoutReplayBuffer | None = None
     _sr_probe_size: int = 0
     _sr_diag_max_samples: int = 0
     _sr_probe_fixed_obs: torch.Tensor | None = None
@@ -142,7 +143,8 @@ class PolicyGradient(BaseAlgo):
             self._cfgs.model_cfgs.sr_cfgs.get('readout', 'ridge') if self._sr_td_ridge else 'ridge'
         )
         # Which transitions the closed-form ridge is solved on (readout='ridge' only): 'epoch' --
-        # the fresh epoch's training split, or 'buffer' -- the persistent cross-epoch history. This
+        # the fresh epoch's training split, 'buffer' -- the persistent cross-epoch history, or
+        # 'cost_replay' -- the epoch plus an equal number of past cost-inducing transitions. This
         # is deliberately a separate axis from ``readout`` above, which selects only *how* w is fit;
         # holding one fixed while varying the other is what makes the two comparable.
         self._sr_ridge_data = (
@@ -150,10 +152,10 @@ class PolicyGradient(BaseAlgo):
             if self._sr_td_ridge
             else 'epoch'
         )
-        if self._sr_ridge_data not in ('epoch', 'buffer'):
+        if self._sr_ridge_data not in ('epoch', 'buffer', 'cost_replay'):
             raise NotImplementedError(
                 f'Unknown sr_cfgs.ridge_data "{self._sr_ridge_data}". '
-                'Available ridge data sources are: "epoch", "buffer".',
+                'Available ridge data sources are: "epoch", "buffer", "cost_replay".',
             )
 
         self._buf: VectorOnPolicyBuffer = VectorOnPolicyBuffer(
@@ -185,6 +187,18 @@ class PolicyGradient(BaseAlgo):
             self._sr_readout_buf = ReadoutReplayBuffer(
                 obs_dim=self._env.observation_space.shape[0],
                 size=int(self._cfgs.model_cfgs.sr_cfgs.get('readout_buffer_size', 1_000_000)),
+                device=self._device,
+            )
+
+        # Persistent cross-epoch buffer holding only *cost-inducing* transitions (cost > 0), used
+        # by readout='ridge' under ridge_data='cost_replay'. Costs are typically sparse, so the
+        # fresh epoch alone rarely carries enough cost-positive transitions to fit w_c well; this
+        # buffer accumulates them across epochs so a matched number can be resampled back in.
+        self._sr_cost_readout_buf = None
+        if self._sr_td_ridge and self._sr_ridge_data == 'cost_replay':
+            self._sr_cost_readout_buf = ReadoutReplayBuffer(
+                obs_dim=self._env.observation_space.shape[0],
+                size=int(self._cfgs.model_cfgs.sr_cfgs.get('cost_replay_buffer_size', 1_000_000)),
                 device=self._device,
             )
 
@@ -329,6 +343,11 @@ class PolicyGradient(BaseAlgo):
             # How many transitions w_r / w_c were actually fitted over this epoch -- constant under
             # ridge_data='epoch', but rising then plateauing at the buffer capacity otherwise.
             self._logger.register_key('Misc/RidgeFitSamples')
+            if self._sr_ridge_data == 'cost_replay':
+                # Size of the cost-inducing replay buffer -- rises then plateaus at
+                # cost_replay_buffer_size; also caps how close 'try to sample steps_per_epoch
+                # replay rows' gets to actually matching the epoch size early in training.
+                self._logger.register_key('Misc/CostReplayBufferSize')
             self._register_sr_diagnostic_keys(_splits)
 
         self._logger.register_key('Time/Total')
@@ -1311,6 +1330,16 @@ class PolicyGradient(BaseAlgo):
             conditions the solve when ``phi`` is rank-deficient (``phi_source='random'``). ``phi``
             is recomputed from the stored observations rather than cached, so the basis is always
             the current one even when it drifts under ``phi_source='trunk'``.
+        * ``'cost_replay'``: the fresh epoch's training split, plus an equal number of past
+            cost-inducing (``cost > 0``) transitions resampled from a dedicated replay buffer --
+            e.g. at ``steps_per_epoch=5000`` this tries for 5000 fresh + 5000 replayed rows. Costs
+            are typically sparse, so an ``'epoch'``-only fit sees very few cost-positive rows per
+            update; retaining and reinjecting only those (rather than the whole history, as
+            ``'buffer'`` does) concentrates the replay on the signal ``w_c`` actually needs without
+            diluting it with the many cost-zero transitions that already dominate the fresh epoch.
+            Both ``w_r`` and ``w_c`` are solved on the same combined design matrix, so the reward
+            read-out sees the wider state coverage too. ``phi`` is recomputed from the combined
+            observations, as under ``'buffer'``.
 
         Args:
             train_data (dict[str, torch.Tensor]): The training-split epoch batch (post
@@ -1329,6 +1358,40 @@ class PolicyGradient(BaseAlgo):
             else:
                 obs, reward, cost = self._sr_readout_buf.sample(int(n_samples))
             phi, _ = self._actor_critic.sr_features(obs)  # detached; recomputed under current phi
+        elif self._sr_ridge_data == 'cost_replay':
+            assert self._sr_cost_readout_buf is not None
+            epoch_obs, epoch_reward, epoch_cost = (
+                train_data['obs'],
+                train_data['reward'],
+                train_data['cost'],
+            )
+            # Only the training split's cost-inducing rows are retained -- same held-out
+            # discipline as the 'buffer' path above, and consistent across epochs since a row
+            # added while cost-inducing stays in the buffer even if later re-evaluated as 0.
+            cost_mask = epoch_cost.reshape(-1) > 0
+            if bool(cost_mask.any()):
+                self._sr_cost_readout_buf.add(
+                    epoch_obs[cost_mask],
+                    epoch_reward[cost_mask],
+                    epoch_cost[cost_mask],
+                )
+            n_replay_avail = len(self._sr_cost_readout_buf)
+            n_target = epoch_obs.shape[0]  # try to match the epoch 1:1, e.g. 5000 + 5000
+            if n_replay_avail == 0:
+                obs, reward, cost = epoch_obs, epoch_reward, epoch_cost
+            else:
+                # Fewer stored than requested: take them all rather than sample-with-replacement,
+                # which would just duplicate the same handful of rows early in training.
+                if n_replay_avail >= n_target:
+                    replay_obs, replay_reward, replay_cost = self._sr_cost_readout_buf.sample(
+                        n_target,
+                    )
+                else:
+                    replay_obs, replay_reward, replay_cost = self._sr_cost_readout_buf.all()
+                obs = torch.cat([epoch_obs, replay_obs], dim=0)
+                reward = torch.cat([epoch_reward, replay_reward], dim=0)
+                cost = torch.cat([epoch_cost, replay_cost], dim=0)
+            phi, _ = self._actor_critic.sr_features(obs)  # detached; recomputed under current phi
         else:
             phi, reward, cost = train_data['phi'], train_data['reward'], train_data['cost']
 
@@ -1341,6 +1404,9 @@ class PolicyGradient(BaseAlgo):
             ridge_kappa_cost=sr_cfgs.get('ridge_kappa_cost', None),
         )
         stats['Misc/RidgeFitSamples'] = float(phi.shape[0])
+        if self._sr_ridge_data == 'cost_replay':
+            assert self._sr_cost_readout_buf is not None
+            stats['Misc/CostReplayBufferSize'] = float(len(self._sr_cost_readout_buf))
         self._logger.store(stats)
 
     def _sgd_update_readout_weights(self, data: dict[str, torch.Tensor]) -> None:

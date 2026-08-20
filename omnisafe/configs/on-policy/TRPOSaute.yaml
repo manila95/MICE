@@ -187,16 +187,26 @@ defaults:
       # buffer is wiped every epoch, so w is still fit over all past experience.
       readout: ridge
       # which transitions the closed-form ridge is solved on (readout: ridge only).
-      #   'epoch'  : the fresh epoch's training split (the rollout's own phi).
-      #   'buffer' : the persistent cross-epoch history, recomputing phi under the current basis.
-      #              Valid because the read-out r(s) ~= phi(s).w is policy-independent; widens the
-      #              state coverage the Gram is built from, which is what conditions the solve when
-      #              phi is rank-deficient (phi_source: random). Held-out val episodes are never
-      #              added, so SR/Gap/RidgeR2* stays a genuine generalization test.
+      #   'epoch'       : the fresh epoch's training split (the rollout's own phi).
+      #   'buffer'      : the persistent cross-epoch history, recomputing phi under the current
+      #                   basis. Valid because the read-out r(s) ~= phi(s).w is policy-independent;
+      #                   widens the state coverage the Gram is built from, which is what
+      #                   conditions the solve when phi is rank-deficient (phi_source: random).
+      #                   Held-out val episodes are never added, so SR/Gap/RidgeR2* stays a
+      #                   genuine generalization test.
+      #   'cost_replay' : the fresh epoch plus an equal number of past cost-inducing (cost > 0)
+      #                   transitions resampled from a dedicated replay buffer -- e.g. at
+      #                   steps_per_epoch=5000, tries for 5000 fresh + 5000 replayed rows. Costs
+      #                   are typically sparse, so an 'epoch'-only fit rarely sees enough
+      #                   cost-positive rows; this concentrates the replay on exactly those rows
+      #                   instead of diluting it with 'buffer''s whole (mostly cost-zero) history.
+      #                   Both w_r and w_c are solved on the same combined design matrix.
       ridge_data: epoch
       # how many buffered transitions to draw for the solve (ridge_data: buffer only);
       # null = use the entire buffer. Cost is O(N * sr_dim^2), linear in N.
       ridge_buffer_samples: ~
+      # capacity of the persistent cost-inducing replay buffer (ridge_data: cost_replay only)
+      cost_replay_buffer_size: 1000000
       # learning rate for the sgd read-out weights (readout: sgd only); null = reuse sr_cfgs.lr
       w_lr: ~
       # capacity of the persistent sgd read-out replay buffer (readout: sgd only)
