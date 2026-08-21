@@ -78,6 +78,16 @@ Within ``td_ridge``, ``model_cfgs.sr_cfgs.phi_source`` selects where ``phi`` com
   splitting ``sr_dim`` as evenly as possible across members. Trades a single arbitrary random draw
   for an average over several, and -- read per-member through :mod:`omnisafe.utils.sr_diagnostics`
   -- doubles as a diagnostic for which family actually carries the reward/cost signal.
+* ``contrastive``: ``phi = normalize(MLP(s))``, architecturally identical to ``separate`` but
+  *not* frozen -- trained by a time-contrastive InfoNCE loss (see
+  :mod:`omnisafe.utils.contrastive` and :meth:`PolicyGradient._contrastive_update_phi`) that pulls
+  together states visited close in time within an episode and pushes apart temporally-distant /
+  other-episode ones. The only ``phi_source`` trained by a loss of its own rather than either
+  drifting implicitly (``trunk``) or staying fixed (every other source); it gets a dedicated
+  optimizer (``sr_phi_optimizer``) and is pretrained on the first epoch's rollout before that
+  epoch's first ``psi`` TD update ever sees it. On-policy (V flavor) only -- the Q flavor below has
+  no episode-boundary bookkeeping to sample temporal pairs from, so it raises
+  :func:`build_frozen_phi`'s ``NotImplementedError`` for this value like any other unhandled one.
 
 The one structural difference in the Q flavors is that ``td_ridge`` carries ``num_psi_heads``
 independent ``psi`` heads over the shared trunk rather than one, so that the off-policy
@@ -438,6 +448,41 @@ class EnsemblePhiFeatures(nn.Module):
         return p / (p.norm(dim=-1, keepdim=True) + 1e-8)
 
 
+class ContrastivePhiFeatures(FrozenPhiFeatures):
+    r"""A one-step feature map ``phi`` trained by a time-contrastive loss instead of held fixed.
+
+    Backs ``phi_source='contrastive'``. Architecturally identical to :class:`FrozenPhiFeatures`
+    with ``hidden_sizes`` set (i.e. the same standalone MLP :class:`FrozenPhiFeatures` uses for
+    ``phi_source='separate'``) -- the only difference is that this one's parameters are left
+    trainable, since the whole point is for :meth:`PolicyGradient._contrastive_update_phi` to move
+    them. Not constructed by :func:`build_frozen_phi` (whose contract is "frozen, or None for
+    ``trunk``"); :class:`TDRidgeSuccessorRepresentationTrunk` builds it directly instead. Excluded
+    from the shared ``sr_optimizer``'s parameter list and given its own optimizer
+    (``sr_phi_optimizer``, see :class:`~omnisafe.models.actor_critic.constraint_actor_critic.ConstraintActorCritic`)
+    so its InfoNCE loss's Adam state never mixes with the very differently-cadenced ``psi`` TD
+    loss's.
+
+    Args:
+        in_dim (int): Input dimension -- ``obs_dim`` (V flavor only; see the module docstring).
+        hidden_sizes (list of int): Hidden layer sizes of the standalone network.
+        sr_dim (int): Dimensionality of ``phi``.
+        activation (Activation): Activation function.
+        weight_initialization_mode (InitFunction): Weight initialization mode.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_sizes: list[int],
+        sr_dim: int,
+        activation: Activation,
+        weight_initialization_mode: InitFunction,
+    ) -> None:
+        """Initialize an instance of :class:`ContrastivePhiFeatures`."""
+        super().__init__(in_dim, hidden_sizes, sr_dim, activation, weight_initialization_mode)
+        self.net.requires_grad_(True)  # undo FrozenPhiFeatures.__init__'s freeze
+
+
 def build_frozen_phi(
     phi_source: str,
     in_dim: int,
@@ -454,9 +499,19 @@ def build_frozen_phi(
     Shared by the V and Q ``td_ridge`` trunks so all settings are defined in one place. Recurses
     into itself to build each sub-basis of ``phi_source='ensemble'``.
 
+    Note:
+        ``phi_source='contrastive'`` is *not* handled here, even though it is a valid value for
+        the V-flavor :class:`TDRidgeSuccessorRepresentationTrunk` -- unlike everything this
+        function builds, it is trained rather than frozen, so that trunk constructs
+        :class:`ContrastivePhiFeatures` directly instead of calling this function. The Q flavor
+        (:class:`TDRidgeSuccessorRepresentationQTrunk`) only ever calls this function, so it falls
+        through to the ``NotImplementedError`` below for ``'contrastive'`` -- the correct behavior,
+        since the Q flavor's off-policy buffer has no episode-boundary bookkeeping to sample
+        temporal pairs from.
+
     Args:
         phi_source (str): One of ``'trunk'``, ``'random'``, ``'separate'``, ``'rff'``,
-            ``'ensemble'``.
+            ``'ensemble'`` (plus ``'contrastive'``, V flavor only -- see the Note above).
         in_dim (int): Input dimension of the frozen network (see :class:`FrozenPhiFeatures`).
         phi_hidden_sizes (list of int): Hidden sizes, used by ``'separate'`` (and any ``'separate'``
             entries of an ``'ensemble'``) only.
@@ -530,7 +585,8 @@ def build_frozen_phi(
         return EnsemblePhiFeatures(members)  # type: ignore[arg-type]
     raise NotImplementedError(
         f'Unknown sr_cfgs.phi_source "{phi_source}". '
-        'Available phi sources are: "trunk", "random", "separate", "rff", "ensemble".',
+        'Available phi sources are: "trunk", "random", "separate", "rff", "ensemble" '
+        '(plus "contrastive", V-flavor td_ridge trunk only -- not supported here).',
     )
 
 
@@ -544,10 +600,12 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         activation (Activation): Activation function.
         weight_initialization_mode (InitFunction): Weight initialization mode.
         phi_source (str): Where ``phi`` comes from -- ``'trunk'`` (a trainable linear read-out of
-            the trunk shared with ``psi``), or ``'random'`` / ``'separate'`` / ``'rff'`` /
-            ``'ensemble'`` (a frozen map of the raw observation, see :func:`build_frozen_phi`).
+            the trunk shared with ``psi``), ``'random'`` / ``'separate'`` / ``'rff'`` /
+            ``'ensemble'`` (a frozen map of the raw observation, see :func:`build_frozen_phi`), or
+            ``'contrastive'`` (a *trained* map of the raw observation, fit by a time-contrastive
+            loss rather than frozen or read off the trunk, see :class:`ContrastivePhiFeatures`).
         phi_hidden_sizes (list of int): Hidden sizes of the standalone ``phi`` network, used by
-            ``phi_source='separate'`` only.
+            ``phi_source='separate'`` and ``phi_source='contrastive'`` only.
         phi_orthogonal_init (bool): See :func:`build_frozen_phi`.
         phi_rff_bandwidth (float): See :func:`build_frozen_phi`.
         phi_ensemble_sources (list of str or None): See :func:`build_frozen_phi`.
@@ -580,17 +638,32 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
             if hidden_sizes
             else nn.Identity()
         )
-        phi_net = build_frozen_phi(
-            phi_source,
-            in_dim=obs_dim,
-            phi_hidden_sizes=phi_hidden_sizes or [],
-            sr_dim=sr_dim,
-            activation=activation,
-            weight_initialization_mode=weight_initialization_mode,
-            phi_orthogonal_init=phi_orthogonal_init,
-            phi_rff_bandwidth=phi_rff_bandwidth,
-            phi_ensemble_sources=phi_ensemble_sources,
-        )
+        phi_net: nn.Module | None
+        if phi_source == 'contrastive':
+            # Trained, not frozen -- build_frozen_phi's contract is "frozen, or None for 'trunk'",
+            # and it's shared verbatim with the Q flavor, which cannot support this source (no
+            # episode-boundary bookkeeping to sample temporal pairs from). Branching here instead
+            # of teaching build_frozen_phi about 'contrastive' means the Q flavor rejects it
+            # automatically via that function's existing NotImplementedError.
+            phi_net = ContrastivePhiFeatures(
+                in_dim=obs_dim,
+                hidden_sizes=phi_hidden_sizes or [],
+                sr_dim=sr_dim,
+                activation=activation,
+                weight_initialization_mode=weight_initialization_mode,
+            )
+        else:
+            phi_net = build_frozen_phi(
+                phi_source,
+                in_dim=obs_dim,
+                phi_hidden_sizes=phi_hidden_sizes or [],
+                sr_dim=sr_dim,
+                activation=activation,
+                weight_initialization_mode=weight_initialization_mode,
+                phi_orthogonal_init=phi_orthogonal_init,
+                phi_rff_bandwidth=phi_rff_bandwidth,
+                phi_ensemble_sources=phi_ensemble_sources,
+            )
         self._phi_from_trunk = phi_net is None
         if phi_net is None:
             self.phi_head = nn.Linear(trunk_out, sr_dim)
@@ -789,7 +862,11 @@ class TDRidgeSuccessorRepresentationQTrunk(RidgeSolvedReadoutWeights):
         phi_source (str): Where ``phi`` comes from -- ``'trunk'`` (a trainable linear read-out of
             the trunk shared with ``psi``), or ``'random'`` / ``'separate'`` / ``'rff'`` /
             ``'ensemble'`` (a frozen map of the raw ``cat([obs, act], -1)``, see
-            :func:`build_frozen_phi`).
+            :func:`build_frozen_phi`). ``'contrastive'`` is *not* supported here -- it is a
+            V-flavor-only source (see :class:`TDRidgeSuccessorRepresentationTrunk`) because it
+            needs episode-boundary bookkeeping to sample temporal pairs from, which the off-policy
+            buffer this trunk is built for does not track; passing it raises
+            :func:`build_frozen_phi`'s ``NotImplementedError``.
         phi_hidden_sizes (list of int): Hidden sizes of the standalone ``phi`` network, used by
             ``phi_source='separate'`` only.
         phi_orthogonal_init (bool): See :func:`build_frozen_phi`.

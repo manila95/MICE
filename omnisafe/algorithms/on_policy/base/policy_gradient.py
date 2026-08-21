@@ -32,7 +32,7 @@ from omnisafe.common.buffer import VectorOnPolicyBuffer
 from omnisafe.common.buffer.readout_buffer import ReadoutReplayBuffer
 from omnisafe.common.logger import Logger
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
-from omnisafe.utils import distributed, sr_diagnostics
+from omnisafe.utils import contrastive, distributed, sr_diagnostics
 from omnisafe.utils.value_eval import estimate_true_value
 
 
@@ -61,6 +61,14 @@ class PolicyGradient(BaseAlgo):
     _sr_probe_fixed_obs: torch.Tensor | None = None
     _sr_probe_fresh_obs: torch.Tensor | None = None
     _sr_snapshot: dict[str, torch.Tensor] | None = None
+    # phi_source='contrastive' state; see _contrastive_update_phi / _relabel_after_phi_update.
+    _sr_phi_source: str = 'trunk'
+    _sr_phi_pretrain_steps: int = 0
+    _sr_phi_steps_per_epoch: int = 0
+    # Set by learn() right before each epoch's _update() call; declared here (rather than only in
+    # learn()) so the getattr(self, '_current_epoch', 0) fallback used elsewhere in this class has
+    # a real class-level default to fall back to.
+    _current_epoch: int = 0
 
     def _init_env(self) -> None:
         """Initialize the environment.
@@ -157,6 +165,22 @@ class PolicyGradient(BaseAlgo):
                 f'Unknown sr_cfgs.ridge_data "{self._sr_ridge_data}". '
                 'Available ridge data sources are: "epoch", "buffer", "cost_replay".',
             )
+        # Where phi comes from; only 'contrastive' is read here (every other value is handled
+        # entirely inside the trunk/critic construction). Drives the pretrain-then-continual
+        # cadence in _update()'s contrastive hook -- see _contrastive_update_phi.
+        self._sr_phi_source = (
+            self._cfgs.model_cfgs.sr_cfgs.get('phi_source', 'trunk') if self._sr_td_ridge else 'trunk'
+        )
+        self._sr_phi_pretrain_steps = (
+            int(self._cfgs.model_cfgs.sr_cfgs.get('phi_contrastive_pretrain_steps', 500))
+            if self._sr_phi_source == 'contrastive'
+            else 0
+        )
+        self._sr_phi_steps_per_epoch = (
+            int(self._cfgs.model_cfgs.sr_cfgs.get('phi_contrastive_steps_per_epoch', 50))
+            if self._sr_phi_source == 'contrastive'
+            else 0
+        )
 
         self._buf: VectorOnPolicyBuffer = VectorOnPolicyBuffer(
             obs_space=self._env.observation_space,
@@ -348,6 +372,14 @@ class PolicyGradient(BaseAlgo):
                 # cost_replay_buffer_size; also caps how close 'try to sample steps_per_epoch
                 # replay rows' gets to actually matching the epoch size early in training.
                 self._logger.register_key('Misc/CostReplayBufferSize')
+            if self._sr_phi_source == 'contrastive':
+                # Keys match the f'Misc/Contrastive{k}' format _contrastive_update_phi's stats
+                # dict produces (see contrastive.info_nce_loss). SR/{split}/PhiEffRank (registered
+                # below by _register_sr_diagnostic_keys) already reflects the post-pretrain phi
+                # for free, since train_data['phi'] is relabelled before _log_sr_diagnostics runs.
+                self._logger.register_key('Misc/ContrastiveLoss')
+                self._logger.register_key('Misc/ContrastivePosSim')
+                self._logger.register_key('Misc/ContrastiveNegSim')
             self._register_sr_diagnostic_keys(_splits)
 
         self._logger.register_key('Time/Total')
@@ -553,6 +585,18 @@ class PolicyGradient(BaseAlgo):
         """
         data = self._buf.get()
         train_data, val_data = self._make_train_val_split(data)
+
+        if self._sr_td_ridge and self._sr_phi_source == 'contrastive':
+            # Pretrain (epoch 0) or continue training (every epoch after) phi by its own
+            # time-contrastive loss, strictly before the ridge solve / psi TD update below ever
+            # see it -- "before updating psi for epoch 0 we should first train phi." Relabel phi
+            # (always) and target_sr (epoch 0 only) so neither is fit against a phi that has
+            # since moved out from under it; see _relabel_after_phi_update.
+            epoch = getattr(self, '_current_epoch', 0)
+            n_steps = self._sr_phi_pretrain_steps if epoch == 0 else self._sr_phi_steps_per_epoch
+            if n_steps > 0:
+                self._contrastive_update_phi(train_data, n_steps)
+                self._relabel_after_phi_update(train_data, relabel_target_sr=(epoch == 0))
 
         if self._sr_td_ridge:
             if self._sr_readout == 'ridge':
@@ -1251,9 +1295,12 @@ class PolicyGradient(BaseAlgo):
         loss = nn.functional.mse_loss(self._actor_critic.reward_critic(obs)[0], target_value_r)
 
         if self._cfgs.algo_cfgs.use_critic_norm:
+            excluded_ids = getattr(self._actor_critic, '_sr_critic_norm_excluded_ids', set())
             for param in self._actor_critic.reward_critic.parameters():
-                if not param.requires_grad:
-                    # frozen phi network (sr_cfgs.phi_source); a no-op otherwise
+                if not param.requires_grad or id(param) in excluded_ids:
+                    # frozen phi network (sr_cfgs.phi_source), or -- under phi_source='contrastive'
+                    # -- phi_net, trainable but fit only by its own InfoNCE loss/optimizer, never
+                    # this one; a no-op under every other phi_source.
                     continue
                 loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coef
 
@@ -1294,9 +1341,12 @@ class PolicyGradient(BaseAlgo):
         loss = nn.functional.mse_loss(self._actor_critic.cost_critic(obs)[0], target_value_c)
 
         if self._cfgs.algo_cfgs.use_critic_norm:
+            excluded_ids = getattr(self._actor_critic, '_sr_critic_norm_excluded_ids', set())
             for param in self._actor_critic.cost_critic.parameters():
-                if not param.requires_grad:
-                    # frozen phi network (sr_cfgs.phi_source); a no-op otherwise
+                if not param.requires_grad or id(param) in excluded_ids:
+                    # frozen phi network (sr_cfgs.phi_source), or -- under phi_source='contrastive'
+                    # -- phi_net, trainable but fit only by its own InfoNCE loss/optimizer, never
+                    # this one; a no-op under every other phi_source.
                     continue
                 loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coef
 
@@ -1452,6 +1502,104 @@ class PolicyGradient(BaseAlgo):
             stats['Misc/RidgeFitSamples'] = float(len(self._sr_readout_buf))
             self._logger.store(stats)
 
+    def _contrastive_update_phi(self, train_data: dict[str, torch.Tensor], n_steps: int) -> None:
+        r"""Train ``phi`` by a time-contrastive InfoNCE loss (``phi_source='contrastive'`` only).
+
+        Pulls together states visited close in time within the same rollout episode and pushes
+        apart temporally-distant / other-episode ones (see :mod:`omnisafe.utils.contrastive`).
+        Called from :meth:`_update`, before the ridge solve / ``psi`` TD update -- at epoch 0 with
+        a large one-time ``n_steps`` (``sr_cfgs.phi_contrastive_pretrain_steps``) to move ``phi``
+        out of its random init before anything downstream is fit against it, and every epoch after
+        with a smaller continual ``n_steps`` (``sr_cfgs.phi_contrastive_steps_per_epoch``) so
+        ``phi`` keeps adapting as the on-policy state distribution shifts.
+
+        Trains only ``self._actor_critic.sr_trunk.phi_net`` (via its own ``sr_phi_optimizer``) --
+        never ``psi_head`` or the trunk body, which this loss's forward pass never even reads.
+
+        Args:
+            train_data (dict[str, torch.Tensor]): The training-split epoch batch, providing
+                ``obs`` and ``_episode_lengths`` (always present when ``self._sr_td_ridge``, see
+                :meth:`_make_train_val_split`) that the temporal pairs are sampled from.
+            n_steps (int): Number of gradient steps to take.
+        """
+        sr_cfgs = self._cfgs.model_cfgs.sr_cfgs
+        horizon = int(sr_cfgs.get('phi_contrastive_horizon', 5))
+        temperature = sr_cfgs.get('phi_contrastive_temperature', 0.1)
+        batch_size = sr_cfgs.get('phi_contrastive_batch_size', None) or self._cfgs.algo_cfgs.batch_size
+
+        obs = train_data['obs']
+        anchor_pool, positive_pool = contrastive.sample_temporal_pairs(
+            train_data['_episode_lengths'],
+            horizon,
+        )
+        if anchor_pool.numel() == 0:
+            # e.g. every episode this epoch has length 1 -- nothing to contrast against yet.
+            return
+
+        phi_net = self._actor_critic.sr_trunk.phi_net
+        stats: dict[str, float] = {}
+        for _ in range(n_steps):
+            idx = torch.randint(
+                anchor_pool.shape[0],
+                (min(batch_size, anchor_pool.shape[0]),),
+                device=obs.device,
+            )
+            anchor_feat = phi_net(obs[anchor_pool[idx]])
+            positive_feat = phi_net(obs[positive_pool[idx]])
+            loss, stats = contrastive.info_nce_loss(anchor_feat, positive_feat, temperature)
+            self._actor_critic.sr_phi_optimizer.zero_grad()
+            loss.backward()
+            if self._cfgs.algo_cfgs.use_max_grad_norm:
+                clip_grad_norm_(phi_net.parameters(), self._cfgs.algo_cfgs.max_grad_norm)
+            distributed.avg_grads(phi_net)
+            self._actor_critic.sr_phi_optimizer.step()
+        if stats:
+            self._logger.store({f'Misc/Contrastive{k}': v for k, v in stats.items()})
+
+    @torch.no_grad()
+    def _relabel_after_phi_update(
+        self,
+        train_data: dict[str, torch.Tensor],
+        relabel_target_sr: bool,
+    ) -> None:
+        r"""Recompute ``train_data``'s ``phi`` (and, at epoch 0, ``target_sr``) after phi moved.
+
+        ``phi`` was cached by the rollout under the *pre*-contrastive-update network, so once
+        :meth:`_contrastive_update_phi` has moved it, that cached value -- and anything computed
+        from it -- is stale. ``phi`` itself is cheap and exact to fix (a single forward pass, the
+        same idea :meth:`_ridge_update_successor_weights`'s ``ridge_data='buffer'``/``'cost_replay'``
+        paths already use). ``target_sr`` is only relabelled at epoch 0, where the pretraining
+        burst moves ``phi`` far more than a normal epoch's drift; smaller continual drift in later
+        epochs is left alone, since it self-corrects the same way ``phi_source='trunk'``'s
+        per-epoch drift already does without special-casing.
+
+        Args:
+            train_data (dict[str, torch.Tensor]): The training-split epoch batch, mutated in place.
+            relabel_target_sr (bool): Whether to also recompute ``target_sr`` (epoch 0 only).
+        """
+        train_data['phi'] = self._actor_critic.sr_trunk.phi(train_data['obs'])
+        if not relabel_target_sr:
+            return
+        # gae_lambda_targets_segments only reimplements the 'gae' branch of the buffer's own
+        # estimator; target_sr was originally built with whatever algo_cfgs.adv_estimation_method
+        # selects (finish_path passes no explicit estimator, so it defaults to that same setting),
+        # so silently mismatching estimators here would be wrong rather than merely approximate.
+        # Under any other estimator, leave target_sr as its (epoch-0-stale) rollout-time value --
+        # the same accepted staleness _update_successor_features already tolerates within an
+        # epoch under phi_source='trunk'.
+        if self._cfgs.algo_cfgs.adv_estimation_method != 'gae':
+            return
+        sr_cfgs = self._cfgs.model_cfgs.sr_cfgs
+        gamma_sr = sr_cfgs.get('gamma_sr', None)
+        gamma_sr = self._cfgs.algo_cfgs.gamma if gamma_sr is None else gamma_sr
+        train_data['target_sr'] = sr_diagnostics.gae_lambda_targets_segments(
+            values=train_data['psi'],  # rollout-time psi -- untouched by the contrastive step
+            rewards=train_data['phi'],  # just-relabelled above
+            lengths=train_data['_episode_lengths'],
+            lam=sr_cfgs.get('lam_sr', 0.95),
+            gamma=gamma_sr,
+        )
+
     def _update_successor_features(self, obs: torch.Tensor, target_sr: torch.Tensor) -> None:
         r"""Update the ``td_ridge`` successor-representation trunk under a double for loop.
 
@@ -1471,9 +1619,12 @@ class PolicyGradient(BaseAlgo):
         loss = nn.functional.mse_loss(psi, target_sr)
 
         if self._cfgs.algo_cfgs.use_critic_norm:
+            excluded_ids = getattr(self._actor_critic, '_sr_critic_norm_excluded_ids', set())
             for param in self._actor_critic.sr_trunk.parameters():
-                if not param.requires_grad:
-                    # frozen phi network (sr_cfgs.phi_source); a no-op otherwise
+                if not param.requires_grad or id(param) in excluded_ids:
+                    # frozen phi network (sr_cfgs.phi_source), or -- under phi_source='contrastive'
+                    # -- phi_net, trainable but fit only by its own InfoNCE loss/optimizer, never
+                    # this one; a no-op under every other phi_source.
                     continue
                 loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coef
 

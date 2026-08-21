@@ -245,6 +245,12 @@ defaults:
       #                splitting sr_dim evenly across members. Trades one arbitrary random draw
       #                for an average over several; also useful as a diagnostic (via
       #                sr_diagnostics) for which family actually fits the reward/cost signal.
+      #   'contrastive': phi = normalize(MLP(s)), same architecture as 'separate' but NOT frozen
+      #                -- trained by a time-contrastive InfoNCE loss (see the block below) that
+      #                pulls together states visited close in time within an episode and pushes
+      #                apart temporally-distant / other-episode ones. Pretrained at epoch 0,
+      #                before the first psi TD update / ridge solve ever see it, then continually
+      #                fine-tuned every epoch after. On-policy (V flavor) only.
       phi_source: trunk
       # depth of the standalone phi network (phi_source: 'separate' only, and any 'separate'
       # entries of phi_ensemble_sources); as with sr_cfgs.hidden_sizes above, only the number of
@@ -263,6 +269,25 @@ defaults:
       # null falls back to one of each ['random', 'separate', 'rff']. Ignored unless
       # phi_source: 'ensemble'
       phi_ensemble_sources: ~
+      # --- Contrastive phi learning (phi_source: 'contrastive' only) -------------------------
+      # temperature for the InfoNCE / NT-Xent similarity scaling; lower = sharper, more
+      # discriminative positive/negative separation
+      phi_contrastive_temperature: 0.1
+      # max |timestep offset| within an episode a state pair may be sampled as a positive; both
+      # directions (past and future) count, i.e. the true window is +/- this many steps
+      phi_contrastive_horizon: 5
+      # gradient steps taken on phi at epoch 0, before the first psi TD update / ridge solve --
+      # gets phi out of its random-init regime before anything downstream is fit against it
+      phi_contrastive_pretrain_steps: 500
+      # gradient steps taken on phi every epoch after epoch 0 -- phi is trained continually,
+      # never frozen once pretrained
+      phi_contrastive_steps_per_epoch: 50
+      # minibatch size for the contrastive loss's in-batch-negative InfoNCE; null = reuse
+      # algo_cfgs.batch_size
+      phi_contrastive_batch_size: ~
+      # learning rate for phi's dedicated optimizer (phi_source: 'contrastive' only); null =
+      # reuse sr_cfgs.lr
+      phi_lr: ~
       # --- SR diagnostics (td_ridge mode only; see PolicyGradient._log_sr_diagnostics) ---
       # number of observations in each phi/psi drift probe set. One probe is drawn once and held
       # for the whole run (drift with the input distribution held constant), the other is redrawn

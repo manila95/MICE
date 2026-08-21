@@ -191,13 +191,14 @@ class ConstraintActorCritic(ActorCritic):
             # fit over a persistent replay buffer, see PolicyGradient._sgd_update_readout_weights).
             self._sr_readout: str = sr_cfgs.get('readout', 'ridge')
             learnable_readout = self._sr_readout == 'sgd'
+            self._sr_phi_source: str = sr_cfgs.get('phi_source', 'trunk')
             trunk = TDRidgeSuccessorRepresentationTrunk(
                 obs_dim=obs_dim,
                 hidden_sizes=hidden_sizes,
                 sr_dim=sr_cfgs.sr_dim,
                 activation=sr_cfgs.activation,
                 weight_initialization_mode=model_cfgs.weight_initialization_mode,
-                phi_source=sr_cfgs.get('phi_source', 'trunk'),
+                phi_source=self._sr_phi_source,
                 phi_hidden_sizes=phi_hidden_sizes,
                 learnable_readout=learnable_readout,
                 phi_orthogonal_init=sr_cfgs.get('phi_orthogonal_init', False),
@@ -238,14 +239,30 @@ class ConstraintActorCritic(ActorCritic):
             # SR-feature losses through the shared sr_optimizer. Under readout='sgd', w_r / w_c are
             # also parameters but are fit by their own regression loss on a separate optimizer, so
             # they are excluded here. The requires_grad filter additionally drops the frozen phi
-            # network under phi_source='random' / 'separate' (a no-op under 'trunk').
+            # network under phi_source='random' / 'separate' / 'rff' / 'ensemble' (a no-op under
+            # 'trunk'). Under phi_source='contrastive', phi_net is trainable (unlike every other
+            # frozen source) but must still be excluded: it is fit by its own InfoNCE loss on its
+            # own optimizer (sr_phi_optimizer, below), never by the value/SR-feature losses this
+            # optimizer trains against -- so its params would otherwise sit in sr_optimizer's
+            # param group forever accumulating unrelated gradients no step of this optimizer
+            # should apply.
             readout_weight_ids = (
                 {id(trunk.w_r), id(trunk.w_c)} if learnable_readout else set()
             )
+            phi_param_ids = (
+                {id(p) for p in trunk.phi_net.parameters()}
+                if self._sr_phi_source == 'contrastive'
+                else set()
+            )
+            excluded_ids = readout_weight_ids | phi_param_ids
+            # Read by PolicyGradient's use_critic_norm loops (_update_reward_critic /
+            # _update_cost_critic / _update_successor_features), which otherwise fold phi_net's
+            # norm into losses no optimizer of phi_net ever steps from -- see those methods.
+            self._sr_critic_norm_excluded_ids: set[int] = excluded_ids
             trainable_params = [
                 param
                 for param in trunk.parameters()
-                if param.requires_grad and id(param) not in readout_weight_ids
+                if param.requires_grad and id(param) not in excluded_ids
             ]
         else:
             raise NotImplementedError(
@@ -290,6 +307,18 @@ class ConstraintActorCritic(ActorCritic):
                         },
                     ],
                     lr=w_lr,
+                )
+            # phi_net's own optimizer (phi_source='contrastive' only): its InfoNCE loss runs on a
+            # different cadence (a handful of steps per epoch, see
+            # PolicyGradient._contrastive_update_phi) than the per-minibatch value/SR-feature
+            # losses sr_optimizer trains against, so it gets independent Adam momentum state
+            # rather than sharing sr_optimizer's -- the same reasoning as sr_readout_optimizer
+            # above, applied to phi_net instead of w_r / w_c.
+            if self._sr_mode == 'td_ridge' and self._sr_phi_source == 'contrastive':
+                phi_lr = sr_cfgs.get('phi_lr', None) or sr_cfgs.lr
+                self.sr_phi_optimizer: optim.Optimizer = optim.Adam(
+                    trunk.phi_net.parameters(),
+                    lr=phi_lr,
                 )
 
     def sr_features(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

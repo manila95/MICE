@@ -106,6 +106,73 @@ def discount_cumsum_segments(
     return gathered
 
 
+def gae_lambda_targets_segments(
+    values: torch.Tensor,
+    rewards: torch.Tensor,
+    lengths: list[int],
+    lam: float,
+    gamma: float,
+) -> torch.Tensor:
+    r"""Recompute GAE-lambda targets per segment, with a zero bootstrap at each segment's end.
+
+    Mirrors the ``'gae'`` branch of :meth:`omnisafe.common.buffer.onpolicy_buffer.OnPolicyBuffer.
+    _calculate_adv_and_value_targets` -- ``delta_t = rewards_t + gamma*values_{t+1} - values_t``,
+    ``target = discount_cumsum(delta, gamma*lam) + values`` -- applied independently within each
+    segment of ``lengths`` rather than to one contiguous path, and reusing
+    :func:`discount_cumsum_segments` as the reverse-cumsum subroutine.
+
+    This exists to *relabel* :meth:`~omnisafe.algorithms.on_policy.base.policy_gradient.
+    PolicyGradient`'s cached ``target_sr`` (``values=psi``, ``rewards=phi``) after ``phi`` has
+    moved by more than a normal epoch's drift -- e.g. the ``phi_source='contrastive'`` epoch-0
+    pretraining burst -- so the ``psi`` TD target isn't built against a ``phi`` that no longer
+    exists by the time it's used.
+
+    The bootstrap at each segment's end is **always zero**, which is exact for naturally-terminated
+    episodes (:meth:`OnPolicyBuffer.finish_path` already defaults ``last_psi`` to zero for those)
+    but an approximation for episodes truncated by ``steps_per_epoch``: the true bootstrap value
+    used at rollout time depended on the next (discarded, un-stored) observation, which cannot be
+    recovered from ``values``/``rewards`` alone after the fact. Callers relabelling ``target_sr``
+    should treat this as an accepted, documented bias on truncated segments only.
+
+    Args:
+        values (torch.Tensor): Concatenated segments of shape ``(N, d)`` -- e.g. ``psi``.
+        rewards (torch.Tensor): Concatenated segments of shape ``(N, d)``, row-aligned with
+            ``values`` -- e.g. ``phi``.
+        lengths (list of int): Length of each segment, in the order they appear in ``values`` /
+            ``rewards``.
+        lam (float): The lambda parameter of the GAE-lambda recursion.
+        gamma (float): The discount factor.
+
+    Returns:
+        A tensor shaped like ``values`` holding the recomputed target within each segment.
+    """
+    assert values.shape == rewards.shape, (
+        f'values {tuple(values.shape)} and rewards {tuple(rewards.shape)} must have the same shape.'
+    )
+    assert sum(lengths) == values.shape[0], (
+        f'segment lengths sum to {sum(lengths)} but values has {values.shape[0]} rows.'
+    )
+    if not lengths:
+        return values.clone()
+
+    feature_shape = values.shape[1:]
+    deltas = values.new_empty(values.shape)
+    offset = 0
+    for length in lengths:
+        seg_values = values[offset : offset + length]
+        seg_rewards = rewards[offset : offset + length]
+        # Bootstrap value at the segment's end is zero -- see the docstring's accepted-bias note.
+        next_values = torch.cat(
+            [seg_values[1:], seg_values.new_zeros((1, *feature_shape))],
+            dim=0,
+        )
+        deltas[offset : offset + length] = seg_rewards + gamma * next_values - seg_values
+        offset += length
+
+    adv = discount_cumsum_segments(deltas, lengths, gamma * lam)
+    return adv + values
+
+
 def explained_variance(pred: torch.Tensor, target: torch.Tensor) -> float:
     r"""Fraction of the target's total variance captured by ``pred``.
 
