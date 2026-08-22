@@ -146,17 +146,24 @@ class ConstraintActorCritic(ActorCritic):
         """
         sr_cfgs = model_cfgs.sr_cfgs
         obs_dim = obs_space.shape[0]
-        # Every hidden layer of the trunk is sized to match sr_dim (keeping the configured
-        # depth): the layer that produces phi/psi is a plain linear map with no nonlinearity of
-        # its own, so its output can never carry more independent information than the last
-        # hidden layer feeding it. A narrower last hidden layer would silently cap psi/phi's
-        # effective rank below sr_dim (wasted capacity in shared_trunk mode; a rank-deficient,
-        # exactly-singular-without-regularization ridge Gram matrix in td_ridge mode).
-        hidden_sizes = [sr_cfgs.sr_dim] * len(sr_cfgs.hidden_sizes)
-        # Same convention for the standalone phi network of sr_cfgs.phi_source='separate': only
-        # the configured depth is used, every width is sr_dim. Its depth is independent of the
-        # trunk's, which is the point of that mode.
-        phi_hidden_sizes = [sr_cfgs.sr_dim] * len(sr_cfgs.get('phi_hidden_sizes', []) or [])
+        # hidden_sizes sets the trunk's own hidden widths verbatim; sr_dim only sets the width of
+        # the final phi/psi projection -- the two are independent knobs. (Previously every hidden
+        # width was silently overridden to sr_dim as well, coupling trunk capacity to sr_dim.)
+        #
+        # Caution: the layer that produces phi/psi off the trunk (phi_head / psi_head, or
+        # SuccessorRepresentationTrunk's own final layer in shared_trunk mode) is a plain linear
+        # map with no nonlinearity of its own, so its output can never carry more independent
+        # information than the last hidden layer feeding it. Setting hidden_sizes[-1] < sr_dim is
+        # now possible and silently caps psi/phi's effective rank at hidden_sizes[-1] -- wasted
+        # capacity in shared_trunk mode; a rank-deficient, exactly-singular-without-regularization
+        # ridge Gram matrix in td_ridge mode. Keep hidden_sizes[-1] >= sr_dim unless that
+        # bottleneck is deliberate.
+        hidden_sizes = list(sr_cfgs.hidden_sizes)
+        # Same independence for the standalone phi network of sr_cfgs.phi_source='separate' /
+        # 'contrastive': phi_hidden_sizes sets its hidden widths verbatim, sr_dim only sets its
+        # output width. Its depth (and now its width) is independent of the trunk's, which is the
+        # point of that mode.
+        phi_hidden_sizes = list(sr_cfgs.get('phi_hidden_sizes', []) or [])
 
         if self._sr_mode == 'shared_trunk':
             trunk = SuccessorRepresentationTrunk(
