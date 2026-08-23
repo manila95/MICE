@@ -56,6 +56,9 @@ defaults:
     use_critic_norm: True
     # critic norm coefficient
     critic_norm_coef: 0.001
+    # critic norm coefficient for the cost critic only; null = reuse critic_norm_coef. Same
+    # null-fallback convention as sr_cfgs.ridge_kappa_cost / w_weight_decay_cost.
+    critic_norm_coef_cost: ~
     # reward discount factor
     gamma: 0.99
     # cost discount factor

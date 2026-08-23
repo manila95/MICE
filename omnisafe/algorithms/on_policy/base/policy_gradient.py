@@ -1341,6 +1341,13 @@ class PolicyGradient(BaseAlgo):
         loss = nn.functional.mse_loss(self._actor_critic.cost_critic(obs)[0], target_value_c)
 
         if self._cfgs.algo_cfgs.use_critic_norm:
+            # Cost gets its own coefficient (null falls back to critic_norm_coef), the same
+            # null-fallback convention as sr_cfgs.ridge_kappa_cost / w_weight_decay_cost --
+            # a sparser, differently-scaled cost target generally wants different shrinkage
+            # than the dense reward critic it shares no parameters with.
+            critic_norm_coef_cost = getattr(self._cfgs.algo_cfgs, 'critic_norm_coef_cost', None)
+            if critic_norm_coef_cost is None:
+                critic_norm_coef_cost = self._cfgs.algo_cfgs.critic_norm_coef
             excluded_ids = getattr(self._actor_critic, '_sr_critic_norm_excluded_ids', set())
             for param in self._actor_critic.cost_critic.parameters():
                 if not param.requires_grad or id(param) in excluded_ids:
@@ -1348,7 +1355,7 @@ class PolicyGradient(BaseAlgo):
                     # -- phi_net, trainable but fit only by its own InfoNCE loss/optimizer, never
                     # this one; a no-op under every other phi_source.
                     continue
-                loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coef
+                loss += param.pow(2).sum() * critic_norm_coef_cost
 
         loss.backward()
 
