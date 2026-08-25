@@ -32,7 +32,7 @@ from omnisafe.common.buffer import VectorOnPolicyBuffer
 from omnisafe.common.buffer.readout_buffer import ReadoutReplayBuffer
 from omnisafe.common.logger import Logger
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
-from omnisafe.utils import contrastive, distributed, laplacian, sr_diagnostics
+from omnisafe.utils import clearning, contrastive, distributed, laplacian, sr_diagnostics
 from omnisafe.utils.value_eval import estimate_true_value
 
 
@@ -186,6 +186,39 @@ class PolicyGradient(BaseAlgo):
         self._sr_phi_steps_per_epoch = (
             int(self._cfgs.model_cfgs.sr_cfgs.get(f'{phi_cfg_prefix}steps_per_epoch', 50))
             if self._sr_phi_trained
+            else 0
+        )
+        # How psi is fitted: 'td' bootstraps it against a lambda-target built from phi (the
+        # original and the default), 'contrastive' drops the bootstrap entirely and fits phi and
+        # psi together as the two factors of a successor-measure critic -- see
+        # _contrastive_update_successor_features and omnisafe.utils.clearning.
+        self._sr_psi_objective = (
+            self._cfgs.model_cfgs.sr_cfgs.get('psi_objective', 'td') if self._sr_td_ridge else 'td'
+        )
+        if self._sr_psi_objective not in ('td', 'contrastive'):
+            raise NotImplementedError(
+                f'Unknown sr_cfgs.psi_objective "{self._sr_psi_objective}". '
+                'Available psi objectives are: "td", "contrastive".',
+            )
+        if self._sr_psi_objective == 'contrastive' and self._sr_phi_source != 'joint':
+            # Not a stylistic preference. Every other source either freezes phi or gives it a
+            # separate objective and optimizer, and both are incoherent here: this loss trains phi
+            # as one of its own two factors, so a frozen phi cannot be fitted and a separately
+            # trained one would be pulled by two objectives whose scales have nothing in common
+            # (the bilinear critic's magnitude *is* the estimate, so a phi normalized or
+            # orthonormalized by another loss silently rescales the successor measure).
+            raise NotImplementedError(
+                'sr_cfgs.psi_objective="contrastive" requires sr_cfgs.phi_source="joint" '
+                f'(phi is fitted as a factor of the same critic), got "{self._sr_phi_source}".',
+            )
+        self._sr_psi_pretrain_steps = (
+            int(self._cfgs.model_cfgs.sr_cfgs.get('psi_contrastive_pretrain_steps', 2000))
+            if self._sr_psi_objective == 'contrastive'
+            else 0
+        )
+        self._sr_psi_steps_per_epoch = (
+            int(self._cfgs.model_cfgs.sr_cfgs.get('psi_contrastive_steps_per_epoch', 300))
+            if self._sr_psi_objective == 'contrastive'
             else 0
         )
 
@@ -397,6 +430,18 @@ class PolicyGradient(BaseAlgo):
                 self._logger.register_key('Misc/LaplacianDiagErr')
                 self._logger.register_key('Misc/LaplacianOffDiagErr')
                 self._logger.register_key('Misc/LaplacianDualNorm')
+            if self._sr_psi_objective == 'contrastive':
+                # Keys match the f'Misc/CLearning{k}' format
+                # _contrastive_update_successor_features' stats dict produces (see
+                # clearning.density_ratio_loss). RatioMass against RatioMassTarget is the one to
+                # read: the fitted ratio must integrate to sum_t gamma^t = 1 / (1 - gamma) under
+                # rho, and it drifts off that long before the loss (which has no scale of its own)
+                # shows anything.
+                self._logger.register_key('Misc/CLearningLoss')
+                self._logger.register_key('Misc/CLearningPosRatio')
+                self._logger.register_key('Misc/CLearningNegSq')
+                self._logger.register_key('Misc/CLearningRatioMass')
+                self._logger.register_key('Misc/CLearningRatioMassTarget')
             self._register_sr_diagnostic_keys(_splits)
 
         self._logger.register_key('Time/Total')
@@ -1552,21 +1597,33 @@ class PolicyGradient(BaseAlgo):
                 and turn the generalization gap into a measure of how far ``phi`` moved this epoch.
                 Defaults to ``None``.
         """
-        if not (self._sr_td_ridge and self._sr_phi_trained):
+        if not self._sr_td_ridge:
             return
         epoch = getattr(self, '_current_epoch', 0)
-        n_steps = self._sr_phi_pretrain_steps if epoch == 0 else self._sr_phi_steps_per_epoch
-        if n_steps <= 0:
+
+        if self._sr_psi_objective == 'contrastive':
+            # phi has no objective of its own here -- it is fitted together with psi, and
+            # _update_successor_features is a no-op for the duration. relabel_target_sr is False
+            # for the same reason: there is no TD target left to be stale.
+            n_steps = self._sr_psi_pretrain_steps if epoch == 0 else self._sr_psi_steps_per_epoch
+            if n_steps <= 0:
+                return
+            self._contrastive_update_successor_features(train_data, n_steps)
+        elif self._sr_phi_trained:
+            n_steps = self._sr_phi_pretrain_steps if epoch == 0 else self._sr_phi_steps_per_epoch
+            if n_steps <= 0:
+                return
+            if self._sr_phi_source == 'contrastive':
+                self._contrastive_update_phi(train_data, n_steps)
+            else:
+                self._laplacian_update_phi(train_data, n_steps)
+        else:
             return
 
-        if self._sr_phi_source == 'contrastive':
-            self._contrastive_update_phi(train_data, n_steps)
-        else:
-            self._laplacian_update_phi(train_data, n_steps)
-
+        relabel_target_sr = epoch == 0 and self._sr_psi_objective == 'td'
         for split in (train_data, val_data):
             if split is not None:
-                self._relabel_after_phi_update(split, relabel_target_sr=(epoch == 0))
+                self._relabel_after_phi_update(split, relabel_target_sr=relabel_target_sr)
 
     def _laplacian_update_phi(self, train_data: dict[str, torch.Tensor], n_steps: int) -> None:
         r"""Train ``phi`` by the Augmented Lagrangian Laplacian Objective (``'laplacian'`` only).
@@ -1772,6 +1829,86 @@ class PolicyGradient(BaseAlgo):
             gamma=gamma_sr,
         )
 
+    def _contrastive_update_successor_features(
+        self,
+        train_data: dict[str, torch.Tensor],
+        n_steps: int,
+    ) -> None:
+        r"""Fit ``phi`` and ``psi`` jointly as a successor-measure critic (C-learning).
+
+        The replacement for :meth:`_update_successor_features` under
+        ``sr_cfgs.psi_objective='contrastive'``. Instead of bootstrapping ``psi`` against a target
+        built from ``phi``, both are trained as the two factors of one bilinear critic
+        ``psi(s)^T phi(g)`` fitted to the discounted successor measure's density ratio -- positives
+        drawn from each anchor's own geometrically-discounted future, negatives from the batch at
+        large. See :mod:`omnisafe.utils.clearning` for the objective, and why fitting the ratio in
+        its linear (not log) scale is what keeps the ``value(s) = psi(s) . w`` read-out valid.
+
+        Runs as its own loop over the epoch rather than inside the policy's minibatch loop, the way
+        :meth:`_laplacian_update_phi` does. That is not merely convenient: the negatives are the
+        ``rho`` sample, and their count is what the ``E_rho`` estimate's quality rests on, so this
+        loss wants a batch sized for *it* rather than whatever ``algo_cfgs.batch_size`` the policy
+        update happens to use. :meth:`_update_successor_features` becomes a no-op for the duration,
+        so ``psi`` is fitted here and nowhere else.
+
+        Args:
+            train_data (dict[str, torch.Tensor]): The training-split epoch batch, providing ``obs``
+                and ``_episode_lengths``.
+            n_steps (int): Number of gradient steps to take.
+        """
+        sr_cfgs = self._cfgs.model_cfgs.sr_cfgs
+        gamma_sr = sr_cfgs.get('gamma_sr', None)
+        gamma_sr = self._cfgs.algo_cfgs.gamma if gamma_sr is None else gamma_sr
+        batch_size = int(
+            sr_cfgs.get('psi_contrastive_batch_size', None) or self._cfgs.algo_cfgs.batch_size,
+        )
+
+        obs = train_data['obs']
+        anchor_pool, future_pool = clearning.sample_geometric_futures(
+            train_data['_episode_lengths'],
+            gamma=gamma_sr,
+            device=obs.device,
+        )
+        if anchor_pool.numel() == 0:
+            # Every episode this epoch has length 1 -- no row has a future within its own episode.
+            return
+
+        trunk = self._actor_critic.sr_trunk
+        n_rows, n_pairs = obs.shape[0], anchor_pool.shape[0]
+        pair_batch = min(batch_size, n_pairs)
+        neg_batch = min(batch_size, n_rows)
+        stats: dict[str, float] = {}
+        for _ in range(n_steps):
+            # Anchor/positive pairs and the rho sample are drawn independently: a negative that
+            # happened to be a given anchor's own sampled future is not an error (rho genuinely
+            # contains those states), but drawing them from one shared index set would correlate
+            # the two expectations the loss differences against each other.
+            pairs = torch.randperm(n_pairs, device=obs.device)[:pair_batch]
+            negatives = torch.randperm(n_rows, device=obs.device)[:neg_batch]
+            loss, stats = clearning.density_ratio_loss(
+                psi_anchor=trunk.psi(obs[anchor_pool[pairs]]),
+                phi_future=trunk.phi(obs[future_pool[pairs]]),
+                phi_random=trunk.phi(obs[negatives]),
+                gamma=gamma_sr,
+            )
+            if self._cfgs.algo_cfgs.use_critic_norm:
+                for param in trunk.parameters():
+                    if param.requires_grad:
+                        loss += param.pow(2).sum() * self._cfgs.algo_cfgs.critic_norm_coef
+
+            self._actor_critic.sr_optimizer.zero_grad()
+            loss.backward()
+            if self._cfgs.algo_cfgs.use_max_grad_norm:
+                clip_grad_norm_(trunk.parameters(), self._cfgs.algo_cfgs.max_grad_norm)
+            distributed.avg_grads(trunk)
+            self._actor_critic.sr_optimizer.step()
+        if stats:
+            self._logger.store({f'Misc/CLearning{k}': v for k, v in stats.items()})
+            # Loss/Loss_sr is registered unconditionally for td_ridge and is the series a reader
+            # will look at first; fill it with this objective's loss so it stays the "is psi being
+            # fitted" line whichever objective is fitting it.
+            self._logger.store({'Loss/Loss_sr': stats['Loss']})
+
     def _update_successor_features(self, obs: torch.Tensor, target_sr: torch.Tensor) -> None:
         r"""Update the ``td_ridge`` successor-representation trunk under a double for loop.
 
@@ -1786,6 +1923,12 @@ class PolicyGradient(BaseAlgo):
             obs (torch.Tensor): The ``observation`` sampled from buffer.
             target_sr (torch.Tensor): The ``target_sr`` sampled from buffer.
         """
+        if self._sr_psi_objective != 'td':
+            # psi was already fitted for this epoch by
+            # _contrastive_update_successor_features, which owns it end to end. Guarding here
+            # rather than at the three call sites keeps the check in one place -- NaturalPG and
+            # FOCOPS reimplement _update independently and would each need their own otherwise.
+            return
         self._actor_critic.sr_optimizer.zero_grad()
         psi = self._actor_critic.sr_trunk.psi(obs)
         loss = nn.functional.mse_loss(psi, target_sr)

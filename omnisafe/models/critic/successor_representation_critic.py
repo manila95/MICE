@@ -100,6 +100,13 @@ Within ``td_ridge``, ``model_cfgs.sr_cfgs.phi_source`` selects where ``phi`` com
   and its on-policy-only restriction. Alone among the sources its output is *not* l2-normalized
   (the orthonormality constraint sets the scale instead, and satisfying it hands the ridge solve
   an ``N * I`` Gram matrix) -- see :class:`LaplacianPhiFeatures`.
+* ``joint``: ``phi = MLP(s)``, the same architecture once more, trainable and unnormalized, but
+  with **no objective of its own at all**. It is one factor of the bilinear successor-measure
+  critic ``psi(s)^T phi(g)`` that ``model_cfgs.sr_cfgs.psi_objective='contrastive'`` fits (see
+  :mod:`omnisafe.utils.clearning`), so it is trained by the same loss, the same optimizer and the
+  same step as ``psi`` -- there is no ``phi``-then-``psi`` ordering to get wrong, and no TD target
+  referring to a ``phi`` that has since moved. Selecting it is therefore only meaningful together
+  with that ``psi_objective``, and the two are validated against each other at construction.
 
 The one structural difference in the Q flavors is that ``td_ridge`` carries ``num_psi_heads``
 independent ``psi`` heads over the shared trunk rather than one, so that the off-policy
@@ -495,7 +502,52 @@ class ContrastivePhiFeatures(FrozenPhiFeatures):
         self.net.requires_grad_(True)  # undo FrozenPhiFeatures.__init__'s freeze
 
 
-class LaplacianPhiFeatures(nn.Module):
+class UnnormalizedPhiFeatures(nn.Module):
+    r"""A trainable, deliberately **unnormalized** one-step feature map ``phi``.
+
+    The body shared by the two ``phi_source`` settings whose objective sets ``phi``'s scale itself
+    rather than delegating it to a projection onto the unit sphere: ``'laplacian'`` (see
+    :class:`LaplacianPhiFeatures`), whose orthonormality constraint ``E_rho[phi phi^T] = I`` forces
+    ``E[||phi||^2] = sr_dim`` and is unsatisfiable on the sphere, and ``'joint'`` (this class used
+    directly), where ``phi`` is one factor of the bilinear successor-measure critic
+    ``psi(s)^T phi(g)`` fitted by :mod:`omnisafe.utils.clearning` -- a critic whose *magnitude* is
+    the quantity being estimated, so normalizing either factor would discard exactly the
+    information the fit is about.
+
+    The network itself is the same standalone MLP on the raw observation that
+    :class:`FrozenPhiFeatures` uses for ``phi_source='separate'``, so capacity is never what
+    distinguishes these modes from each other -- only what trains them, and on what scale.
+
+    Args:
+        in_dim (int): Input dimension -- ``obs_dim`` (V flavor only; see the module docstring).
+        hidden_sizes (list of int): Hidden layer sizes of the standalone network.
+        sr_dim (int): Dimensionality of ``phi``.
+        activation (Activation): Activation function.
+        weight_initialization_mode (InitFunction): Weight initialization mode.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_sizes: list[int],
+        sr_dim: int,
+        activation: Activation,
+        weight_initialization_mode: InitFunction,
+    ) -> None:
+        """Initialize an instance of :class:`UnnormalizedPhiFeatures`."""
+        super().__init__()
+        self.net = build_mlp_network(
+            sizes=[in_dim, *hidden_sizes, sr_dim],
+            activation=activation,
+            weight_initialization_mode=weight_initialization_mode,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the (deliberately unnormalized) feature of ``x``."""
+        return self.net(x)
+
+
+class LaplacianPhiFeatures(UnnormalizedPhiFeatures):
     r"""A one-step feature map ``phi`` trained to be the graph Laplacian's bottom eigenvectors.
 
     Backs ``phi_source='laplacian'``, fitted by the Augmented Lagrangian Laplacian Objective (see
@@ -542,17 +594,8 @@ class LaplacianPhiFeatures(nn.Module):
         weight_initialization_mode: InitFunction,
     ) -> None:
         """Initialize an instance of :class:`LaplacianPhiFeatures`."""
-        super().__init__()
-        self.net = build_mlp_network(
-            sizes=[in_dim, *hidden_sizes, sr_dim],
-            activation=activation,
-            weight_initialization_mode=weight_initialization_mode,
-        )
+        super().__init__(in_dim, hidden_sizes, sr_dim, activation, weight_initialization_mode)
         self.register_buffer('dual', torch.zeros(sr_dim, sr_dim))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute the (deliberately unnormalized) Laplacian feature of ``x``."""
-        return self.net(x)
 
 
 def build_frozen_phi(
@@ -660,7 +703,8 @@ def build_frozen_phi(
     raise NotImplementedError(
         f'Unknown sr_cfgs.phi_source "{phi_source}". '
         'Available phi sources are: "trunk", "random", "separate", "rff", "ensemble" '
-        '(plus "contrastive" / "laplacian", V-flavor td_ridge trunk only -- not supported here).',
+        '(plus "contrastive" / "laplacian" / "joint", V-flavor td_ridge trunk only -- not '
+        'supported here).',
     )
 
 
@@ -676,10 +720,12 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         phi_source (str): Where ``phi`` comes from -- ``'trunk'`` (a trainable linear read-out of
             the trunk shared with ``psi``), ``'random'`` / ``'separate'`` / ``'rff'`` /
             ``'ensemble'`` (a frozen map of the raw observation, see :func:`build_frozen_phi`), or
-            ``'contrastive'`` / ``'laplacian'`` (*trained* maps of the raw observation, fit by a
-            time-contrastive loss and by the Augmented Lagrangian Laplacian Objective respectively,
-            rather than frozen or read off the trunk -- see :class:`ContrastivePhiFeatures` and
-            :class:`LaplacianPhiFeatures`).
+            ``'contrastive'`` / ``'laplacian'`` / ``'joint'`` (*trained* maps of the raw
+            observation, fit by a time-contrastive loss, by the Augmented Lagrangian Laplacian
+            Objective, and jointly with ``psi`` by the contrastive successor-measure loss
+            respectively, rather than frozen or read off the trunk -- see
+            :class:`ContrastivePhiFeatures`, :class:`LaplacianPhiFeatures` and
+            :class:`UnnormalizedPhiFeatures`).
         phi_hidden_sizes (list of int): Hidden sizes of the standalone ``phi`` network, used by
             ``phi_source`` ``'separate'`` / ``'contrastive'`` / ``'laplacian'`` only.
         phi_orthogonal_init (bool): See :func:`build_frozen_phi`.
@@ -726,6 +772,11 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         trained_phi = {
             'contrastive': ContrastivePhiFeatures,
             'laplacian': LaplacianPhiFeatures,
+            # 'joint' is the odd one out: it is trained, but not by an optimizer of its own -- it
+            # is one factor of the bilinear successor-measure critic that
+            # sr_cfgs.psi_objective='contrastive' fits, so it is stepped by the same loss and the
+            # same sr_optimizer as psi. See omnisafe.utils.clearning.
+            'joint': UnnormalizedPhiFeatures,
         }.get(phi_source)
         if trained_phi is not None:
             phi_net = trained_phi(

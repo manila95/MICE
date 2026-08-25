@@ -264,6 +264,11 @@ defaults:
       #                NOTE: alone among the sources its phi is NOT l2-normalized -- the
       #                orthonormality constraint sets the scale instead, and satisfying it is
       #                what hands the ridge solve an N * I Gram matrix (watch Misc/GramCond).
+      #   'joint'    : phi = MLP(s) -- trainable and unnormalized like 'laplacian', but with NO
+      #                objective of its own: it is one factor of the bilinear successor-measure
+      #                critic psi(s).phi(g) that psi_objective: 'contrastive' fits, so it is
+      #                trained by the same loss, optimizer and step as psi. Only meaningful
+      #                together with that psi_objective, and validated against it at startup.
       phi_source: trunk
       # hidden layer sizes of the standalone phi network (phi_source: 'separate' /
       # 'contrastive' / 'laplacian' only, and any such entries of phi_ensemble_sources). Sets
@@ -335,6 +340,37 @@ defaults:
       # gradient steps taken on phi every epoch after epoch 0 -- phi keeps adapting as the
       # on-policy state distribution shifts, rather than being frozen once pretrained
       phi_laplacian_steps_per_epoch: 50
+      # --- How psi is fitted (td_ridge mode only) ---------------------------------------------
+      #   'td'          : bootstrap psi against the discounted lambda-target of the phi stream
+      #                   (lam_sr / gamma_sr above), the same estimator machinery the scalar
+      #                   reward/cost value targets use. The original and the default.
+      #   'contrastive' : C-learning / contrastive RL. Drop the bootstrap: fit phi and psi
+      #                   *jointly* as the two factors of one bilinear critic psi(s).phi(g),
+      #                   trained to be the density ratio of the discounted successor measure
+      #                   against the visitation distribution -- positives drawn from each
+      #                   anchor's own geometrically-discounted future, negatives from the batch.
+      #                   Removes the moving-target problem outright: psi's TD target refers to
+      #                   phi, so under any phi that is still training psi chases a feature map
+      #                   that moves under it, and here there is no target at all. The ridge
+      #                   read-out is unchanged and in fact becomes exactly right, since
+      #                   sum_t gamma^t r(s_t) = psi(s) . E_rho[phi(g) r(g)] -- note this needs
+      #                   the ratio in its LINEAR scale, which is why the loss is a least-squares
+      #                   density-ratio fit and not an InfoNCE whose inner product is a logit.
+      #                   Requires phi_source: 'joint'. On-policy (V flavor) only.
+      psi_objective: td
+      # gradient steps on the joint phi/psi critic at epoch 0 (psi_objective: 'contrastive' only).
+      # Larger than the per-epoch budget because epoch 0 builds the representation from scratch
+      # with nothing downstream yet fitted against it.
+      psi_contrastive_pretrain_steps: 2000
+      # gradient steps on the joint phi/psi critic every epoch after epoch 0. Roughly matches what
+      # the 'td' path spends on psi (update_iters * minibatches per epoch), so the two objectives
+      # are compared at comparable budget rather than at comparable wall-clock.
+      psi_contrastive_steps_per_epoch: 300
+      # minibatch size for the joint critic. The negatives ARE the rho sample the E_rho term is
+      # estimated over, and all anchor-negative pairs are used at once (a batch of M anchors
+      # contributes M^2 samples via one matmul), so this is the knob that sets that estimate's
+      # quality. null = reuse algo_cfgs.batch_size.
+      psi_contrastive_batch_size: 1024
       # --- SR diagnostics (td_ridge mode only; see PolicyGradient._log_sr_diagnostics) ---
       # number of observations in each phi/psi drift probe set. One probe is drawn once and held
       # for the whole run (drift with the input distribution held constant), the other is redrawn
