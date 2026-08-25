@@ -88,6 +88,18 @@ Within ``td_ridge``, ``model_cfgs.sr_cfgs.phi_source`` selects where ``phi`` com
   epoch's first ``psi`` TD update ever sees it. On-policy (V flavor) only -- the Q flavor below has
   no episode-boundary bookkeeping to sample temporal pairs from, so it raises
   :func:`build_frozen_phi`'s ``NotImplementedError`` for this value like any other unhandled one.
+* ``laplacian``: ``phi = MLP(s)``, the same architecture again and also trained -- but by the
+  Augmented Lagrangian Laplacian Objective (see :mod:`omnisafe.utils.laplacian` and
+  :meth:`PolicyGradient._laplacian_update_phi`), which drives ``phi`` to the bottom ``sr_dim``
+  eigenvectors of the transition graph's Laplacian. Where ``contrastive`` asks only that
+  temporally-adjacent states be close, this asks for the property ``td_ridge`` actually depends
+  on: by the variational characterization of the eigenvalue problem those eigenvectors are the
+  ``sr_dim``-dimensional basis in which an arbitrary state signal is best approximated linearly,
+  and the reward and cost read-outs are exactly two such linear approximations. Shares
+  ``contrastive``'s pretrain-then-continually-adapt cadence, its dedicated ``sr_phi_optimizer``,
+  and its on-policy-only restriction. Alone among the sources its output is *not* l2-normalized
+  (the orthonormality constraint sets the scale instead, and satisfying it hands the ridge solve
+  an ``N * I`` Gram matrix) -- see :class:`LaplacianPhiFeatures`.
 
 The one structural difference in the Q flavors is that ``td_ridge`` carries ``num_psi_heads``
 independent ``psi`` heads over the shared trunk rather than one, so that the off-policy
@@ -483,6 +495,66 @@ class ContrastivePhiFeatures(FrozenPhiFeatures):
         self.net.requires_grad_(True)  # undo FrozenPhiFeatures.__init__'s freeze
 
 
+class LaplacianPhiFeatures(nn.Module):
+    r"""A one-step feature map ``phi`` trained to be the graph Laplacian's bottom eigenvectors.
+
+    Backs ``phi_source='laplacian'``, fitted by the Augmented Lagrangian Laplacian Objective (see
+    :mod:`omnisafe.utils.laplacian` and
+    :meth:`~omnisafe.algorithms.on_policy.base.policy_gradient.PolicyGradient._laplacian_update_phi`).
+    The network body is the same standalone MLP on the raw observation that
+    :class:`FrozenPhiFeatures` uses for ``phi_source='separate'`` and
+    :class:`ContrastivePhiFeatures` for ``phi_source='contrastive'`` -- the three differ only in
+    what (if anything) trains it, which is what makes them a controlled comparison at equal
+    capacity. Like the contrastive source it is excluded from the shared ``sr_optimizer`` and
+    driven by its own ``sr_phi_optimizer``, and like it, it is on-policy (V flavor) only: sampling
+    graph edges needs the episode-boundary bookkeeping the off-policy buffer does not keep.
+
+    Two things set it apart from every other source:
+
+    * **The output is not l2-normalized.** Every other ``phi`` is projected onto the unit sphere;
+      this one must not be. The objective's constraint is ``E_rho[phi phi^T] = I``, which implies
+      ``E[||phi||^2] = sr_dim``, and normalized features have ``||phi|| = 1`` identically -- the
+      constraint would be unsatisfiable and the multipliers would diverge trying. Leaving the
+      scale to the constraint is also what pays off downstream: a ``phi`` whose second moment is
+      the identity gives :meth:`TDRidgeSuccessorRepresentationTrunk.ridge_update` a Gram matrix of
+      ``N * I`` up to estimation error, the best-conditioned design matrix any source can hand it.
+    * **It carries state beyond its weights.** ``dual`` holds the Lagrange multipliers, one per
+      constraint ``<u_i, u_j> = delta_ij`` for ``j <= i``. They are registered as a buffer rather
+      than kept in the algorithm object so they are checkpointed, device-moved and
+      ``state_dict``-round-tripped along with the weights they constrain -- a resumed run that
+      restored the network but reset its multipliers would be pulled back through the transient
+      the multipliers exist to have already passed.
+
+    Args:
+        in_dim (int): Input dimension -- ``obs_dim`` (V flavor only; see the module docstring).
+        hidden_sizes (list of int): Hidden layer sizes of the standalone network.
+        sr_dim (int): Dimensionality of ``phi``, i.e. how many Laplacian eigenvectors are sought.
+        activation (Activation): Activation function.
+        weight_initialization_mode (InitFunction): Weight initialization mode.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_sizes: list[int],
+        sr_dim: int,
+        activation: Activation,
+        weight_initialization_mode: InitFunction,
+    ) -> None:
+        """Initialize an instance of :class:`LaplacianPhiFeatures`."""
+        super().__init__()
+        self.net = build_mlp_network(
+            sizes=[in_dim, *hidden_sizes, sr_dim],
+            activation=activation,
+            weight_initialization_mode=weight_initialization_mode,
+        )
+        self.register_buffer('dual', torch.zeros(sr_dim, sr_dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the (deliberately unnormalized) Laplacian feature of ``x``."""
+        return self.net(x)
+
+
 def build_frozen_phi(
     phi_source: str,
     in_dim: int,
@@ -500,18 +572,20 @@ def build_frozen_phi(
     into itself to build each sub-basis of ``phi_source='ensemble'``.
 
     Note:
-        ``phi_source='contrastive'`` is *not* handled here, even though it is a valid value for
-        the V-flavor :class:`TDRidgeSuccessorRepresentationTrunk` -- unlike everything this
-        function builds, it is trained rather than frozen, so that trunk constructs
-        :class:`ContrastivePhiFeatures` directly instead of calling this function. The Q flavor
+        The two *trained* sources -- ``phi_source='contrastive'`` and ``phi_source='laplacian'`` --
+        are not handled here, even though both are valid values for the V-flavor
+        :class:`TDRidgeSuccessorRepresentationTrunk`. Everything this function builds is frozen at
+        initialization, so that trunk constructs :class:`ContrastivePhiFeatures` /
+        :class:`LaplacianPhiFeatures` directly instead of calling it. The Q flavor
         (:class:`TDRidgeSuccessorRepresentationQTrunk`) only ever calls this function, so it falls
-        through to the ``NotImplementedError`` below for ``'contrastive'`` -- the correct behavior,
-        since the Q flavor's off-policy buffer has no episode-boundary bookkeeping to sample
-        temporal pairs from.
+        through to the ``NotImplementedError`` below for both -- the correct behavior, since the Q
+        flavor's off-policy buffer has no episode-boundary bookkeeping to sample the temporal pairs
+        (contrastive) or graph edges (laplacian) either objective needs.
 
     Args:
         phi_source (str): One of ``'trunk'``, ``'random'``, ``'separate'``, ``'rff'``,
-            ``'ensemble'`` (plus ``'contrastive'``, V flavor only -- see the Note above).
+            ``'ensemble'`` (plus ``'contrastive'`` / ``'laplacian'``, V flavor only -- see the
+            Note above).
         in_dim (int): Input dimension of the frozen network (see :class:`FrozenPhiFeatures`).
         phi_hidden_sizes (list of int): Hidden sizes, used by ``'separate'`` (and any ``'separate'``
             entries of an ``'ensemble'``) only.
@@ -586,7 +660,7 @@ def build_frozen_phi(
     raise NotImplementedError(
         f'Unknown sr_cfgs.phi_source "{phi_source}". '
         'Available phi sources are: "trunk", "random", "separate", "rff", "ensemble" '
-        '(plus "contrastive", V-flavor td_ridge trunk only -- not supported here).',
+        '(plus "contrastive" / "laplacian", V-flavor td_ridge trunk only -- not supported here).',
     )
 
 
@@ -602,10 +676,12 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         phi_source (str): Where ``phi`` comes from -- ``'trunk'`` (a trainable linear read-out of
             the trunk shared with ``psi``), ``'random'`` / ``'separate'`` / ``'rff'`` /
             ``'ensemble'`` (a frozen map of the raw observation, see :func:`build_frozen_phi`), or
-            ``'contrastive'`` (a *trained* map of the raw observation, fit by a time-contrastive
-            loss rather than frozen or read off the trunk, see :class:`ContrastivePhiFeatures`).
+            ``'contrastive'`` / ``'laplacian'`` (*trained* maps of the raw observation, fit by a
+            time-contrastive loss and by the Augmented Lagrangian Laplacian Objective respectively,
+            rather than frozen or read off the trunk -- see :class:`ContrastivePhiFeatures` and
+            :class:`LaplacianPhiFeatures`).
         phi_hidden_sizes (list of int): Hidden sizes of the standalone ``phi`` network, used by
-            ``phi_source='separate'`` and ``phi_source='contrastive'`` only.
+            ``phi_source`` ``'separate'`` / ``'contrastive'`` / ``'laplacian'`` only.
         phi_orthogonal_init (bool): See :func:`build_frozen_phi`.
         phi_rff_bandwidth (float): See :func:`build_frozen_phi`.
         phi_ensemble_sources (list of str or None): See :func:`build_frozen_phi`.
@@ -639,13 +715,20 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
             else nn.Identity()
         )
         phi_net: nn.Module | None
-        if phi_source == 'contrastive':
-            # Trained, not frozen -- build_frozen_phi's contract is "frozen, or None for 'trunk'",
-            # and it's shared verbatim with the Q flavor, which cannot support this source (no
-            # episode-boundary bookkeeping to sample temporal pairs from). Branching here instead
-            # of teaching build_frozen_phi about 'contrastive' means the Q flavor rejects it
-            # automatically via that function's existing NotImplementedError.
-            phi_net = ContrastivePhiFeatures(
+        # The trained sources are built here rather than in build_frozen_phi, whose contract is
+        # "frozen, or None for 'trunk'" and which is shared verbatim with the Q flavor -- a flavor
+        # that cannot support either of them (no episode-boundary bookkeeping to sample temporal
+        # pairs or graph edges from). Branching here instead of teaching that function about them
+        # means the Q flavor rejects both automatically via its existing NotImplementedError.
+        # Both take the same constructor signature and the same standalone-MLP body as
+        # FrozenPhiFeatures under phi_source='separate', so the three differ only in what trains
+        # the network -- which is what makes them a controlled comparison at equal capacity.
+        trained_phi = {
+            'contrastive': ContrastivePhiFeatures,
+            'laplacian': LaplacianPhiFeatures,
+        }.get(phi_source)
+        if trained_phi is not None:
+            phi_net = trained_phi(
                 in_dim=obs_dim,
                 hidden_sizes=phi_hidden_sizes or [],
                 sr_dim=sr_dim,

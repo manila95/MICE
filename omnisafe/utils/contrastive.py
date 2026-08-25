@@ -14,7 +14,7 @@
 # ==============================================================================
 r"""Time-contrastive pair sampling and InfoNCE loss for ``phi_source='contrastive'``.
 
-Backs the one ``td_ridge`` ``phi_source`` that is trained by a loss of its own (see
+Backs ``td_ridge``'s time-contrastive ``phi_source`` (see
 :mod:`omnisafe.models.critic.successor_representation_critic`'s module docstring and
 :class:`~omnisafe.models.critic.successor_representation_critic.ContrastivePhiFeatures`), rather
 than either drifting implicitly under the ``psi``/value loss (``'trunk'``) or staying fixed at
@@ -31,6 +31,11 @@ tensor-in/tensor-out functions with no network, config, or logger dependency, so
 checked against hand-computed values in isolation -- the same testability goal
 :mod:`sr_diagnostics` states for itself. The optimizer step / gradient loop that calls these lives
 in :meth:`~omnisafe.algorithms.on_policy.base.policy_gradient.PolicyGradient._contrastive_update_phi`.
+
+:func:`sample_temporal_pairs` is additionally reused at ``horizon=1`` by ``phi_source='laplacian'``
+(:mod:`omnisafe.utils.laplacian`) to draw transition-graph edges: pairing each state with its
+predecessor or its successor with equal probability is exactly what makes the operator that
+objective decomposes the *symmetrized* one its Dirichlet form assumes.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ def sample_temporal_pairs(
     lengths: list[int],
     horizon: int,
     generator: torch.Generator | None = None,
+    device: torch.device | str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""Sample one (anchor, positive) row-index pair per valid row of a segmented batch.
 
@@ -62,7 +68,13 @@ def sample_temporal_pairs(
             in the flat batch (e.g. ``train_data['_episode_lengths']``).
         horizon (int): Maximum ``|offset|`` a positive may be sampled at. Must be ``>= 1``.
         generator (torch.Generator or None, optional): Passed to the internal ``torch.rand`` call
-            for reproducible sampling. Defaults to ``None`` (the global RNG).
+            for reproducible sampling. Must live on ``device``. Defaults to ``None`` (the global
+            RNG).
+        device (torch.device or str or None, optional): Device to build the index tensors on. Pass
+            the device of the batch these indices will be used against: PyTorch permits CPU indices
+            into a CUDA tensor but not the reverse, so indices left on the CPU raise as soon as a
+            caller draws a minibatch *of* them with a CUDA index tensor. Defaults to ``None``
+            (CPU).
 
     Returns:
         ``(anchor_idx, positive_idx)``, two ``int64`` tensors of equal shape ``(M,)`` with
@@ -70,10 +82,10 @@ def sample_temporal_pairs(
     """
     assert horizon >= 1, f'horizon must be >= 1, got {horizon}.'
     if not lengths:
-        empty = torch.empty(0, dtype=torch.long)
+        empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
 
-    lengths_t = torch.tensor(lengths, dtype=torch.long)
+    lengths_t = torch.tensor(lengths, dtype=torch.long, device=device)
     n = int(lengths_t.sum().item())
     device = lengths_t.device
 
@@ -90,7 +102,7 @@ def sample_temporal_pairs(
     total = n_neg + n_pos
     valid = total > 0
     if not bool(valid.any()):
-        empty = torch.empty(0, dtype=torch.long)
+        empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
 
     anchor_idx = global_idx[valid]

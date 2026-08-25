@@ -157,16 +157,7 @@ class FOCOPS(PolicyGradient):
         data = self._buf.get()
         train_data, val_data = self._make_train_val_split(data)
 
-        if self._sr_td_ridge and self._sr_phi_source == 'contrastive':
-            # Mirrors PolicyGradient._update()'s contrastive-phi hook -- FOCOPS reimplements
-            # _update() independently rather than calling super(), so this has to be duplicated
-            # here too or phi_source='contrastive' silently never trains phi. See
-            # PolicyGradient._update() for the full rationale.
-            epoch = getattr(self, '_current_epoch', 0)
-            n_steps = self._sr_phi_pretrain_steps if epoch == 0 else self._sr_phi_steps_per_epoch
-            if n_steps > 0:
-                self._contrastive_update_phi(train_data, n_steps)
-                self._relabel_after_phi_update(train_data, relabel_target_sr=(epoch == 0))
+        self._maybe_update_trained_phi(train_data, val_data)
 
         if self._sr_td_ridge:
             if self._sr_readout == 'ridge':

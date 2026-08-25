@@ -205,9 +205,9 @@ class ConstraintActorQCritic(ActorQCritic):
         # bottleneck is deliberate.
         hidden_sizes = list(sr_cfgs.hidden_sizes)
         # Same independence for the standalone phi network of sr_cfgs.phi_source='separate' /
-        # 'contrastive': phi_hidden_sizes sets its hidden widths verbatim, sr_dim only sets its
-        # output width. Its depth (and now its width) is independent of the trunk's, which is the
-        # point of that mode.
+        # 'contrastive' / 'laplacian': phi_hidden_sizes sets its hidden widths verbatim, sr_dim
+        # only sets its output width. Its depth (and now its width) is independent of the
+        # trunk's, which is the point of that mode.
         phi_hidden_sizes = list(sr_cfgs.get('phi_hidden_sizes', []) or [])
 
         trunk: QSuccessorRepresentationTrunk | TDRidgeSuccessorRepresentationQTrunk

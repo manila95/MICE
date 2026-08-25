@@ -250,10 +250,23 @@ defaults:
       #                apart temporally-distant / other-episode ones. Pretrained at epoch 0,
       #                before the first psi TD update / ridge solve ever see it, then continually
       #                fine-tuned every epoch after. On-policy (V flavor) only.
+      #   'laplacian': phi = MLP(s) -- same architecture as 'separate' / 'contrastive', trained
+      #                by the Augmented Lagrangian Laplacian Objective (ALLO; see the block
+      #                below) to be the bottom sr_dim eigenvectors of the transition graph's
+      #                Laplacian. Where 'contrastive' asks only that temporally-adjacent states
+      #                be close, this asks for the property td_ridge actually needs: those
+      #                eigenvectors are, by the variational characterization of the eigenvalue
+      #                problem, the sr_dim-dimensional basis in which an arbitrary state signal
+      #                is best approximated LINEARLY -- and w_r / w_c are exactly two such linear
+      #                approximations. Same cadence as 'contrastive' (pretrained at epoch 0,
+      #                fine-tuned every epoch after) and likewise on-policy (V flavor) only.
+      #                NOTE: alone among the sources its phi is NOT l2-normalized -- the
+      #                orthonormality constraint sets the scale instead, and satisfying it is
+      #                what hands the ridge solve an N * I Gram matrix (watch Misc/GramCond).
       phi_source: trunk
       # hidden layer sizes of the standalone phi network (phi_source: 'separate' /
-      # 'contrastive' only, and any such entries of phi_ensemble_sources). Sets its hidden
-      # widths verbatim, independent of sr_dim (which only sets its output width) and of
+      # 'contrastive' / 'laplacian' only, and any such entries of phi_ensemble_sources). Sets
+      # its hidden widths verbatim, independent of sr_dim (which only sets its output width) and of
       # sr_cfgs.hidden_sizes (its depth and width are its own, which is the point of this mode).
       phi_hidden_sizes: [64, 64]
       # draw phi_source: 'random' / 'separate' (and any such phi_ensemble_sources entries) with
@@ -269,7 +282,7 @@ defaults:
       # null falls back to one of each ['random', 'separate', 'rff']. Ignored unless
       # phi_source: 'ensemble'
       phi_ensemble_sources: ~
-      # --- Contrastive phi learning (phi_source: 'contrastive' only) -------------------------
+      # --- Time-contrastive phi learning (phi_source: 'contrastive' only) ---------------------
       # temperature for the InfoNCE / NT-Xent similarity scaling; lower = sharper, more
       # discriminative positive/negative separation
       phi_contrastive_temperature: 0.1
@@ -285,9 +298,42 @@ defaults:
       # minibatch size for the contrastive loss's in-batch-negative InfoNCE; null = reuse
       # algo_cfgs.batch_size
       phi_contrastive_batch_size: ~
-      # learning rate for phi's dedicated optimizer (phi_source: 'contrastive' only); null =
-      # reuse sr_cfgs.lr
+      # learning rate for phi's dedicated optimizer (the trained phi sources 'contrastive' /
+      # 'laplacian' only); null = reuse sr_cfgs.lr
       phi_lr: ~
+      # --- Laplacian phi learning, ALLO (phi_source: 'laplacian' only) ------------------------
+      # quadratic barrier coefficient b of the augmented Lagrangian. Unlike the fixed-penalty
+      # methods ALLO replaces -- whose equilibrium, and therefore whose recovered features, are an
+      # artifact of this coefficient -- the solution here does NOT depend on it: the dual
+      # variables below are what make the constraint exact. It only conditions the descent.
+      phi_laplacian_barrier: 2.0
+      # dual-ascent step size for the Lagrange multipliers enforcing E_rho[phi phi^T] = I. Too
+      # large and the multipliers oscillate; too small and phi spends the run with an unsatisfied
+      # constraint. Watch Misc/LaplacianOffDiagErr (are the coordinates decorrelating?) against
+      # Misc/LaplacianDualNorm (are the multipliers still growing, or have they settled?).
+      phi_laplacian_dual_lr: 0.01
+      # minibatch size for the objective, deliberately larger than algo_cfgs.batch_size: the
+      # constraint is on an sr_dim x sr_dim second moment, so a batch that does not comfortably
+      # exceed sr_dim leaves the residual dominated by estimation noise rather than by real
+      # correlation. Cheap -- it is a small MLP over states already in memory. Each step draws two
+      # independent batches this size (needed for an unbiased barrier gradient) plus one batch of
+      # graph edges. null = reuse algo_cfgs.batch_size.
+      phi_laplacian_batch_size: 1024
+      # learning rate for phi under this objective, overriding phi_lr / sr_cfgs.lr. Deliberately
+      # ~10x the trunk's: ALLO has an orthonormality constraint to satisfy from scratch, and at
+      # sr_cfgs.lr (3e-4) it simply does not get there within any sane pretrain budget.
+      phi_laplacian_lr: 0.003
+      # gradient steps taken on phi at epoch 0, before the first psi TD update / ridge solve --
+      # gets phi out of its random-init regime before anything downstream is fit against it.
+      # Measured on Simple-v0 at sr_dim 16 (LaplacianDiagErr / OffDiagErr / GramCond after the
+      # burst): 500 steps at 3e-4 leaves 0.28 / 0.30 / ~4000 -- i.e. no better conditioned than
+      # phi_source: trunk -- while 2000 at 3e-3 reaches 0.07 / 0.08 / ~3, which is the N * I Gram
+      # this basis exists to produce. 5000 steps buys nothing more. If GramCond is not falling to
+      # single digits within a few epochs, this and phi_laplacian_lr are the two knobs to raise.
+      phi_laplacian_pretrain_steps: 2000
+      # gradient steps taken on phi every epoch after epoch 0 -- phi keeps adapting as the
+      # on-policy state distribution shifts, rather than being frozen once pretrained
+      phi_laplacian_steps_per_epoch: 50
       # --- SR diagnostics (td_ridge mode only; see PolicyGradient._log_sr_diagnostics) ---
       # number of observations in each phi/psi drift probe set. One probe is drawn once and held
       # for the whole run (drift with the input distribution held constant), the other is redrawn
