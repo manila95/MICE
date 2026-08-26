@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+
+import numpy as np
 import torch
 from rich.progress import Progress
 
@@ -208,6 +211,25 @@ def _rollout_and_report(  # pylint: disable=too-many-locals,too-many-statements
     s0_r_error,  s0_true_r_m,  s0_est_r_m,  s0_corr_r  = _stats(s0_true_r_t,  s0_est_r_t)
     all_c_error, all_true_c_m, all_est_c_m, all_corr_c = _stats(all_true_c_t, all_est_c_t)
     all_r_error, all_true_r_m, all_est_r_m, all_corr_r = _stats(all_true_r_t, all_est_r_t)
+
+    # Opt-in local dump of the raw per-state (true, estimate) pairs behind the scatter plots
+    # above, keyed by epoch. Independent of use_wandb -- offline analysis (e.g. reliability /
+    # calibration diagrams binned across many epochs) needs the raw arrays, not just the wandb
+    # scatter images and the aggregate corr/error scalars logged below.
+    dump_dir = os.environ.get('MICE_VALUE_EVAL_DUMP_DIR')
+    if dump_dir:
+        os.makedirs(dump_dir, exist_ok=True)
+        np.savez(
+            os.path.join(dump_dir, f'{value_symbol}_epoch_{(epoch or 0):04d}.npz'),
+            s0_true_c=s0_true_c_t.cpu().numpy(),
+            s0_est_c=s0_est_c_t.cpu().numpy(),
+            s0_true_r=s0_true_r_t.cpu().numpy(),
+            s0_est_r=s0_est_r_t.cpu().numpy(),
+            all_true_c=all_true_c_t.cpu().numpy(),
+            all_est_c=all_est_c_t.cpu().numpy(),
+            all_true_r=all_true_r_t.cpu().numpy(),
+            all_est_r=all_est_r_t.cpu().numpy(),
+        )
 
     if cfgs.logger_cfgs.use_wandb:
         import matplotlib.pyplot as plt

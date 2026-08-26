@@ -95,6 +95,11 @@ defaults:
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5
     value_eval_freq: 50
+    # whether to run the full-episode true-vs-estimated value calibration rollout
+    # (see omnisafe.utils.value_eval.estimate_true_value)
+    test_estimate: True
+    # number of full episodes rolled out per calibration eval (see test_estimate above)
+    value_eval_episodes: 100
   logger_cfgs:
     # use wandb for logging
     use_wandb: True
@@ -188,6 +193,22 @@ defaults:
       # phi_source: random / separate). On-policy 'sgd' keeps its own buffer since the rollout
       # buffer is wiped every epoch, so w is still fit over all past experience.
       readout: ridge
+      # what the closed-form ridge regresses (readout: ridge only).
+      #   'phi' (default): phi(s).w ~= one-step reward/cost -- the original successor-feature
+      #                 factorization; w is policy-independent since the immediate reward/cost
+      #                 doesn't depend on the return.
+      #   'psi'         : psi(s).w ~= the true discounted return (discounted_ret /
+      #                 discounted_cost_ret), an ordinary linear value-function regression on top
+      #                 of psi as a learned feature extractor rather than a literal successor
+      #                 measure. Requires ridge_data: 'epoch'. Motivated by phi_source: 'trunk'
+      #                 specifically: phi_head never receives a gradient there (every trainable
+      #                 loss reads out through psi, never phi), so regressing against the
+      #                 gradient-shaped psi instead of the frozen-random phi measured a large,
+      #                 held-out-verified improvement in both correlation and absolute scale
+      #                 against the true cost-to-go on Ant-v4/CPO -- see WOracleCostCorr /
+      #                 WOracleCostR2 in PolicyGradient._sr_split_scalars, the diagnostic this
+      #                 mode makes real.
+      w_source: phi
       # which transitions the closed-form ridge is solved on (readout: ridge only).
       #   'epoch'       : the fresh epoch's training split (the rollout's own phi).
       #   'buffer'      : the persistent cross-epoch history, recomputing phi under the current

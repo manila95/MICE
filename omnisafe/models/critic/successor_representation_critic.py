@@ -289,6 +289,75 @@ class RidgeSolvedReadoutWeights(nn.Module):
         return loss, stats
 
     @torch.no_grad()
+    def _ridge_solve(
+        self,
+        design: torch.Tensor,
+        target_r: torch.Tensor,
+        target_c: torch.Tensor,
+        ridge_kappa: float,
+        ema_tau: float,
+        ridge_kappa_cost: float | None,
+    ) -> dict[str, float]:
+        r"""Shared closed-form solve behind :meth:`ridge_update` and :meth:`ridge_update_on_return`.
+
+        .. math::
+
+            w \leftarrow (1 - \tau) w + \tau (X^T X + \kappa I)^{-1} X^T y
+
+        solved in float64 for numerical stability, then EMA-blended into the stored buffer. Callers
+        differ only in what ``design`` (``X``) and ``target_r`` / ``target_c`` (``y``) are: the
+        design matrix and its regression targets are otherwise interchangeable to this solve.
+
+        The two read-outs share one design matrix but not necessarily one ``kappa``. The
+        MSE-optimal shrinkage scales with a target's noise-to-signal ratio, and reward and cost do
+        not share one: a sparse cost that the basis fits poorly generalizes far worse than a dense
+        reward at the same ``kappa`` (measured on ``SafetyPointGoal1-v0``: a train-minus-val
+        ``RidgeR2`` gap of 1.19 for cost against 0.05 for reward). ``ridge_kappa_cost`` therefore
+        regularizes the cost read-out independently; left at ``None`` both share ``ridge_kappa``
+        and the solve is bit-for-bit what it was before.
+
+        Args:
+            design (torch.Tensor): Design matrix of shape ``(N, sr_dim)`` for the fresh batch.
+            target_r (torch.Tensor): Reward-stream regression target of shape ``(N,)``.
+            target_c (torch.Tensor): Cost-stream regression target of shape ``(N,)``.
+            ridge_kappa (float): Ridge regularization coefficient for the reward read-out (scales
+                the mean diagonal of the Gram matrix), and for the cost read-out when
+                ``ridge_kappa_cost`` is ``None``.
+            ema_tau (float): EMA blending coefficient; ``1.0`` means no smoothing (replace).
+            ridge_kappa_cost (float or None): Ridge coefficient for the cost read-out only, on the
+                same mean-diagonal scale. ``None`` reuses ``ridge_kappa``.
+
+        Returns:
+            A dict of diagnostic statistics for logging.
+        """
+        x = design.double()
+        gram = x.T @ x
+        # Both kappas scale the same Gram diagonal, so they stay comparable across bases whatever
+        # the design matrix's magnitude is -- the ratio kappa_c / kappa_r is the quantity tuned.
+        scale = torch.diagonal(gram).mean().clamp(min=1e-12)
+        eye = torch.eye(self.sr_dim, dtype=torch.float64, device=x.device)
+        mat_r = gram + ridge_kappa * scale * eye
+        # Reuse the reward matrix outright when the kappas coincide: same factorization, and no
+        # chance of the two solves drifting apart numerically in the shared-kappa default.
+        mat_c = mat_r if ridge_kappa_cost is None else gram + ridge_kappa_cost * scale * eye
+
+        w_r_new = torch.linalg.solve(mat_r, x.T @ target_r.double())
+        w_c_new = torch.linalg.solve(mat_c, x.T @ target_c.double())
+        self.w_r.mul_(1.0 - ema_tau).add_(ema_tau * w_r_new.float())
+        self.w_c.mul_(1.0 - ema_tau).add_(ema_tau * w_c_new.float())
+
+        resid_r = (x @ w_r_new - target_r.double()).pow(2).mean().sqrt().item()
+        resid_c = (x @ w_c_new - target_c.double()).pow(2).mean().sqrt().item()
+        return {
+            'Misc/RidgeResidualReward': resid_r,
+            'Misc/RidgeResidualCost': resid_c,
+            'Misc/WrNorm': self.w_r.norm().item(),
+            'Misc/WcNorm': self.w_c.norm().item(),
+            'Misc/GramCond': torch.linalg.cond(mat_r).item(),
+            'Misc/GramCondCost': torch.linalg.cond(mat_c).item(),
+        }
+
+    @torch.no_grad()
     def ridge_update(
         self,
         phi: torch.Tensor,
@@ -298,62 +367,71 @@ class RidgeSolvedReadoutWeights(nn.Module):
         ema_tau: float,
         ridge_kappa_cost: float | None = None,
     ) -> dict[str, float]:
-        r"""Refresh ``w_r`` and ``w_c`` by closed-form ridge regression on the fresh batch.
-
-        .. math::
-
-            w \leftarrow (1 - \tau) w + \tau (\Phi^T \Phi + \kappa I)^{-1} \Phi^T y
-
-        solved in float64 for numerical stability, then EMA-blended into the stored buffer.
-
-        The two read-outs share one design matrix ``Phi`` but not necessarily one ``kappa``. The
-        MSE-optimal shrinkage scales with a target's noise-to-signal ratio, and reward and cost do
-        not share one: a sparse cost that the basis fits poorly generalizes far worse than a dense
-        reward at the same ``kappa`` (measured on ``SafetyPointGoal1-v0``: a train-minus-val
-        ``RidgeR2`` gap of 1.19 for cost against 0.05 for reward). ``ridge_kappa_cost`` therefore
-        regularizes the cost read-out independently; left at ``None`` both share ``ridge_kappa``
-        and the solve is bit-for-bit what it was before.
+        r"""Refresh ``w_r`` and ``w_c`` by closed-form ridge regression of the one-step
+        reward/cost onto ``phi`` -- the original successor-feature factorization
+        (``sr_cfgs.w_source='phi'``, the default). See :meth:`_ridge_solve` for the solve itself.
 
         Args:
             phi (torch.Tensor): One-step features of shape ``(N, sr_dim)`` for the fresh batch.
             reward (torch.Tensor): One-step rewards of shape ``(N,)``.
             cost (torch.Tensor): One-step costs of shape ``(N,)``.
-            ridge_kappa (float): Ridge regularization coefficient for the reward read-out (scales
-                the mean diagonal of the Gram matrix), and for the cost read-out when
-                ``ridge_kappa_cost`` is ``None``.
-            ema_tau (float): EMA blending coefficient; ``1.0`` means no smoothing (replace).
-            ridge_kappa_cost (float or None): Ridge coefficient for the cost read-out only, on the
-                same mean-diagonal scale. ``None`` reuses ``ridge_kappa``. Defaults to ``None``.
+            ridge_kappa (float): See :meth:`_ridge_solve`.
+            ema_tau (float): See :meth:`_ridge_solve`.
+            ridge_kappa_cost (float or None): See :meth:`_ridge_solve`. Defaults to ``None``.
 
         Returns:
             A dict of diagnostic statistics for logging.
         """
-        p = phi.double()
-        gram = p.T @ p
-        # Both kappas scale the same Gram diagonal, so they stay comparable across bases whatever
-        # phi's magnitude is -- the ratio kappa_c / kappa_r is the quantity being tuned.
-        scale = torch.diagonal(gram).mean().clamp(min=1e-12)
-        eye = torch.eye(self.sr_dim, dtype=torch.float64, device=p.device)
-        mat_r = gram + ridge_kappa * scale * eye
-        # Reuse the reward matrix outright when the kappas coincide: same factorization, and no
-        # chance of the two solves drifting apart numerically in the shared-kappa default.
-        mat_c = mat_r if ridge_kappa_cost is None else gram + ridge_kappa_cost * scale * eye
+        return self._ridge_solve(phi, reward, cost, ridge_kappa, ema_tau, ridge_kappa_cost)
 
-        w_r_new = torch.linalg.solve(mat_r, p.T @ reward.double())
-        w_c_new = torch.linalg.solve(mat_c, p.T @ cost.double())
-        self.w_r.mul_(1.0 - ema_tau).add_(ema_tau * w_r_new.float())
-        self.w_c.mul_(1.0 - ema_tau).add_(ema_tau * w_c_new.float())
+    @torch.no_grad()
+    def ridge_update_on_return(
+        self,
+        psi: torch.Tensor,
+        true_r: torch.Tensor,
+        true_c: torch.Tensor,
+        ridge_kappa: float,
+        ema_tau: float,
+        ridge_kappa_cost: float | None = None,
+    ) -> dict[str, float]:
+        r"""Refresh ``w_r`` and ``w_c`` by closed-form ridge regression of the true multi-step
+        discounted return onto ``psi`` (``sr_cfgs.w_source='psi'``).
 
-        resid_r = (p @ w_r_new - reward.double()).pow(2).mean().sqrt().item()
-        resid_c = (p @ w_c_new - cost.double()).pow(2).mean().sqrt().item()
-        return {
-            'Misc/RidgeResidualReward': resid_r,
-            'Misc/RidgeResidualCost': resid_c,
-            'Misc/WrNorm': self.w_r.norm().item(),
-            'Misc/WcNorm': self.w_c.norm().item(),
-            'Misc/GramCond': torch.linalg.cond(mat_r).item(),
-            'Misc/GramCondCost': torch.linalg.cond(mat_c).item(),
-        }
+        Regresses the successor feature ``psi`` directly onto the quantity ``V(s) = psi(s) . w``
+        is meant to predict -- the true discounted return -- rather than regressing the one-step
+        reward/cost onto ``phi`` and relying on ``psi``'s TD fit to the recursion
+        ``psi(s) ~= phi(s) + gamma * psi(s')`` to carry that regression through the discounted sum.
+        This gives up the strict successor-measure property that a single ``psi`` and several w's
+        can be recombined for different reward-like quantities without refitting, in exchange for
+        directly optimizing what the critic is scored on -- closer to ordinary linear
+        fitted-value regression (LSTD-style) on top of ``psi`` as a learned feature extractor.
+
+        Motivation and validation: under ``phi_source='trunk'``, ``phi_head`` never receives a
+        gradient (every trainable loss -- the SR TD loss and both critic MSEs -- reads out through
+        ``psi``, never ``phi``, so the only two call sites that ever evaluate ``phi(obs)`` are the
+        ridge solve itself and the diagnostic pass, both under ``torch.no_grad()``). Regressing
+        against the gradient-shaped ``psi`` instead of the frozen-random ``phi`` was measured, on
+        Ant-v4/CPO with a held-out split, to substantially improve both correlation and absolute
+        scale against the true discounted cost-to-go over the ``phi``-based fit -- see
+        ``SR/{split}/WOracleCostCorr`` / ``WOracleCostR2`` (the diagnostic this mode makes real) in
+        :meth:`~omnisafe.algorithms.on_policy.base.policy_gradient.PolicyGradient._sr_split_scalars`.
+
+        Args:
+            psi (torch.Tensor): Successor features of shape ``(N, sr_dim)`` for the fresh batch
+                (this epoch's pre-update ``psi``, matching how ``ridge_update``'s ``phi`` is also
+                this epoch's pre-update value).
+            true_r (torch.Tensor): True discounted reward return of shape ``(N,)`` (e.g. the
+                buffer's Monte-Carlo ``discounted_ret``).
+            true_c (torch.Tensor): True discounted cost return of shape ``(N,)`` (e.g. the
+                buffer's Monte-Carlo ``discounted_cost_ret``).
+            ridge_kappa (float): See :meth:`_ridge_solve`.
+            ema_tau (float): See :meth:`_ridge_solve`.
+            ridge_kappa_cost (float or None): See :meth:`_ridge_solve`. Defaults to ``None``.
+
+        Returns:
+            A dict of diagnostic statistics for logging, with the same keys as :meth:`ridge_update`.
+        """
+        return self._ridge_solve(psi, true_r, true_c, ridge_kappa, ema_tau, ridge_kappa_cost)
 
 
 class FrozenPhiFeatures(nn.Module):

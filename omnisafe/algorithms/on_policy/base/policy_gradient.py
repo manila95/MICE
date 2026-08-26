@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from rich.progress import track
@@ -150,6 +152,37 @@ class PolicyGradient(BaseAlgo):
         self._sr_readout = (
             self._cfgs.model_cfgs.sr_cfgs.get('readout', 'ridge') if self._sr_td_ridge else 'ridge'
         )
+        # What the closed-form ridge regresses (readout='ridge' only):
+        #   'phi' (default): phi(s) . w ~= one-step reward/cost -- the original successor-feature
+        #       factorization. w is policy-independent (the immediate reward/cost does not depend
+        #       on the return), so this can in principle be fit over stale-policy data too.
+        #   'psi': psi(s) . w ~= the true multi-step discounted return (buffer's Monte-Carlo
+        #       discounted_ret / discounted_cost_ret), i.e. an ordinary linear value-function
+        #       regression on top of psi as a learned feature extractor, abandoning the strict
+        #       successor-measure property that lets one psi be dotted with several w's to get
+        #       different reward-like quantities. Validated in the SR calibration study (see
+        #       SR/{split}/WOracle{Reward,Cost}{Corr,R2} in _sr_split_scalars, which measures
+        #       exactly this fit): under phi_source='trunk', phi_head never receives a gradient
+        #       (every trainable loss reads out through psi, never phi), so regressing against the
+        #       gradient-shaped psi instead of the frozen-random phi gave a large, held-out-verified
+        #       improvement in both correlation and absolute scale on Ant-v4/CPO. w is fit against
+        #       psi *before* this epoch's update loop (matching how the 'phi' path already has to
+        #       fit before the loop that trains phi/psi/w_r/w_c's readers), so it uses this epoch's
+        #       pre-update psi, not the post-update psi the diagnostic's WOracle is scored against.
+        self._sr_w_source = (
+            self._cfgs.model_cfgs.sr_cfgs.get('w_source', 'phi') if self._sr_td_ridge else 'phi'
+        )
+        if self._sr_w_source not in ('phi', 'psi'):
+            raise NotImplementedError(
+                f'Unknown sr_cfgs.w_source "{self._sr_w_source}". '
+                'Available w sources are: "phi", "psi".',
+            )
+        if self._sr_w_source == 'psi' and self._sr_readout != 'ridge':
+            raise NotImplementedError(
+                'sr_cfgs.w_source="psi" is only implemented for sr_cfgs.readout="ridge" '
+                f'(got readout="{self._sr_readout}"); the SGD read-out still regresses phi '
+                'against the one-step reward/cost.',
+            )
         # Which transitions the closed-form ridge is solved on (readout='ridge' only): 'epoch' --
         # the fresh epoch's training split, 'buffer' -- the persistent cross-epoch history, or
         # 'cost_replay' -- the epoch plus an equal number of past cost-inducing transitions. This
@@ -164,6 +197,16 @@ class PolicyGradient(BaseAlgo):
             raise NotImplementedError(
                 f'Unknown sr_cfgs.ridge_data "{self._sr_ridge_data}". '
                 'Available ridge data sources are: "epoch", "buffer", "cost_replay".',
+            )
+        if self._sr_w_source == 'psi' and self._sr_ridge_data != 'epoch':
+            # 'buffer' / 'cost_replay' recompute phi from stored obs to widen coverage under a
+            # frozen or slowly-drifting phi; psi has no such persistent-buffer story here (the
+            # readout buffers store obs/reward/cost, not the discounted returns a psi-based fit
+            # needs), and psi is read straight off the trunk that generated it, not recomputed from
+            # older obs the same way phi is.
+            raise NotImplementedError(
+                'sr_cfgs.w_source="psi" only supports sr_cfgs.ridge_data="epoch" '
+                f'(got ridge_data="{self._sr_ridge_data}").',
             )
         # Where phi comes from. Only the *trained* sources are read here (every other value is
         # handled entirely inside the trunk/critic construction): they are the ones needing a
@@ -488,12 +531,16 @@ class PolicyGradient(BaseAlgo):
                 self._logger.register_key(f'SR/{split}/{stage}/PerDimEVMedian')
             self._logger.register_key(f'SR/{split}/TargetTrueEV')
 
-            # Layer 3 -- the psi x w attribution grid (see _log_sr_diagnostics).
+            # Layer 3 -- the psi x w attribution grid (see _log_sr_diagnostics). Corr is
+            # scale-free (a uniformly mis-scaled prediction still scores 1.0); R2 is not, so a
+            # readout that correlates well but predicts outside the true target's range shows up
+            # here and not there -- see the note on out['*R2'] in _sr_split_scalars.
             for stream in ('Reward', 'Cost'):
-                self._logger.register_key(f'SR/{split}/V{stream}Corr')
-                self._logger.register_key(f'SR/{split}/PsiOracle{stream}Corr')
-                self._logger.register_key(f'SR/{split}/WOracle{stream}Corr')
-                self._logger.register_key(f'SR/{split}/Ceiling{stream}Corr')
+                for metric in ('Corr', 'R2'):
+                    self._logger.register_key(f'SR/{split}/V{stream}{metric}')
+                    self._logger.register_key(f'SR/{split}/PsiOracle{stream}{metric}')
+                    self._logger.register_key(f'SR/{split}/WOracle{stream}{metric}')
+                    self._logger.register_key(f'SR/{split}/Ceiling{stream}{metric}')
 
         if 'Val' in splits:
             # Train - Val, logged directly so overfitting is one series rather than a
@@ -506,6 +553,11 @@ class PolicyGradient(BaseAlgo):
                 'AfterUpdate/MCExplainedVar',
                 'CeilingRewardCorr',
                 'CeilingCostCorr',
+                'VCostCorr',
+                'VCostR2',
+                'WOracleCostCorr',
+                'WOracleCostR2',
+                'CeilingCostR2',
             ):
                 self._logger.register_key(f'SR/Gap/{key}')
 
@@ -1030,6 +1082,7 @@ class PolicyGradient(BaseAlgo):
         for split, prep in prepared.items():
             scalars[split] = self._sr_split_scalars(prep, oracle_w)
             self._logger.store({f'SR/{split}/{k}': v for k, v in scalars[split].items()})
+            self._dump_sr_cost_predictions(split, prep, oracle_w)
 
         if 'Val' in scalars:
             for key in (
@@ -1040,6 +1093,11 @@ class PolicyGradient(BaseAlgo):
                 'AfterUpdate/MCExplainedVar',
                 'CeilingRewardCorr',
                 'CeilingCostCorr',
+                'VCostCorr',
+                'VCostR2',
+                'WOracleCostCorr',
+                'WOracleCostR2',
+                'CeilingCostR2',
             ):
                 self._logger.store({f'SR/Gap/{key}': scalars['Train'][key] - scalars['Val'][key]})
 
@@ -1065,11 +1123,23 @@ class PolicyGradient(BaseAlgo):
         w_c = self._actor_critic.sr_trunk.w_c.detach()
         out: dict[str, float] = {}
 
-        # --- Layer 0: is phi a usable basis? -------------------------------------------------
-        # Measured on the rollout-time phi and the live w, which is exactly the pair the ridge
-        # solved for this epoch, so Train is in-sample fit and Val is its generalization.
-        out['RidgeR2Reward'] = sr_diagnostics.r2_score(prep['phi_roll'] @ w_r, prep['reward'])
-        out['RidgeR2Cost'] = sr_diagnostics.r2_score(prep['phi_roll'] @ w_c, prep['cost'])
+        # --- Layer 0: is the read-out's own basis usable? -------------------------------------
+        # Measured on the rollout-time design matrix and the live w against whatever w was
+        # actually solved against, which is exactly the pair the ridge fit this epoch, so Train
+        # is in-sample fit and Val is its generalization. Which pair that is depends on
+        # sr_cfgs.w_source: under 'phi' (default) w is solved against phi and the one-step
+        # reward/cost (ridge_update); under 'psi' it is solved against psi and the true discounted
+        # return (ridge_update_on_return). Scoring 'psi'-mode w against phi_roll/one-step
+        # reward-cost would silently mix the two bases -- w's *dimensions* still line up with
+        # phi_roll's (both sr_dim), so it would not error, just report a meaningless number.
+        if self._sr_w_source == 'psi':
+            design_r, design_c = prep['psi_roll'], prep['psi_roll']
+            target_r, target_c = prep['true_r'], prep['true_c']
+        else:
+            design_r, design_c = prep['phi_roll'], prep['phi_roll']
+            target_r, target_c = prep['reward'], prep['cost']
+        out['RidgeR2Reward'] = sr_diagnostics.r2_score(design_r @ w_r, target_r)
+        out['RidgeR2Cost'] = sr_diagnostics.r2_score(design_c @ w_c, target_c)
         out['PhiEffRank'] = sr_diagnostics.effective_rank(prep['phi_roll'])
         out['PhiStableRank'] = sr_diagnostics.stable_rank(prep['phi_roll'])
         out['PhiDeadDims'] = sr_diagnostics.dead_dim_fraction(prep['phi_roll'])
@@ -1089,25 +1159,63 @@ class PolicyGradient(BaseAlgo):
         out['TargetTrueEV'] = sr_diagnostics.explained_variance(prep['target_sr'], prep['mc_roll'])
 
         # --- Layer 3: which piece is responsible for V's error? ------------------------------
+        # Corr and R2 are reported side by side deliberately: Corr (sr_diagnostics.correlation)
+        # is invariant to an affine rescaling of the prediction, so a readout that points the
+        # right direction but predicts on the wrong scale -- e.g. a bounded [0, 1] target
+        # predicted in [0, 3] -- still scores well on it. R2 (sr_diagnostics.r2_score) is not
+        # invariant to that rescaling: it penalizes exactly the miscalibration Corr is blind to,
+        # so a stream with high Corr and low/negative R2 names a scale problem, not a direction
+        # problem, in whichever piece (V, PsiOracle, WOracle, Ceiling) shows the gap.
         for stream, weight, true in (('Reward', w_r, 'true_r'), ('Cost', w_c, 'true_c')):
             suffix = 'r' if stream == 'Reward' else 'c'
-            out[f'V{stream}Corr'] = sr_diagnostics.correlation(
-                prep['psi_after'] @ weight,
-                prep[true],
-            )
-            out[f'PsiOracle{stream}Corr'] = sr_diagnostics.correlation(
-                prep['mc_after'] @ weight,
-                prep[true],
-            )
-            out[f'WOracle{stream}Corr'] = sr_diagnostics.correlation(
-                prep['psi_after'] @ oracle_w[f'psi_after_{suffix}'],
-                prep[true],
-            )
-            out[f'Ceiling{stream}Corr'] = sr_diagnostics.correlation(
-                prep['mc_after'] @ oracle_w[f'mc_after_{suffix}'],
-                prep[true],
-            )
+            pred_v = prep['psi_after'] @ weight
+            pred_psi_oracle = prep['mc_after'] @ weight
+            pred_w_oracle = prep['psi_after'] @ oracle_w[f'psi_after_{suffix}']
+            pred_ceiling = prep['mc_after'] @ oracle_w[f'mc_after_{suffix}']
+            for name, pred in (
+                ('V', pred_v),
+                ('PsiOracle', pred_psi_oracle),
+                ('WOracle', pred_w_oracle),
+                ('Ceiling', pred_ceiling),
+            ):
+                out[f'{name}{stream}Corr'] = sr_diagnostics.correlation(pred, prep[true])
+                out[f'{name}{stream}R2'] = sr_diagnostics.r2_score(pred, prep[true])
         return out
+
+    @torch.no_grad()
+    def _dump_sr_cost_predictions(
+        self,
+        split: str,
+        prep: dict[str, torch.Tensor],
+        oracle_w: dict[str, torch.Tensor],
+    ) -> None:
+        """Opt-in local dump of the raw cost-stream predictions behind the Layer 3 attribution grid.
+
+        ``SR/{split}/{V,WOracle,Ceiling}CostCorr`` / ``*R2`` (see :meth:`_sr_split_scalars`) are
+        aggregate scalars; offline analysis that needs the actual per-state prediction/target pairs
+        -- reliability diagrams, out-of-range fractions, side-by-side scatter plots comparing the
+        deployed read-out against the psi-based oracle one -- needs the raw arrays instead. No-op
+        unless ``MICE_SR_ORACLE_DUMP_DIR`` is set, so this has no effect on a normal run.
+
+        Args:
+            split (str): ``'Train'`` or ``'Val'``, used only to name the output file.
+            prep (dict): The split's tensors, as returned by :meth:`_sr_prepare_split`.
+            oracle_w (dict): Oracle read-out weights fitted on the training split, keyed
+                ``'{psi_after,mc_after}_{r,c}'``.
+        """
+        dump_dir = os.environ.get('MICE_SR_ORACLE_DUMP_DIR')
+        if not dump_dir:
+            return
+        os.makedirs(dump_dir, exist_ok=True)
+        w_c = self._actor_critic.sr_trunk.w_c.detach()
+        epoch = getattr(self, '_current_epoch', 0)
+        np.savez(
+            os.path.join(dump_dir, f'{split}_epoch_{epoch:04d}.npz'),
+            true_c=prep['true_c'].cpu().numpy(),
+            pred_v_c=(prep['psi_after'] @ w_c).cpu().numpy(),
+            pred_woracle_c=(prep['psi_after'] @ oracle_w['psi_after_c']).cpu().numpy(),
+            pred_ceiling_c=(prep['mc_after'] @ oracle_w['mc_after_c']).cpu().numpy(),
+        )
 
     @torch.no_grad()
     def _log_sr_drift(self) -> None:
@@ -1450,12 +1558,31 @@ class PolicyGradient(BaseAlgo):
             read-out sees the wider state coverage too. ``phi`` is recomputed from the combined
             observations, as under ``'buffer'``.
 
+        Under ``sr_cfgs.w_source='psi'`` (validated at init to require ``ridge_data='epoch'``,
+        since the persistent readout buffers below store obs/reward/cost, not the discounted
+        returns this mode regresses onto), the design matrix is instead this epoch's pre-update
+        ``psi`` and the targets are the true discounted returns -- see
+        :meth:`~omnisafe.models.critic.successor_representation_critic.RidgeSolvedReadoutWeights.ridge_update_on_return`.
+
         Args:
             train_data (dict[str, torch.Tensor]): The training-split epoch batch (post
                 :meth:`_make_train_val_split`), including the ``phi``, ``reward``, and ``cost``
                 fields used for the ridge solve.
         """
         sr_cfgs = self._cfgs.model_cfgs.sr_cfgs
+        if self._sr_w_source == 'psi':
+            stats = self._actor_critic.sr_trunk.ridge_update_on_return(
+                train_data['psi'],
+                train_data['discounted_ret'],
+                train_data['discounted_cost_ret'],
+                ridge_kappa=sr_cfgs.get('ridge_kappa', 1e-3),
+                ema_tau=sr_cfgs.get('ema_tau', 1.0),
+                ridge_kappa_cost=sr_cfgs.get('ridge_kappa_cost', None),
+            )
+            stats['Misc/RidgeFitSamples'] = float(train_data['psi'].shape[0])
+            self._logger.store(stats)
+            return
+
         if self._sr_ridge_data == 'buffer':
             assert self._sr_readout_buf is not None
             # Only the training split is retained, so held-out episodes never enter the fit --

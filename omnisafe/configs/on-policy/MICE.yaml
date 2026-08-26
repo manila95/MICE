@@ -113,6 +113,8 @@ defaults:
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5
     value_eval_freq: 50
+    # number of full episodes rolled out per calibration eval (see test_estimate above)
+    value_eval_episodes: 100
   # logger configurations
   logger_cfgs:
     # use wandb for logging
