@@ -22,6 +22,7 @@ from omnisafe.common.buffer.onpolicy_buffer import (
     ADV_NORM_MODES,
     OnPolicyBuffer,
     standardize_advantages,
+    timestep_baseline_diagnostics,
 )
 from omnisafe.typing import DEVICE_CPU, AdvatageEstimator, OmnisafeSpace
 
@@ -83,6 +84,7 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
         assert adv_norm_mode in ADV_NORM_MODES, f'adv_norm_mode must be one of {ADV_NORM_MODES}!'
         self._adv_norm_mode: str = adv_norm_mode
         self._adv_norm_timestep_min_count: int = adv_norm_timestep_min_count
+        self._timestep_baseline_stats: dict[str, float] = {}
 
         if num_envs < 1:
             raise ValueError('num_envs must be greater than 0.')
@@ -105,6 +107,11 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
             )
             for _ in range(num_envs)
         ]
+
+    @property
+    def timestep_baseline_stats(self) -> dict[str, float]:
+        """Diagnostics from the most recent :meth:`get`, ready to hand to the logger."""
+        return self._timestep_baseline_stats
 
     @property
     def num_buffers(self) -> int:
@@ -160,6 +167,11 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
                 data_pre[k].append(v)
         data = {k: torch.cat(v, dim=0) for k, v in data_pre.items()}
 
+        self._timestep_baseline_stats = timestep_baseline_diagnostics(
+            data,
+            num_timesteps=self.buffers[0].max_size,
+            timestep_min_count=self._adv_norm_timestep_min_count,
+        )
         standardize_advantages(
             data,
             standardized_adv_r=self._standardized_adv_r,

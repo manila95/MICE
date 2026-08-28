@@ -288,6 +288,7 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
         self._standardized_adv_c = standardized_adv_c
         self._adv_norm_mode = adv_norm_mode
         self._adv_norm_timestep_min_count = adv_norm_timestep_min_count
+        self._timestep_baseline_stats = {}
         if num_envs < 1:
             raise ValueError('num_envs must be greater than 0.')
         self.buffers = [

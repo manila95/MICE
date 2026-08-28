@@ -389,6 +389,13 @@ class PolicyGradient(BaseAlgo):
                 self._logger.register_key(f'Value/{split}/{stage}/RewardPredTrueCorr')
             self._logger.register_key(f'Value/{split}/RewardTargetTrueCorr')
 
+        # How much of the return-to-go is explained by the episode timestep alone; see
+        # :func:`~omnisafe.common.buffer.onpolicy_buffer.timestep_baseline_diagnostics`.  Logged
+        # in both advantage-normalization modes, so a run can be used to decide whether
+        # ``algo_cfgs.adv_norm_mode='timestep'`` has anything to remove.
+        self._logger.register_key('Value/TimestepBaseline/RewardCorr')
+        self._logger.register_key('Value/TimestepBaseline/CostCorr')
+
         if self._cfgs.algo_cfgs.use_cost:
             # log information about cost critic
             self._logger.register_key('Loss/Loss_cost_critic', delta=True)
@@ -756,6 +763,8 @@ class PolicyGradient(BaseAlgo):
         * :meth:`_sr_capture_pre_update` snapshots ``phi`` / ``psi`` / ``w`` while they are still
           at their pre-update values, which is what the drift metrics are measured against.
         """
+        self._logger.store(self._buf.timestep_baseline_stats)
+
         n_val = getattr(self._cfgs.algo_cfgs, 'n_val_episodes', 0)
         need_slices = self._sr_td_ridge or n_val > 0
         episode_slices = self._buf.get_episode_slices() if need_slices else []

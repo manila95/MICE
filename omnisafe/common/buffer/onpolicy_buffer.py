@@ -22,6 +22,7 @@ from omnisafe.common.buffer.base import BaseBuffer
 from omnisafe.typing import DEVICE_CPU, AdvatageEstimator, OmnisafeSpace
 from omnisafe.utils import distributed
 from omnisafe.utils.math import discount_cumsum
+from omnisafe.utils.sr_diagnostics import correlation
 
 
 ADV_NORM_MODES = ('batch', 'timestep')
@@ -137,6 +138,56 @@ def standardize_advantages(  # pylint: disable=too-many-arguments
         data['adv_r'] = (data['adv_r'] - r_mean) / (r_std + 1e-8)
     if standardized_adv_c:
         data['adv_c'] = data['adv_c'] - c_mean
+
+
+def timestep_baseline_diagnostics(
+    data: dict[str, torch.Tensor],
+    num_timesteps: int,
+    timestep_min_count: int,
+) -> dict[str, float]:
+    r"""How much of the return-to-go is explained by the episode timestep alone.
+
+    For each signal this takes the per-timestep mean of the observed (Monte-Carlo, un-bootstrapped)
+    return-to-go -- the baseline ``adv_norm_mode='timestep'`` subtracts -- and correlates it against
+    the individual returns it is subtracted from.  Its square is the fraction of the return variance
+    that is pure timing: a correlation near 1 means the returns mostly say *when* a transition
+    happened, which is the case ``adv_norm_mode='timestep'`` exists to fix; a correlation near 0
+    means the timestep carries no information and the mode has nothing to remove.
+
+    Computed on the full epoch batch in :meth:`get`, before the train/val split and before any
+    standardization, so it describes the rollout rather than the normalized advantages.  It is
+    computed in both modes -- under ``'batch'`` it measures what is *not* being removed.
+
+    The per-timestep means use the same ``timestep_min_count`` gate as the normalization itself,
+    so the logged number describes the baseline actually in use rather than an idealized one.
+
+    Args:
+        data (dict[str, torch.Tensor]): The epoch batch, as returned by :meth:`get`.
+        num_timesteps (int): One past the largest episode timestep the buffer can hold.
+        timestep_min_count (int): Minimum samples a timestep needs before its own mean is used.
+
+    Returns:
+        Logger keys mapped to Pearson correlations, ``nan`` where the signal is constant (an
+        all-zero cost stream, say) or the batch lacks the fields to compute it.
+    """
+    stats = {
+        'Value/TimestepBaseline/RewardCorr': float('nan'),
+        'Value/TimestepBaseline/CostCorr': float('nan'),
+    }
+    if 'time_step' not in data:
+        return stats
+
+    group_idx = data['time_step'].long().clamp(0, num_timesteps - 1)
+    for key, label in (('discounted_ret', 'Reward'), ('discounted_cost_ret', 'Cost')):
+        if key not in data:
+            continue
+        returns = data[key]
+        mean, std, *_ = distributed.dist_statistics_scalar(returns)
+        timestep_mean, _ = grouped_statistics(
+            returns, group_idx, num_timesteps, timestep_min_count, mean, std,
+        )
+        stats[f'Value/TimestepBaseline/{label}Corr'] = correlation(timestep_mean, returns)
+    return stats
 
 
 class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attributes
@@ -269,6 +320,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self.max_size: int = size
         self._episode_slices: list[tuple[int, int]] = []
         self._last_episode_slices: list[tuple[int, int]] = []
+        self._timestep_baseline_stats: dict[str, float] = {}
 
         _valid = ['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce', 'td_zero', 'td_zero_gae']
         assert self._penalty_coefficient >= 0, 'penalty_coefficient must be non-negative!'
@@ -298,6 +350,11 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
     def standardized_adv_r(self) -> bool:
         """Whether to standardize the advantages of the actor."""
         return self._standardized_adv_r
+
+    @property
+    def timestep_baseline_stats(self) -> dict[str, float]:
+        """Diagnostics from the most recent :meth:`get`, ready to hand to the logger."""
+        return self._timestep_baseline_stats
 
     @property
     def standardized_adv_c(self) -> bool:
@@ -464,6 +521,11 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             data['psi'] = self.data['psi']
             data['discounted_sr'] = self.data['discounted_sr']
 
+        self._timestep_baseline_stats = timestep_baseline_diagnostics(
+            data,
+            num_timesteps=self.max_size,
+            timestep_min_count=self._adv_norm_timestep_min_count,
+        )
         standardize_advantages(
             data,
             standardized_adv_r=self._standardized_adv_r,
