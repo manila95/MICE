@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import torch
 
-from omnisafe.common.buffer.onpolicy_buffer import OnPolicyBuffer
+from omnisafe.common.buffer.onpolicy_buffer import (
+    ADV_NORM_MODES,
+    OnPolicyBuffer,
+    standardize_advantages,
+)
 from omnisafe.typing import DEVICE_CPU, AdvatageEstimator, OmnisafeSpace
-from omnisafe.utils import distributed
 
 
 class VectorOnPolicyBuffer(OnPolicyBuffer):
@@ -70,11 +73,16 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
         sr_dim: int | None = None,
         lam_sr: float = 0.95,
         gamma_sr: float | None = None,
+        adv_norm_mode: str = 'batch',
+        adv_norm_timestep_min_count: int = 4,
     ) -> None:
         """Initialize an instance of :class:`VectorOnPolicyBuffer`."""
         self._num_buffers: int = num_envs
         self._standardized_adv_r: bool = standardized_adv_r
         self._standardized_adv_c: bool = standardized_adv_c
+        assert adv_norm_mode in ADV_NORM_MODES, f'adv_norm_mode must be one of {ADV_NORM_MODES}!'
+        self._adv_norm_mode: str = adv_norm_mode
+        self._adv_norm_timestep_min_count: int = adv_norm_timestep_min_count
 
         if num_envs < 1:
             raise ValueError('num_envs must be greater than 0.')
@@ -152,11 +160,15 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
                 data_pre[k].append(v)
         data = {k: torch.cat(v, dim=0) for k, v in data_pre.items()}
 
-        adv_mean, adv_std, *_ = distributed.dist_statistics_scalar(data['adv_r'])
-        cadv_mean, *_ = distributed.dist_statistics_scalar(data['adv_c'])
-        if self._standardized_adv_r:
-            data['adv_r'] = (data['adv_r'] - adv_mean) / (adv_std + 1e-8)
-        if self._standardized_adv_c:
-            data['adv_c'] = data['adv_c'] - cadv_mean
+        standardize_advantages(
+            data,
+            standardized_adv_r=self._standardized_adv_r,
+            standardized_adv_c=self._standardized_adv_c,
+            adv_norm_mode=self._adv_norm_mode,
+            # every sub-buffer holds one environment's slice of the epoch, so the longest
+            # possible episode -- and hence the timestep range -- is one sub-buffer's size.
+            num_timesteps=self.buffers[0].max_size,
+            timestep_min_count=self._adv_norm_timestep_min_count,
+        )
 
         return data

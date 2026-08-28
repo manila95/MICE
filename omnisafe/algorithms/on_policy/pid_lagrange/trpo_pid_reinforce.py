@@ -92,6 +92,10 @@ class TRPOPIDReinforce(TRPOPID):
             num_envs=self._cfgs.train_cfgs.vector_env_nums,
             device=self._device,
             cost_gamma=getattr(self._cfgs.algo_cfgs, 'cost_gamma', None),
+            adv_norm_mode=getattr(self._cfgs.algo_cfgs, 'adv_norm_mode', 'batch'),
+            adv_norm_timestep_min_count=getattr(
+                self._cfgs.algo_cfgs, 'adv_norm_timestep_min_count', 4,
+            ),
             reinforce_reward=reinforce_reward,
             reinforce_cost=reinforce_cost,
         )

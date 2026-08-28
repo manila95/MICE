@@ -78,6 +78,14 @@ defaults:
     standardized_rew_adv: True
     # standardize cost advantage
     standardized_cost_adv: True
+    # how the advantage standardization statistics are pooled:
+    #   batch    -> one mean/std over the whole epoch (original behaviour)
+    #   timestep -> a separate mean/std per episode timestep, so a return-to-go is normalized
+    #               against the other samples that sat at the same point in an episode
+    adv_norm_mode: batch
+    # adv_norm_mode: timestep only -- timesteps with fewer than this many samples in the epoch
+    # fall back to the whole-batch statistics instead of their own
+    adv_norm_timestep_min_count: 4
     # penalty coefficient
     penalty_coef: 0.0
     # use cost

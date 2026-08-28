@@ -61,6 +61,10 @@ class MICE(CPO):
             no_intrinsic_in_deltas=self._cfgs.algo_cfgs.no_intrinsic_in_deltas,
             cost_gamma=getattr(self._cfgs.algo_cfgs, 'cost_gamma', None),
             cost_advantage_estimator=getattr(self._cfgs.algo_cfgs, 'cost_adv_estimation_method', None),
+            adv_norm_mode=getattr(self._cfgs.algo_cfgs, 'adv_norm_mode', 'batch'),
+            adv_norm_timestep_min_count=getattr(
+                self._cfgs.algo_cfgs, 'adv_norm_timestep_min_count', 4,
+            ),
         )
 
         self._RPNet = utl.RandomProjection(self._env.observation_space.shape[0], self._cfgs.model_cfgs.emb_dim).to(

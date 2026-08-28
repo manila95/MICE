@@ -240,6 +240,10 @@ class PolicyGradient(BaseAlgo):
             sr_dim=self._cfgs.model_cfgs.sr_cfgs.sr_dim if self._sr_td_ridge else None,
             lam_sr=self._cfgs.model_cfgs.sr_cfgs.get('lam_sr', 0.95) if self._sr_td_ridge else 0.95,
             gamma_sr=self._cfgs.model_cfgs.sr_cfgs.get('gamma_sr', None) if self._sr_td_ridge else None,
+            adv_norm_mode=getattr(self._cfgs.algo_cfgs, 'adv_norm_mode', 'batch'),
+            adv_norm_timestep_min_count=getattr(
+                self._cfgs.algo_cfgs, 'adv_norm_timestep_min_count', 4,
+            ),
         )
 
         # Persistent cross-epoch buffer for the read-out regression. The rollout buffer above is

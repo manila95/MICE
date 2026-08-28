@@ -61,6 +61,10 @@ class CPOReinforce(CPO):
             penalty_coefficient=self._cfgs.algo_cfgs.penalty_coef,
             num_envs=self._cfgs.train_cfgs.vector_env_nums,
             device=self._device,
+            adv_norm_mode=getattr(self._cfgs.algo_cfgs, 'adv_norm_mode', 'batch'),
+            adv_norm_timestep_min_count=getattr(
+                self._cfgs.algo_cfgs, 'adv_norm_timestep_min_count', 4,
+            ),
         )
 
     def _update_reward_critic(

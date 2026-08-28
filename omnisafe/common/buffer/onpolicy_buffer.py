@@ -24,6 +24,121 @@ from omnisafe.utils import distributed
 from omnisafe.utils.math import discount_cumsum
 
 
+ADV_NORM_MODES = ('batch', 'timestep')
+
+
+def grouped_statistics(  # pylint: disable=too-many-arguments
+    values: torch.Tensor,
+    group_idx: torch.Tensor,
+    num_groups: int,
+    min_count: int,
+    fallback_mean: torch.Tensor,
+    fallback_std: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    r"""Per-group mean/std of ``values``, broadcast back to one entry per sample.
+
+    Used to normalize advantages against the statistics of their own episode timestep rather
+    than of the whole epoch: ``group_idx`` holds the timestep of each sample and ``num_groups``
+    is one past the largest timestep the buffer can hold.
+
+    Groups holding fewer than ``min_count`` samples fall back to ``fallback_mean`` /
+    ``fallback_std`` (the statistics over the whole batch).  Without that fallback a group of
+    one would normalize its single sample to exactly zero, silently dropping it from the
+    gradient, and a group of two or three would divide by a std estimated from noise.
+
+    Statistics are pooled across MPI processes, so every rank normalizes with the same
+    constants even though each holds a different slice of the batch.
+
+    Args:
+        values (torch.Tensor): The per-sample quantity to compute statistics of, shape ``(N,)``.
+        group_idx (torch.Tensor): Integer group of each sample, shape ``(N,)``, in
+            ``[0, num_groups)``.
+        num_groups (int): Number of groups.
+        min_count (int): Minimum samples a group needs before its own statistics are used.
+        fallback_mean (torch.Tensor): Mean used for groups below ``min_count``.
+        fallback_std (torch.Tensor): Std used for groups below ``min_count``.
+
+    Returns:
+        mean (torch.Tensor): The mean to subtract from each sample, shape ``(N,)``.
+        std (torch.Tensor): The std to divide each sample by, shape ``(N,)``.
+    """
+    device = values.device
+    zeros = torch.zeros(num_groups, dtype=torch.float32, device=device)
+    count = zeros.clone().index_add_(0, group_idx, torch.ones_like(values))
+    total = zeros.clone().index_add_(0, group_idx, values)
+    count = distributed.dist_sum(count).to(device)
+    total = distributed.dist_sum(total).to(device)
+    mean = total / count.clamp(min=1.0)
+
+    # Second pass against the pooled mean rather than the E[x^2] - E[x]^2 shortcut, which
+    # cancels catastrophically for large tightly-clustered returns -- exactly the regime the
+    # early-timestep groups are in when gamma is close to 1.
+    total_sq = zeros.clone().index_add_(0, group_idx, (values - mean[group_idx]) ** 2)
+    total_sq = distributed.dist_sum(total_sq).to(device)
+    # Population std, matching :func:`distributed.dist_statistics_scalar`.
+    std = (total_sq / count.clamp(min=1.0)).sqrt()
+
+    enough = count >= min_count
+    mean = torch.where(enough, mean, fallback_mean.to(device))
+    std = torch.where(enough, std, fallback_std.to(device))
+    return mean[group_idx], std[group_idx]
+
+
+def standardize_advantages(  # pylint: disable=too-many-arguments
+    data: dict[str, torch.Tensor],
+    standardized_adv_r: bool,
+    standardized_adv_c: bool,
+    adv_norm_mode: str,
+    num_timesteps: int,
+    timestep_min_count: int,
+) -> None:
+    r"""Standardize ``adv_r`` / ``adv_c`` in ``data``, in place.
+
+    Two modes, selected by ``adv_norm_mode``:
+
+    - ``'batch'`` (the original behaviour): one mean/std pair for the whole epoch, so
+      :math:`A_r \leftarrow (A_r - \mu) / \sigma` and :math:`A_c \leftarrow A_c - \mu_c`.
+    - ``'timestep'``: the statistics are computed separately for each episode timestep
+      :math:`t`, over every sample in the batch that sits at that timestep, so
+      :math:`A_r[i] \leftarrow (A_r[i] - \mu_{t_i}) / \sigma_{t_i}`.  With an undiscounted-ish
+      :math:`\gamma` the return-to-go shrinks monotonically towards the end of an episode, and
+      batch statistics therefore encode mostly *when* a transition happened rather than how
+      good it was; per-timestep statistics remove that trend and leave only the within-timestep
+      ranking.
+
+    In both modes the cost advantage is only centred, never rescaled -- the convention the
+    Lagrangian algorithms' multiplier is tuned against.
+
+    Args:
+        data (dict[str, torch.Tensor]): Batch to modify, needs ``adv_r``, ``adv_c`` and (for
+            ``'timestep'``) ``time_step``.
+        standardized_adv_r (bool): Whether to standardize the reward advantage at all.
+        standardized_adv_c (bool): Whether to centre the cost advantage at all.
+        adv_norm_mode (str): One of :data:`ADV_NORM_MODES`.
+        num_timesteps (int): One past the largest episode timestep the buffer can hold.
+        timestep_min_count (int): Minimum samples a timestep needs before its own statistics
+            are used instead of the whole-batch ones.
+    """
+    adv_mean, adv_std, *_ = distributed.dist_statistics_scalar(data['adv_r'])
+    cadv_mean, cadv_std, *_ = distributed.dist_statistics_scalar(data['adv_c'])
+
+    if adv_norm_mode == 'timestep':
+        group_idx = data['time_step'].long().clamp_(0, num_timesteps - 1)
+        r_mean, r_std = grouped_statistics(
+            data['adv_r'], group_idx, num_timesteps, timestep_min_count, adv_mean, adv_std,
+        )
+        c_mean, _ = grouped_statistics(
+            data['adv_c'], group_idx, num_timesteps, timestep_min_count, cadv_mean, cadv_std,
+        )
+    else:
+        r_mean, r_std, c_mean = adv_mean, adv_std, cadv_mean
+
+    if standardized_adv_r:
+        data['adv_r'] = (data['adv_r'] - r_mean) / (r_std + 1e-8)
+    if standardized_adv_c:
+        data['adv_c'] = data['adv_c'] - c_mean
+
+
 class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attributes
     """A buffer for storing trajectories experienced by an agent interacting with the environment.
 
@@ -54,6 +169,8 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
     +----------------+---------+---------------+----------------------------------------+
     | logp           | (size,) | torch.float32 | The log probability of the action.     |
     +----------------+---------+---------------+----------------------------------------+
+    | time_step      | (size,) | torch.float32 | The index of the step in its episode.  |
+    +----------------+---------+---------------+----------------------------------------+
 
     In ``td_ridge`` successor-representation mode (``sr_dim`` not ``None``) four more fields hold
     the vector-valued feature stream, all of shape ``(size, sr_dim)``: ``phi`` and ``psi`` are the
@@ -77,6 +194,13 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             Defaults to False.
         device (torch.device, optional): The device to store the data. Defaults to
             ``torch.device('cpu')``.
+        adv_norm_mode (str, optional): How the standardization statistics are pooled --
+            ``'batch'`` for one mean/std over the whole epoch, ``'timestep'`` for a separate
+            mean/std per episode timestep. Defaults to ``'batch'``. See
+            :func:`standardize_advantages`.
+        adv_norm_timestep_min_count (int, optional): With ``adv_norm_mode='timestep'``, the
+            minimum number of samples a timestep needs before its own statistics are used
+            instead of the whole-batch ones. Defaults to 4.
 
     Attributes:
         ptr (int): The pointer of the buffer.
@@ -106,12 +230,17 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         sr_dim: int | None = None,
         lam_sr: float = 0.95,
         gamma_sr: float | None = None,
+        adv_norm_mode: str = 'batch',
+        adv_norm_timestep_min_count: int = 4,
     ) -> None:
         """Initialize an instance of :class:`OnPolicyBuffer`."""
         super().__init__(obs_space, act_space, size, device)
 
         self._standardized_adv_r: bool = standardized_adv_r
         self._standardized_adv_c: bool = standardized_adv_c
+        assert adv_norm_mode in ADV_NORM_MODES, f'adv_norm_mode must be one of {ADV_NORM_MODES}!'
+        self._adv_norm_mode: str = adv_norm_mode
+        self._adv_norm_timestep_min_count: int = adv_norm_timestep_min_count
         self.data['adv_r'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['discounted_ret'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['discounted_cost_ret'] = torch.zeros((size,), dtype=torch.float32, device=device)
@@ -121,6 +250,10 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self.data['value_c'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['target_value_c'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['logp'] = torch.zeros((size,), dtype=torch.float32, device=device)
+        # Index of each transition within its own episode, filled in by :meth:`finish_path`.
+        # Needed by the ``timestep`` advantage-normalization mode, and useful on its own for
+        # any diagnostic that wants to condition on how far into an episode a sample is.
+        self.data['time_step'] = torch.zeros((size,), dtype=torch.float32, device=device)
 
         self._gamma: float = gamma
         self._cost_gamma: float = cost_gamma if cost_gamma is not None else gamma
@@ -223,6 +356,15 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         last_value_r = last_value_r.to(self._device)
         last_value_c = last_value_c.to(self._device)
 
+        # A path always starts at an episode boundary -- the adapter resets every environment at
+        # the start of an epoch and calls :meth:`finish_path` on every termination, timeout and
+        # epoch cut -- so position within the path is the episode timestep.
+        self.data['time_step'][path_slice] = torch.arange(
+            self.ptr - self.path_start_idx,
+            dtype=torch.float32,
+            device=self._device,
+        )
+
         self.data['discounted_ret'][path_slice] = discount_cumsum(
             self.data['reward'][path_slice], self._gamma
         )
@@ -309,6 +451,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             'value_c': self.data['value_c'],
             'adv_c': self.data['adv_c'],
             'target_value_c': self.data['target_value_c'],
+            'time_step': self.data['time_step'],
         }
         if self._sr_dim is not None:
             data['phi'] = self.data['phi']
@@ -321,12 +464,14 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             data['psi'] = self.data['psi']
             data['discounted_sr'] = self.data['discounted_sr']
 
-        adv_mean, adv_std, *_ = distributed.dist_statistics_scalar(data['adv_r'])
-        cadv_mean, *_ = distributed.dist_statistics_scalar(data['adv_c'])
-        if self._standardized_adv_r:
-            data['adv_r'] = (data['adv_r'] - adv_mean) / (adv_std + 1e-8)
-        if self._standardized_adv_c:
-            data['adv_c'] = data['adv_c'] - cadv_mean
+        standardize_advantages(
+            data,
+            standardized_adv_r=self._standardized_adv_r,
+            standardized_adv_c=self._standardized_adv_c,
+            adv_norm_mode=self._adv_norm_mode,
+            num_timesteps=self.max_size,
+            timestep_min_count=self._adv_norm_timestep_min_count,
+        )
 
         return data
 
