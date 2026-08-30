@@ -157,6 +157,25 @@ class AlgoWrapper:
         ):
             # re-launches the current script with workers linked by MPI
             sys.exit()
+        # torch.set_num_threads only caps the *intra-op* thread pool. There's a separate
+        # *inter-op* pool (used e.g. for parallel dispatch across independent parts of a
+        # backward pass) that's never touched anywhere else in this codebase -- it silently
+        # defaults to the machine's core count (confirmed: 32 on a 32-thread box) and stays
+        # that size for the rest of the process's life once any parallel work has run, which is
+        # also why it can only be set once, here, before that happens. With N concurrent
+        # single-process runs sharing a box, that's N x (core count) inter-op threads
+        # potentially contending -- found by a real slowdown that torch_threads alone (e.g.
+        # dropping 2->1) barely improved, discovered via /proc/pressure/cpu showing only
+        # moderate ("some") CPU stall, too mild to explain the wall-clock damage on its own.
+        # Setting it low is only meaningful for the same reason capping torch_threads is: when
+        # multiple whole processes (not just multiple algorithms within one) are going to share
+        # the machine, as opposed to this being the only training run on the box.
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            # Already set (parallel work started before this ran, e.g. via an earlier import) --
+            # nothing to do; not fatal, just means this particular process missed the window.
+            pass
         if self.cfgs.train_cfgs.device == 'cpu':
             torch.set_num_threads(self.cfgs.train_cfgs.torch_threads)
         else:
