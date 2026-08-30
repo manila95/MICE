@@ -98,6 +98,47 @@ defaults:
     test_estimate: True
     # number of full episodes rolled out per calibration eval (see test_estimate above)
     value_eval_episodes: 100
+    # same-layout Monte-Carlo value study (see omnisafe.utils.value_eval.
+    # estimate_true_value_same_state_mc): compares the critic against a genuine MC estimate --
+    # mc_value_study_repeats independent same-seed (same procedurally-generated layout) rollouts
+    # per probe state, rather than estimate_true_value's one-sample-per-state proxy. Off by
+    # default: it is len(mc_value_study_probes) * mc_value_study_repeats extra full episodes on
+    # every eval epoch, on top of test_estimate's own eval_episodes.
+    mc_value_study: False
+    # number of fixed probe states (env reset seeds), held constant for the whole run
+    mc_value_study_probes: 100
+    # independent same-layout rollouts averaged per probe state
+    mc_value_study_repeats: 5
+    # base offset for the probe seeds (probes use seed_offset .. seed_offset+probes-1), chosen
+    # well outside the training seed range so probe layouts never coincide with a training seed
+    mc_value_study_seed_offset: 100000
+    # number of probe rollouts run concurrently (subprocess-parallel vectorized env), instead of
+    # the mc_value_study_probes * mc_value_study_repeats rollouts running one at a time on a
+    # single env -- this was ~80% of wall-clock in the value-function estimation study. Each
+    # probe still gets its own independent reset(seed=X); this only parallelizes across probes,
+    # it does not change what's computed. Set to 1 to fall back to the original sequential
+    # behavior. Pick based on free CPU cores, accounting for train_cfgs.vector_env_nums and
+    # however many other runs share the machine -- e.g. 20 (giving a clean 500/20=25 waves at the
+    # defaults above) on a lightly-loaded 16+-core box.
+    mc_value_study_vector_envs: 20
+    # On-policy intermediate-state value study (see omnisafe.utils.value_eval.
+    # estimate_value_from_snapshots and omnisafe.utils.state_snapshot): the same same-state MC
+    # trick mc_value_study uses for s0, but for states the CURRENT policy actually visits
+    # mid-episode -- captured via an exact simulator-state snapshot/restore (not just a re-seeded
+    # reset, since these states aren't reachable that way), from a dedicated on-policy collection
+    # rollout run fresh every eval epoch. Off by default: like mc_value_study, this adds
+    # meaningful eval-epoch cost (positions * probes * repeats extra partial episodes).
+    intermediate_state_study: False
+    # within-episode step indices to snapshot at (steps elapsed so far in that episode) --
+    # evenly-spaced by default to cover the whole episode timeline, not just its start
+    intermediate_state_study_positions: [100, 300, 500, 700, 900]
+    # on-policy states captured per position, per eval epoch (also sets this env's
+    # num_envs -- one collection rollout produces exactly this many probes per position in a
+    # single pass, no waves needed for collection itself, only for scoring)
+    intermediate_state_study_probes: 20
+    # independent restore-and-rollout repeats averaged per probe state (same role as
+    # mc_value_study_repeats)
+    intermediate_state_study_repeats: 5
   logger_cfgs:
     # use wandb for logging
     use_wandb: True

@@ -296,3 +296,423 @@ def _rollout_and_report(  # pylint: disable=too-many-locals,too-many-statements
         all_c_error, all_true_c_m, all_est_c_m, all_corr_c,
         all_r_error, all_true_r_m, all_est_r_m, all_corr_r,
     )
+
+
+def _find_obs_normalizer(env):
+    """Walk an env's wrapper chain (outermost first) for its ``ObsNormalize`` instance, if any.
+
+    ``Wrapper.__getattr__`` only forwards non-underscore names (see ``omnisafe.envs.core.Wrapper``),
+    so an outer wrapper (``ActionScale``, ``Unsqueeze``, ...) can't reach an inner
+    ``ObsNormalize``'s ``_obs_normalizer`` through attribute delegation alone -- this walks the
+    ``._env`` chain explicitly instead. Returns ``None`` if no ``ObsNormalize`` wrapper is present
+    (``algo_cfgs.obs_normalize=False``), in which case there is nothing to sync.
+    """
+    # Local import: value_eval.py must not import omnisafe.envs.wrapper at module load time (it
+    # would create a circular import, since that module's callers import from here too).
+    from omnisafe.envs.wrapper import ObsNormalize  # noqa: PLC0415
+
+    while True:
+        if isinstance(env, ObsNormalize):
+            return env._obs_normalizer  # noqa: SLF001
+        inner = getattr(env, '_env', None)
+        if inner is None:
+            return None
+        env = inner
+
+
+def sync_obs_normalizer(target_env, source_env) -> None:
+    """Copy ``source_env``'s ``ObsNormalize`` running statistics into ``target_env``'s.
+
+    A no-op if either env has no ``ObsNormalize`` wrapper (``algo_cfgs.obs_normalize=False``).
+    Used to snapshot a dedicated eval-only env's normalizer from the live training env's current
+    statistics before probing with it -- see ``estimate_true_value_same_state_mc``'s
+    ``sync_normalizer_from`` and the on-policy intermediate-state study's collection env, which
+    both need the critic's inputs to be processed exactly as they would be during real training,
+    without the dedicated env's own normalizer (typically built with ``update_stats=False``, see
+    ``omnisafe.envs.wrapper.ObsNormalize``) needing to independently accumulate its own history to
+    get there.
+    """
+    target_norm = _find_obs_normalizer(target_env)
+    source_norm = _find_obs_normalizer(source_env)
+    if target_norm is not None and source_norm is not None:
+        target_norm.load_state_dict(source_norm.state_dict())
+
+
+def estimate_true_value_same_state_mc(
+    agent,
+    env,
+    cfgs,
+    discount_r,
+    discount_c,
+    probe_seeds,
+    mc_repeats=5,
+    epoch=None,
+    sync_normalizer_from=None,
+    max_episode_steps=None,
+    return_raw=False,
+):
+    r"""Compare the critic's V(s0) against a genuine same-layout Monte-Carlo estimate.
+
+    ``estimate_true_value`` above scores the critic against one MC sample per visited state --
+    each state is seen once, under whatever action the current policy happened to sample there,
+    so its "true" return is a single noisy draw, not an estimate with a known variance. This
+    function instead fixes a state (a Safety-Gymnasium *layout*, reproduced exactly by resetting
+    with the same seed -- procedural generation is deterministic in the seed) and re-rolls the
+    current *stochastic* policy out from it ``mc_repeats`` times, so the resulting sample mean is
+    a genuine Monte-Carlo estimate of :math:`V^\pi(s_0)` / :math:`V_c^\pi(s_0)` with a directly
+    measurable sample variance -- the closest thing to an oracle this codebase can produce without
+    an analytic model of the environment.
+
+    ``env`` may be vectorized (``num_envs = N > 1``): the same-layout requirement only constrains
+    *one env instance* per probe (each repeat needs a clean, uninterrupted ``reset(seed=X)`` ->
+    rollout on the *same* underlying env slot), not the whole call to run on a single env. With
+    N > 1, the ``len(probe_seeds) * mc_repeats`` independent rollouts are packed into
+    ``ceil(total / N)`` waves of N concurrent (subprocess-parallel, since
+    ``safety_gymnasium.vector.make`` defaults to ``asynchronous=True``) rollouts instead of
+    running one at a time -- close to an N-x speedup on what was the dominant cost of the whole
+    training loop. Pass a dedicated eval env (see ``sync_normalizer_from``) built via
+    ``omnisafe.envs.core.make(..., num_envs=N)`` with the same wrapper recipe as training
+    (``TimeLimit``/``AutoReset``/``ObsNormalize``/``ActionScale``, plus ``Unsqueeze`` only when
+    N == 1) -- training itself does not need to give up its own vectorization for this.
+
+    Assumes every probe episode reaches ``done`` at exactly ``max_episode_steps`` (uniformly
+    across the whole vectorized batch) -- true for Safety-Gymnasium's Goal/Push/etc. tasks, which
+    only end via the time limit and never terminate early (verified empirically: ``Metrics/EpLen``
+    is exactly ``max_episode_steps`` in every logged epoch of every run in this codebase). This
+    lets the rollout loop below always run for exactly ``max_episode_steps`` steps rather than
+    tracking a per-slot done mask, which keeps the vectorized loop simple; it is checked with an
+    assertion after each wave, so a future environment that terminates early would fail loudly
+    here instead of silently producing wrong (early-terminated-episode-truncated) returns -- such
+    an environment would need a done mask added to freeze each slot's accumulation independently.
+
+    Args:
+        agent: The actor-critic; must expose ``step(obs) -> (action, value_r, value_c, log_prob)``.
+        env: An already-wrapped environment (any ``num_envs >= 1``) to roll the probes out in.
+            May be a dedicated eval env (see ``sync_normalizer_from``) or the training env itself.
+        cfgs: The resolved algorithm config.
+        discount_r (float): Reward discount factor.
+        discount_c (float): Cost discount factor.
+        probe_seeds (list of int): The fixed set of layouts (env reset seeds) to probe. Held
+            constant across calls so the same states are re-evaluated at every eval epoch.
+        mc_repeats (int): Number of independent same-layout rollouts averaged per probe seed.
+            Defaults to 5 -- a deliberately modest budget: this routine is
+            ``len(probe_seeds) * mc_repeats`` full episodes *per call*, so the cost scales
+            directly with this number (before accounting for the ``env.num_envs``-way speedup).
+        epoch (int or None): Current epoch, for logging only.
+        sync_normalizer_from: Optional live env (e.g. the training env) whose ``ObsNormalize``
+            running statistics are copied into ``env``'s ``ObsNormalize`` (via
+            :func:`_find_obs_normalizer` and a ``state_dict`` copy) before probing. A no-op if
+            either env has no ``ObsNormalize`` wrapper (``algo_cfgs.obs_normalize=False``).
+            ``None`` (the default) skips syncing -- appropriate only if ``env`` already *is* the
+            live training env, or normalization is off.
+        max_episode_steps (int or None): Episode horizon to roll every probe out for. Required
+            when ``env.num_envs > 1`` (a vectorized ``AsyncVectorEnv`` has no ``.spec`` to read
+            this off directly -- the caller must supply it, e.g. from a disposable single-env
+            instance). Optional when ``env.num_envs == 1``, where it defaults to
+            ``env.max_episode_steps``.
+        return_raw (bool): If True, also return the per-probe arrays the aggregate stats were
+            computed from (predictions, MC-mean returns, per-repeat variances) -- e.g. for
+            pickling alongside the aggregates for later offline analysis, or for scatter plots
+            (each probe is one point). Defaults to False (the original, stats-dict-only return).
+
+    Returns:
+        A dict of aggregate statistics over the ``len(probe_seeds)`` probes: for each of
+        ``r`` (reward) and ``c`` (cost), ``EstimationError_{r,c}`` (mean of MC estimate minus
+        critic prediction), ``Correlation_{r,c}`` (Pearson correlation between the
+        ``len(probe_seeds)`` critic predictions and MC-mean estimates), and ``MeanVar_{r,c}``
+        (the sample variance of the ``mc_repeats`` returns at each probe, averaged over probes --
+        how noisy the MC "oracle" itself is at this point in training). If ``return_raw``, a
+        ``(stats, raw)`` tuple instead, where ``raw`` is a dict with ``probe_seeds`` and, for each
+        of ``r``/``c``: ``pred`` (critic's V(s) at each probe), ``mc_mean`` (MC-estimated true
+        value at each probe), ``mc_var`` (MC sample variance at each probe) -- all
+        ``len(probe_seeds)``-length lists, in ``probe_seeds`` order.
+    """
+    if sync_normalizer_from is not None:
+        sync_obs_normalizer(env, sync_normalizer_from)
+    device = torch.device(cfgs.train_cfgs.device)
+
+    n_envs = env.num_envs
+    if max_episode_steps is None:
+        assert n_envs == 1, (
+            'max_episode_steps must be passed explicitly when env.num_envs > 1 (a vectorized '
+            'env has no .spec to read it off).'
+        )
+        max_episode_steps = env.max_episode_steps
+    assert max_episode_steps and max_episode_steps > 0
+
+    # Flat task list, mc_repeats consecutive entries per probe seed -- waves below cut across
+    # this list without regard to seed boundaries; the seed-grouping happens afterward, purely
+    # by array-index arithmetic, so it doesn't matter which wave a given repeat lands in.
+    tasks = [seed for seed in probe_seeds for _ in range(mc_repeats)]
+    n_tasks = len(tasks)
+    pred_r_of: list[float | None] = [None] * n_tasks
+    pred_c_of: list[float | None] = [None] * n_tasks
+    ret_r_of: list[float] = [0.0] * n_tasks
+    ret_c_of: list[float] = [0.0] * n_tasks
+
+    n_waves = (n_tasks + n_envs - 1) // n_envs
+    for w in range(n_waves):
+        start = w * n_envs
+        wave_task_idxs = list(range(start, min(start + n_envs, n_tasks)))
+        wave_size = len(wave_task_idxs)
+        wave_seeds = [tasks[i] for i in wave_task_idxs]
+        if wave_size < n_envs:
+            # Last, partial wave: pad with a repeated seed so every env slot still gets a valid
+            # reset -- the padding slots' results are simply never read back out below.
+            wave_seeds += [wave_seeds[0]] * (n_envs - wave_size)
+
+        obs, _ = env.reset(seed=wave_seeds if n_envs > 1 else wave_seeds[0])
+        act, value_r, value_c, _ = agent.step(obs)
+        # V(s0) is deterministic given s0 (no action taken yet), so it only needs computing once
+        # per rollout -- cheap regardless (one batched NN forward pass vs. hundreds of env steps).
+        pred_r_batch = value_r.reshape(-1).detach().cpu().numpy()
+        pred_c_batch = value_c.reshape(-1).detach().cpu().numpy()
+
+        g_r = np.zeros(n_envs, dtype=np.float64)
+        g_c = np.zeros(n_envs, dtype=np.float64)
+        disc_r, disc_c = 1.0, 1.0
+        terminated = truncated = None
+        for t in range(max_episode_steps):
+            obs, r, c, terminated, truncated, _ = env.step(act)
+            g_r += disc_r * r.reshape(-1).detach().cpu().numpy()
+            g_c += disc_c * c.reshape(-1).detach().cpu().numpy()
+            disc_r *= discount_r
+            disc_c *= discount_c
+            if t < max_episode_steps - 1:
+                act, _, _, _ = agent.step(obs)
+        done_at_end = terminated.reshape(-1).bool() | truncated.reshape(-1).bool()
+        if not bool(done_at_end.all()):
+            raise RuntimeError(
+                'estimate_true_value_same_state_mc: not every probe reached done at '
+                f'max_episode_steps={max_episode_steps} (got done={done_at_end.tolist()}). This '
+                'function assumes homogeneous, fixed-length episodes across the vectorized '
+                "batch (see docstring) -- this environment doesn't satisfy that and needs a "
+                'per-slot done mask added instead.',
+            )
+
+        for local_i, task_idx in enumerate(wave_task_idxs):
+            pred_r_of[task_idx] = float(pred_r_batch[local_i])
+            pred_c_of[task_idx] = float(pred_c_batch[local_i])
+            ret_r_of[task_idx] = float(g_r[local_i])
+            ret_c_of[task_idx] = float(g_c[local_i])
+
+    pred_r_list: list[float] = []
+    pred_c_list: list[float] = []
+    mc_mean_r_list: list[float] = []
+    mc_mean_c_list: list[float] = []
+    mc_var_r_list: list[float] = []
+    mc_var_c_list: list[float] = []
+    idx = 0
+    for _seed in probe_seeds:
+        idxs = range(idx, idx + mc_repeats)
+        idx += mc_repeats
+        pred_r_list.append(pred_r_of[idxs[0]])
+        pred_c_list.append(pred_c_of[idxs[0]])
+        returns_r = [ret_r_of[i] for i in idxs]
+        returns_c = [ret_c_of[i] for i in idxs]
+        mc_mean_r_list.append(float(np.mean(returns_r)))
+        mc_mean_c_list.append(float(np.mean(returns_c)))
+        mc_var_r_list.append(float(np.var(returns_r)))
+        mc_var_c_list.append(float(np.var(returns_c)))
+
+    def _t(lst):
+        return torch.tensor(lst, device=device, dtype=torch.float32)
+
+    pred_r_t, pred_c_t = _t(pred_r_list), _t(pred_c_list)
+    mc_mean_r_t, mc_mean_c_t = _t(mc_mean_r_list), _t(mc_mean_c_list)
+
+    def _corr(a, b):
+        if a.numel() < 2 or a.std() <= 0 or b.std() <= 0:
+            return float('nan')
+        return torch.corrcoef(torch.stack([a, b]))[0, 1].item()
+
+    stats = {
+        'MCStudy/EstimationError_r': (mc_mean_r_t - pred_r_t).mean().item(),
+        'MCStudy/EstimationError_c': (mc_mean_c_t - pred_c_t).mean().item(),
+        'MCStudy/Correlation_r': _corr(pred_r_t, mc_mean_r_t),
+        'MCStudy/Correlation_c': _corr(pred_c_t, mc_mean_c_t),
+        'MCStudy/MeanVar_r': float(np.mean(mc_var_r_list)),
+        'MCStudy/MeanVar_c': float(np.mean(mc_var_c_list)),
+        'MCStudy/MeanTrue_r': mc_mean_r_t.mean().item(),
+        'MCStudy/MeanTrue_c': mc_mean_c_t.mean().item(),
+        'MCStudy/MeanPred_r': pred_r_t.mean().item(),
+        'MCStudy/MeanPred_c': pred_c_t.mean().item(),
+        'MCStudy/NumProbes': float(len(probe_seeds)),
+        'MCStudy/MCRepeats': float(mc_repeats),
+    }
+    del epoch  # accepted for call-site symmetry with estimate_true_value; not used here
+    if not return_raw:
+        return stats
+    raw = {
+        'probe_seeds': list(probe_seeds),
+        'r': {'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list},
+        'c': {'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list},
+    }
+    return stats, raw
+
+
+def estimate_value_from_snapshots(
+    agent,
+    env,
+    cfgs,
+    discount_r,
+    discount_c,
+    snapshots,
+    remaining_horizon,
+    mc_repeats=5,
+    epoch=None,
+    return_raw=False,
+):
+    r"""Like :func:`estimate_true_value_same_state_mc`, but for arbitrary on-policy *intermediate*
+    states captured via :mod:`omnisafe.utils.state_snapshot`, instead of states reachable by
+    ``env.reset(seed=X)``. Where the s0 study asks "is the critic accurate at episode starts", this
+    asks the question the critic's accuracy actually needs to answer for TD-learning/GAE/advantages
+    to work: is it accurate at states the *current* policy actually visits mid-episode?
+
+    Structurally almost identical to :func:`estimate_true_value_same_state_mc` -- same
+    wave-batched rollout, same per-probe ``mc_repeats`` averaging, same aggregate stats -- with two
+    differences: probes are restored from pre-captured snapshots
+    (:func:`omnisafe.utils.state_snapshot.restore_and_get_obs`) instead of reset from seeds, and
+    the rollout horizon is ``remaining_horizon`` (however many steps were left in the episode when
+    the snapshot was captured), not the full episode length.
+
+    Args:
+        agent: The actor-critic; must expose ``step(obs) -> (action, value_r, value_c, log_prob)``.
+        env: An already-wrapped, vectorized (``num_envs >= 1``) env to roll the probes out in --
+            same recipe as ``estimate_true_value_same_state_mc``'s ``env`` argument, but there is
+            no ``sync_normalizer_from`` here: normalizer syncing has to happen once, before
+            *capturing* the snapshots (so the on-policy actions that produced them were sampled
+            under realistic normalization), not per scoring call -- see the state-collection call
+            site for where that sync happens.
+        discount_r (float): Reward discount factor.
+        discount_c (float): Cost discount factor.
+        snapshots (list of dict): Pre-captured states (one entry per probe), all from the *same*
+            within-episode step index, so they share a single ``remaining_horizon``.
+        remaining_horizon (int): Steps left in the episode from this snapshot's step index (i.e.
+            ``max_episode_steps - step_index_captured_at``). Every snapshot passed in one call
+            must share this same horizon -- a captured-at-step-300 and a captured-at-step-700
+            probe can't be scored in the same call, since they'd finish at different times.
+        mc_repeats (int): Independent rollouts averaged per probe state.
+        epoch (int or None): Current epoch, for logging only.
+        return_raw (bool): See :func:`estimate_true_value_same_state_mc` -- same meaning, same
+            per-probe ``raw`` dict shape (just no ``probe_seeds`` key, since these probes came
+            from pre-captured snapshots rather than reset seeds).
+
+    Returns:
+        Same shape/semantics as :func:`estimate_true_value_same_state_mc`'s return dict, just
+        without the ``MCStudy/`` key prefix -- callers should apply their own prefix (e.g. tagging
+        which within-episode position these snapshots came from). If ``return_raw``, a
+        ``(stats, raw)`` tuple -- see :func:`estimate_true_value_same_state_mc`'s docstring.
+    """
+    # Local import: mirrors state_snapshot.py's own local import of _find_obs_normalizer from
+    # here -- avoids import-time coupling between the two modules in either direction.
+    from omnisafe.utils.state_snapshot import restore_and_get_obs  # noqa: PLC0415
+
+    device = torch.device(cfgs.train_cfgs.device)
+    n_envs = env.num_envs
+    assert remaining_horizon and remaining_horizon > 0
+
+    # Flat task list, mc_repeats consecutive entries per probe state -- same rationale as
+    # estimate_true_value_same_state_mc's `tasks` list.
+    tasks = [snap for snap in snapshots for _ in range(mc_repeats)]
+    n_tasks = len(tasks)
+    pred_r_of: list[float | None] = [None] * n_tasks
+    pred_c_of: list[float | None] = [None] * n_tasks
+    ret_r_of: list[float] = [0.0] * n_tasks
+    ret_c_of: list[float] = [0.0] * n_tasks
+
+    n_waves = (n_tasks + n_envs - 1) // n_envs
+    for w in range(n_waves):
+        start = w * n_envs
+        wave_task_idxs = list(range(start, min(start + n_envs, n_tasks)))
+        wave_size = len(wave_task_idxs)
+        wave_snaps = [tasks[i] for i in wave_task_idxs]
+        if wave_size < n_envs:
+            # Last, partial wave: pad with a repeated snapshot so every env slot still gets a
+            # valid restore -- the padding slots' results are simply never read back out below.
+            wave_snaps += [wave_snaps[0]] * (n_envs - wave_size)
+
+        obs = restore_and_get_obs(env, wave_snaps, device)
+        act, value_r, value_c, _ = agent.step(obs)
+        pred_r_batch = value_r.reshape(-1).detach().cpu().numpy()
+        pred_c_batch = value_c.reshape(-1).detach().cpu().numpy()
+
+        g_r = np.zeros(n_envs, dtype=np.float64)
+        g_c = np.zeros(n_envs, dtype=np.float64)
+        disc_r, disc_c = 1.0, 1.0
+        terminated = truncated = None
+        for t in range(remaining_horizon):
+            obs, r, c, terminated, truncated, _ = env.step(act)
+            g_r += disc_r * r.reshape(-1).detach().cpu().numpy()
+            g_c += disc_c * c.reshape(-1).detach().cpu().numpy()
+            disc_r *= discount_r
+            disc_c *= discount_c
+            if t < remaining_horizon - 1:
+                act, _, _, _ = agent.step(obs)
+        done_at_end = terminated.reshape(-1).bool() | truncated.reshape(-1).bool()
+        if not bool(done_at_end.all()):
+            raise RuntimeError(
+                'estimate_value_from_snapshots: not every probe reached done after '
+                f'remaining_horizon={remaining_horizon} steps (got done={done_at_end.tolist()}). '
+                'remaining_horizon must be exactly max_episode_steps minus the step index these '
+                'snapshots were captured at.',
+            )
+
+        for local_i, task_idx in enumerate(wave_task_idxs):
+            pred_r_of[task_idx] = float(pred_r_batch[local_i])
+            pred_c_of[task_idx] = float(pred_c_batch[local_i])
+            ret_r_of[task_idx] = float(g_r[local_i])
+            ret_c_of[task_idx] = float(g_c[local_i])
+
+    pred_r_list: list[float] = []
+    pred_c_list: list[float] = []
+    mc_mean_r_list: list[float] = []
+    mc_mean_c_list: list[float] = []
+    mc_var_r_list: list[float] = []
+    mc_var_c_list: list[float] = []
+    idx = 0
+    for _snap in snapshots:
+        idxs = range(idx, idx + mc_repeats)
+        idx += mc_repeats
+        pred_r_list.append(pred_r_of[idxs[0]])
+        pred_c_list.append(pred_c_of[idxs[0]])
+        returns_r = [ret_r_of[i] for i in idxs]
+        returns_c = [ret_c_of[i] for i in idxs]
+        mc_mean_r_list.append(float(np.mean(returns_r)))
+        mc_mean_c_list.append(float(np.mean(returns_c)))
+        mc_var_r_list.append(float(np.var(returns_r)))
+        mc_var_c_list.append(float(np.var(returns_c)))
+
+    def _t(lst):
+        return torch.tensor(lst, device=device, dtype=torch.float32)
+
+    pred_r_t, pred_c_t = _t(pred_r_list), _t(pred_c_list)
+    mc_mean_r_t, mc_mean_c_t = _t(mc_mean_r_list), _t(mc_mean_c_list)
+
+    def _corr(a, b):
+        if a.numel() < 2 or a.std() <= 0 or b.std() <= 0:
+            return float('nan')
+        return torch.corrcoef(torch.stack([a, b]))[0, 1].item()
+
+    stats = {
+        'EstimationError_r': (mc_mean_r_t - pred_r_t).mean().item(),
+        'EstimationError_c': (mc_mean_c_t - pred_c_t).mean().item(),
+        'Correlation_r': _corr(pred_r_t, mc_mean_r_t),
+        'Correlation_c': _corr(pred_c_t, mc_mean_c_t),
+        'MeanVar_r': float(np.mean(mc_var_r_list)),
+        'MeanVar_c': float(np.mean(mc_var_c_list)),
+        'MeanTrue_r': mc_mean_r_t.mean().item(),
+        'MeanTrue_c': mc_mean_c_t.mean().item(),
+        'MeanPred_r': pred_r_t.mean().item(),
+        'MeanPred_c': pred_c_t.mean().item(),
+        'NumProbes': float(len(snapshots)),
+        'MCRepeats': float(mc_repeats),
+    }
+    del epoch  # accepted for call-site symmetry; not used here
+    if not return_raw:
+        return stats
+    raw = {
+        'r': {'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list},
+        'c': {'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list},
+    }
+    return stats, raw
