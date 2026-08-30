@@ -103,8 +103,8 @@ defaults:
     # mc_value_study_repeats independent same-seed (same procedurally-generated layout) rollouts
     # per probe state, rather than estimate_true_value's one-sample-per-state proxy. Off by
     # default: it is len(mc_value_study_probes) * mc_value_study_repeats extra full episodes on
-    # every eval epoch, on top of test_estimate's own eval_episodes.
-    mc_value_study: False
+    # every eval epoch, on top of test_estimate's own eval_episodes. Enabled by default here.
+    mc_value_study: True
     # number of fixed probe states (env reset seeds), held constant for the whole run
     mc_value_study_probes: 100
     # independent same-layout rollouts averaged per probe state
@@ -126,9 +126,9 @@ defaults:
     # trick mc_value_study uses for s0, but for states the CURRENT policy actually visits
     # mid-episode -- captured via an exact simulator-state snapshot/restore (not just a re-seeded
     # reset, since these states aren't reachable that way), from a dedicated on-policy collection
-    # rollout run fresh every eval epoch. Off by default: like mc_value_study, this adds
-    # meaningful eval-epoch cost (positions * probes * repeats extra partial episodes).
-    intermediate_state_study: False
+    # rollout run fresh every eval epoch. Adds meaningful eval-epoch cost (positions * probes *
+    # repeats extra partial episodes), like mc_value_study. Enabled by default here.
+    intermediate_state_study: True
     # within-episode step indices to snapshot at (steps elapsed so far in that episode) --
     # evenly-spaced by default to cover the whole episode timeline, not just its start
     intermediate_state_study_positions: [100, 300, 500, 700, 900]
