@@ -21,7 +21,7 @@ defaults:
     # device to use for training, options: cpu, cuda, cuda:0, cuda:0,1, etc.
     device: cpu
     # number of threads for torch
-    torch_threads: 16
+    torch_threads: 4
     # number of vectorized environments
     vector_env_nums: 1
     # number of parallel agent, similar to a3c
@@ -91,7 +91,7 @@ defaults:
     fvp_sample_freq: 1
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5
-    value_eval_freq: 50
+    value_eval_freq: 25
     # whether to run the full-episode true-vs-estimated value calibration rollout
     # (see omnisafe.utils.value_eval.estimate_true_value)
     test_estimate: True
@@ -105,7 +105,7 @@ defaults:
     # every eval epoch, on top of test_estimate's own eval_episodes. Enabled by default here.
     mc_value_study: True
     # number of fixed probe states (env reset seeds), held constant for the whole run
-    mc_value_study_probes: 100
+    mc_value_study_probes: 17
     # independent same-layout rollouts averaged per probe state
     mc_value_study_repeats: 5
     # base offset for the probe seeds (probes use seed_offset .. seed_offset+probes-1), chosen
@@ -119,7 +119,7 @@ defaults:
     # behavior. Pick based on free CPU cores, accounting for train_cfgs.vector_env_nums and
     # however many other runs share the machine -- e.g. 20 (giving a clean 500/20=25 waves at the
     # defaults above) on a lightly-loaded 16+-core box.
-    mc_value_study_vector_envs: 20
+    mc_value_study_vector_envs: 5
     # On-policy intermediate-state value study (see omnisafe.utils.value_eval.
     # estimate_value_from_snapshots and omnisafe.utils.state_snapshot): the same same-state MC
     # trick mc_value_study uses for s0, but for states the CURRENT policy actually visits
@@ -134,7 +134,7 @@ defaults:
     # on-policy states captured per position, per eval epoch (also sets this env's
     # num_envs -- one collection rollout produces exactly this many probes per position in a
     # single pass, no waves needed for collection itself, only for scoring)
-    intermediate_state_study_probes: 20
+    intermediate_state_study_probes: 17
     # independent restore-and-rollout repeats averaged per probe state (same role as
     # mc_value_study_repeats)
     intermediate_state_study_repeats: 5
