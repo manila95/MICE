@@ -97,3 +97,30 @@ def save_scatter_grid(log_dir: str, epoch: int, series: list[tuple[str, dict]]) 
     fig.savefig(path, dpi=110)
     plt.close(fig)
     return path
+
+
+def log_scatter_to_wandb(png_path: str | None, epoch: int) -> None:
+    """Push a scatter-grid PNG (see :func:`save_scatter_grid`) to the active wandb run, if any.
+
+    ``save_scatter_grid`` only writes to disk -- unlike the numeric eval metrics (``MCStudy/*``,
+    ``IntermediateMC/pos*/*``, ``PooledMC/*``, ...), which reach wandb automatically via
+    ``Logger.store``/``dump_tabular``, nothing pushes these images there on its own. This is a
+    thin, decoupled wrapper (rather than routing through ``Logger``) so callers don't need to
+    reach into ``Logger``'s private ``_use_wandb``/``_maste_proc`` state: ``wandb.run`` is
+    ``None`` on any process that never called ``wandb.init()`` (``use_wandb=False``, or a
+    non-master process under ``train_cfgs.parallel > 1``), which is exactly the set of cases
+    where nothing should be logged, so a no-op naturally follows the same wandb.init gating the
+    numeric metrics already use without needing to duplicate it.
+
+    Args:
+        png_path: Path returned by ``save_scatter_grid`` (``None`` if it had nothing plottable).
+        epoch: Current epoch, used as the wandb step so this lands on the same x-axis position
+            as that epoch's numeric eval metrics.
+    """
+    if png_path is None:
+        return
+    import wandb  # noqa: PLC0415 -- see save_scatter_grid's matplotlib import for why this is local
+
+    if wandb.run is None:
+        return
+    wandb.log({'eval_data/scatter': wandb.Image(png_path)}, step=epoch)

@@ -37,7 +37,7 @@ from omnisafe.envs.core import make as make_env
 from omnisafe.envs.wrapper import ActionScale, AutoReset, ObsNormalize, TimeLimit, Unsqueeze
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
 from omnisafe.utils import clearning, contrastive, distributed, laplacian, sr_diagnostics
-from omnisafe.utils.eval_data_dump import save_eval_data, save_scatter_grid
+from omnisafe.utils.eval_data_dump import log_scatter_to_wandb, save_eval_data, save_scatter_grid
 from omnisafe.utils.state_snapshot import (
     collect_on_policy_snapshots,
     enable_state_snapshots,
@@ -944,7 +944,8 @@ class PolicyGradient(BaseAlgo):
                 if 'pooled' in eval_data_bundle:
                     scatter_series.append(('pooled', eval_data_bundle['pooled']['raw']))
                 if scatter_series:
-                    save_scatter_grid(self._logger.log_dir, epoch, scatter_series)
+                    scatter_path = save_scatter_grid(self._logger.log_dir, epoch, scatter_series)
+                    log_scatter_to_wandb(scatter_path, epoch)
                 self._logger.torch_save()
             self._logger.store({'Time/Rollout': time.time() - rollout_time})
 
