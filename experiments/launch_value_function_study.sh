@@ -45,6 +45,18 @@
 # 3. Total probe budget: 100 states total across ALL 6 categories (s0 + the 5 intermediate
 #    positions), evenly split -- not 100 for each. mc_value_study_probes=17 and
 #    intermediate_state_study_probes=17 (17 x 6 = 102, close enough to 100 for an even split).
+#
+# CAUTION -- torch-threads must be passed as `--torch-threads N`, NOT `--train_cfgs:torch_threads
+# N`: experiments/train_mice.py's own argparse already registers `--torch-threads` (default 4,
+# unrelated to the omnisafe-level train_cfgs config) and passes its whole `vars(args)` as
+# `train_terminal_cfgs`, which AlgoWrapper._init_config() applies AFTER custom_cfgs -- so a
+# `--train_cfgs:torch_threads` custom-cfgs override silently loses to that argparse default of 4.
+# Found by noticing the resolved config actually printed "torch_threads": 4 despite this script
+# passing `--train_cfgs:torch_threads 1`, right as batch 1 (CPO) finished -- meaning batch 1's
+# entire ~7h run happened at torch_threads=4, not the intended 1, which is the real reason the
+# interop-thread fix alone didn't close the isolated-vs-contended gap the earlier investigation
+# expected it to. Batch 1's *data* is unaffected (torch_threads only changes wall-clock speed,
+# not results), so it wasn't rerun; batch 2 (TRPOPID) picked up the corrected flag below.
 set -e
 cd /home/kaustubh/projects/calibration_rl/MICE
 mkdir -p runs_value_study_v2/logs
@@ -62,7 +74,7 @@ launch_one() {
     --cost-limit 10 \
     --seed "${seed}" \
     --device cpu \
-    --train_cfgs:torch_threads 1 \
+    --torch-threads 1 \
     --algo_cfgs:mc_value_study True \
     --algo_cfgs:mc_value_study_probes 17 \
     --algo_cfgs:value_eval_freq 25 \
