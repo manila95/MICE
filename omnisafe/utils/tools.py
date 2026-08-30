@@ -173,14 +173,11 @@ def custom_cfgs_to_dict(key_list: str, value: Any) -> dict[str, Any]:
         value = True
     elif value == 'False':
         value = False
-    elif '.' in value or 'e' in value.lower():
-        try:
-            value = float(value)
-        except ValueError:
-            value = str(value)
-    elif value.isdigit():
-        value = int(value)
     elif value.startswith('[') and value.endswith(']'):
+        # Must run before the float-parsing branch below: a bracketed list of floats (e.g.
+        # "[0.0,1.0]") contains '.', which that branch's substring check would otherwise match
+        # first, fail float("[0.0,1.0]") on, and silently fall back to the raw string -- a real
+        # bug this ordering previously had.
         value = value[1:-1]
         items = []
         for item in value.split(','):
@@ -190,6 +187,13 @@ def custom_cfgs_to_dict(key_list: str, value: Any) -> dict[str, Any]:
             except ValueError:
                 items.append(float(item))
         value = items
+    elif '.' in value or 'e' in value.lower():
+        try:
+            value = float(value)
+        except ValueError:
+            value = str(value)
+    elif value.isdigit():
+        value = int(value)
     else:
         value = str(value)
     keys_split = key_list.replace('-', '_').split(':')

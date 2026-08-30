@@ -239,12 +239,19 @@ class ConstraintActorCritic(ActorCritic):
                     'w_r',
                     model_cfgs.weight_initialization_mode,
                 )
+            # cost_value_clip folds in a prior the ridge solve has no way to know about: a
+            # single-occurrence, discounted cost (cost=terminated, as in plain-Mujoco
+            # environments) is bounded in [0, 1], but psi(s).w is an unconstrained linear
+            # functional -- see SuccessorRepresentationLinearReadout.value_clip's docstring.
+            # None (the default) reproduces the unclamped behavior exactly.
+            cost_value_clip = sr_cfgs.get('cost_value_clip', None)
             self.cost_critic = SuccessorRepresentationLinearReadout(
                 obs_space,
                 act_space,
                 trunk,
                 'w_c',
                 model_cfgs.weight_initialization_mode,
+                value_clip=tuple(cost_value_clip) if cost_value_clip is not None else None,
             )
             self.sr_trunk = trunk
             # The trunk parameters (trunk body + phi_head + psi_head) are trained by the value /

@@ -923,6 +923,20 @@ class SuccessorRepresentationLinearReadout(Critic):
         trunk (TDRidgeSuccessorRepresentationTrunk): The shared phi/psi trunk.
         weight_name (str): Name of the trunk buffer to read out (``'w_r'`` or ``'w_c'``).
         weight_initialization_mode (InitFunction): Weight initialization mode.
+        value_clip (tuple of float, or None): Optional ``(lo, hi)`` bound clamped onto the raw
+            ``psi(s) . w`` output. ``psi . w`` is an unconstrained linear functional with no
+            notion of the target's valid range, so nothing stops it landing far outside one even
+            for a target that has a known bound -- e.g. a discounted, single-occurrence cost
+            (``cost = terminated``, as in plain-Mujoco environments) can never leave
+            ``[0, gamma_c^0] = [0, 1]``, yet the unclamped read-out was measured reaching 5.45 on
+            Ant-v4/CPO early in training (see the SR calibration study). Clamping folds that prior
+            knowledge in directly: every consumer of this critic's output -- the GAE/advantage
+            computation included -- sees a bounded value instead of an occasional wild outlier.
+            Gradient through :func:`torch.clamp` is zero outside the clamped range, so this also
+            stops the value-target MSE loss (the one loss that does reach ``psi`` through this
+            read-out; see the note on ``w`` below) from pushing ``psi`` to make an
+            already-saturating misprediction more extreme. ``None`` (the default) reproduces the
+            unclamped behavior exactly. Defaults to ``None``.
     """
 
     def __init__(
@@ -932,6 +946,7 @@ class SuccessorRepresentationLinearReadout(Critic):
         trunk: TDRidgeSuccessorRepresentationTrunk,
         weight_name: str,
         weight_initialization_mode: InitFunction,
+        value_clip: tuple[float, float] | None = None,
     ) -> None:
         """Initialize an instance of :class:`SuccessorRepresentationLinearReadout`."""
         super().__init__(
@@ -945,6 +960,7 @@ class SuccessorRepresentationLinearReadout(Critic):
         )
         self.trunk = trunk
         self._weight_name = weight_name
+        self._value_clip = value_clip
 
     def forward(self, obs: torch.Tensor) -> list[torch.Tensor]:
         """Read out a scalar value as ``psi(s)^T w``, with gradient flowing into ``psi`` only.
@@ -956,6 +972,8 @@ class SuccessorRepresentationLinearReadout(Critic):
         psi = self.trunk.psi(obs)
         weight = getattr(self.trunk, self._weight_name).detach()
         value = (psi * weight).sum(-1)
+        if self._value_clip is not None:
+            value = value.clamp(min=self._value_clip[0], max=self._value_clip[1])
         return [value]
 
 

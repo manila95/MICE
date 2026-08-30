@@ -4,6 +4,8 @@ import sys
 import argparse
 
 import omnisafe
+from omnisafe.algorithms import ALGORITHM2TYPE
+from omnisafe.utils.config import get_default_kwargs_yaml
 from omnisafe.utils.tools import custom_cfgs_to_dict, update_dict
 
 
@@ -301,10 +303,19 @@ if __name__ == '__main__':
     if target_kl is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:target_kl', str(target_kl)))
     if cost_limit is not None:
-        try:
-            update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:cost_limit', str(cost_limit)))
-        except:
-            update_dict(custom_cfgs, custom_cfgs_to_dict('lagrange_cfgs:cost_limit', str(cost_limit)), allow_new_key=True)
+        # cost_limit lives under algo_cfgs for trust-region algorithms (e.g. CPO) but under
+        # lagrange_cfgs for Lagrangian ones (e.g. TRPOPID) -- ask the algorithm's own default
+        # yaml which one it actually has, rather than guessing. The previous try/except here
+        # never worked: update_dict() merges dicts unconditionally and never raises, so the
+        # 'except' branch (which also passed a nonexistent allow_new_key kwarg) was unreachable;
+        # the actual KeyError only surfaced later, at Agent construction, for any algorithm whose
+        # cost_limit isn't under algo_cfgs.
+        algo_type = ALGORITHM2TYPE.get(args.algo, '')
+        default_cfgs = get_default_kwargs_yaml(args.algo, args.env_id, algo_type)
+        cost_limit_block = (
+            'algo_cfgs' if 'cost_limit' in default_cfgs.algo_cfgs.todict() else 'lagrange_cfgs'
+        )
+        update_dict(custom_cfgs, custom_cfgs_to_dict(f'{cost_limit_block}:cost_limit', str(cost_limit)))
     if gamma is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:gamma', str(gamma)))
     if cost_gamma is not None:
