@@ -46,6 +46,7 @@ from omnisafe.utils.value_eval import (
     estimate_true_value,
     estimate_true_value_same_state_mc,
     estimate_value_from_snapshots,
+    pool_correlation_stats,
     sync_obs_normalizer,
 )
 
@@ -607,6 +608,17 @@ class PolicyGradient(BaseAlgo):
                 self._logger.register_key(f'IntermediateMC/pos{pos}/NumProbes')
                 self._logger.register_key(f'IntermediateMC/pos{pos}/MCRepeats')
 
+            # Pooled diversity correlation: s0 (if mc_value_study is also on) plus every
+            # intermediate position, pooled into one correlation -- see
+            # value_eval.pool_correlation_stats's docstring for why this isn't just the per-
+            # position numbers above averaged together.
+            for stream in ('r', 'c'):
+                self._logger.register_key(f'PooledMC/Correlation_{stream}')
+                self._logger.register_key(f'PooledMC/EstimationError_{stream}')
+                self._logger.register_key(f'PooledMC/MeanTrue_{stream}')
+                self._logger.register_key(f'PooledMC/MeanPred_{stream}')
+            self._logger.register_key('PooledMC/NumProbes')
+
         if self._sr_td_ridge:
             # log information about the td_ridge successor-representation critic
             self._logger.register_key('Loss/Loss_sr', delta=True)
@@ -902,6 +914,20 @@ class PolicyGradient(BaseAlgo):
                     eval_data_bundle['intermediate_study'][pos] = {
                         'stats': pos_stats, 'raw': pos_raw,
                     }
+                # Pooled diversity correlation over every state actually evaluated on this
+                # epoch -- s0 (if mc_value_study also ran) plus every intermediate position,
+                # pooled into one set before computing a single correlation. See
+                # value_eval.pool_correlation_stats's docstring for why this is not the same
+                # as averaging the per-category correlations above.
+                pooled_sources = []
+                if 'mc_study' in eval_data_bundle:
+                    pooled_sources.append(eval_data_bundle['mc_study']['raw'])
+                pooled_sources.extend(
+                    pos_data['raw'] for pos_data in eval_data_bundle['intermediate_study'].values()
+                )
+                pooled_stats, pooled_raw = pool_correlation_stats(pooled_sources, prefix='PooledMC/')
+                self._logger.store(pooled_stats)
+                eval_data_bundle['pooled'] = {'stats': pooled_stats, 'raw': pooled_raw}
             # Persist this epoch's eval data (raw + aggregates -- see eval_data_dump.py's
             # docstring for why this needs to exist separately from the online loggers) and save
             # a checkpoint, both on the exact same cadence as the eval blocks above. Note this
@@ -915,6 +941,8 @@ class PolicyGradient(BaseAlgo):
                     scatter_series.append(('s0', eval_data_bundle['mc_study']['raw']))
                 for pos, pos_data in eval_data_bundle.get('intermediate_study', {}).items():
                     scatter_series.append((f'pos{pos}', pos_data['raw']))
+                if 'pooled' in eval_data_bundle:
+                    scatter_series.append(('pooled', eval_data_bundle['pooled']['raw']))
                 if scatter_series:
                     save_scatter_grid(self._logger.log_dir, epoch, scatter_series)
                 self._logger.torch_save()

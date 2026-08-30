@@ -716,3 +716,59 @@ def estimate_value_from_snapshots(
         'c': {'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list},
     }
     return stats, raw
+
+
+def pool_correlation_stats(raw_list: list[dict], prefix: str = '') -> tuple[dict, dict]:
+    """Pool several ``return_raw=True`` dicts into one correlation, as if every probe from every
+    source (e.g. s0 plus every on-policy intermediate position) had been scored together.
+
+    The per-category ``Correlation_r``/``Correlation_c`` that ``estimate_true_value_same_state_mc``
+    and ``estimate_value_from_snapshots`` report are each computed over only their own narrow slice
+    of states (just resets, or just one fixed within-episode position) -- useful for spotting
+    *where* the critic is worse, but neither one answers "how accurate is the critic across the
+    actual diversity of states we evaluate on". This does: it concatenates the raw
+    predicted/MC-true pairs across every source first, then computes one correlation over the
+    pooled set, which is not the same as averaging the per-category correlations (pooling can
+    surface a relationship -- or wash one out -- that no individual narrow slice shows on its own).
+
+    Args:
+        raw_list: The ``raw`` dicts to pool (each has ``'r'``/``'c'`` keys, each with
+            ``'pred'``/``'mc_mean'`` lists of equal length, as returned by
+            ``estimate_true_value_same_state_mc``/``estimate_value_from_snapshots`` with
+            ``return_raw=True``).
+        prefix: Optional key prefix for the returned stats dict (e.g. ``'PooledMC/'``).
+
+    Returns:
+        ``(stats, raw)`` -- ``stats`` has the same key shape as the per-category stats dicts
+        (``Correlation_r/c``, ``EstimationError_r/c``, ``MeanTrue_r/c``, ``MeanPred_r/c``,
+        ``NumProbes``), and ``raw`` is the merged ``{'r': {...}, 'c': {...}}`` dict (no
+        ``mc_var``/``probe_seeds`` -- pooling those across heterogeneous sources isn't meaningful),
+        suitable for passing straight into ``eval_data_dump.save_scatter_grid`` as one more series.
+    """
+
+    def _t(lst):
+        return torch.tensor(lst, dtype=torch.float32)
+
+    def _corr(a, b):
+        if a.numel() < 2 or a.std() <= 0 or b.std() <= 0:
+            return float('nan')
+        return torch.corrcoef(torch.stack([a, b]))[0, 1].item()
+
+    stats: dict = {}
+    raw: dict = {}
+    num_probes = None
+    for stream in ('r', 'c'):
+        pred_list: list[float] = []
+        mc_mean_list: list[float] = []
+        for src in raw_list:
+            pred_list.extend(src[stream]['pred'])
+            mc_mean_list.extend(src[stream]['mc_mean'])
+        pred_t, mc_mean_t = _t(pred_list), _t(mc_mean_list)
+        stats[f'{prefix}EstimationError_{stream}'] = (mc_mean_t - pred_t).mean().item()
+        stats[f'{prefix}Correlation_{stream}'] = _corr(pred_t, mc_mean_t)
+        stats[f'{prefix}MeanTrue_{stream}'] = mc_mean_t.mean().item()
+        stats[f'{prefix}MeanPred_{stream}'] = pred_t.mean().item()
+        raw[stream] = {'pred': pred_list, 'mc_mean': mc_mean_list}
+        num_probes = len(pred_list)
+    stats[f'{prefix}NumProbes'] = float(num_probes or 0)
+    return stats, raw
