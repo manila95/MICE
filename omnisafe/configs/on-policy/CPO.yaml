@@ -59,6 +59,17 @@ defaults:
     # critic norm coefficient for the cost critic only; null = reuse critic_norm_coef. Same
     # null-fallback convention as sr_cfgs.ridge_kappa_cost / w_weight_decay_cost.
     critic_norm_coef_cost: ~
+    # critic regression loss: 'mse' (default) or 'huber'. Huber is quadratic near zero, linear
+    # past huber_delta -- makes a handful of large targets (the shape of a sparse cost signal:
+    # mostly 0, rarely large) less able to dominate the gradient than under plain squared error.
+    critic_loss: mse
+    # loss for the cost critic only; null = reuse critic_loss. Same null-fallback convention as
+    # critic_norm_coef_cost above.
+    critic_loss_cost: ~
+    # Huber's quadratic-to-linear transition point (critic_loss: huber only)
+    huber_delta: 1.0
+    # Huber delta for the cost critic only; null = reuse huber_delta.
+    huber_delta_cost: ~
     # reward discount factor
     gamma: 0.99
     # cost discount factor
@@ -203,6 +214,36 @@ defaults:
       activation: tanh
       # learning rate
       lr: 0.001
+      # --- regularization options (all off by default; see build_mlp_network/ActorCritic/
+      # ConstraintActorCritic for how each is wired in). Every "_cost" variant below is null by
+      # default, falling back to the non-"_cost" (reward-side) value -- same null-fallback
+      # convention as critic_norm_coef_cost/ridge_kappa_cost/w_weight_decay_cost, so the cost
+      # critic can be regularized differently from the reward critic it shares no parameters
+      # with, or left to just inherit the reward-side setting.
+      #
+      # dropout probability applied after each hidden layer (never the output layer). The
+      # critic is kept in eval() mode everywhere except its own gradient-update step (see
+      # ActorCritic.__init__/_update_reward_critic), so dropout only ever affects training,
+      # never a value read used for logging/GAE/the MC value studies.
+      dropout: 0.0
+      dropout_cost: ~
+      # LayerNorm between each hidden layer's affine transform and its activation (never the
+      # output layer -- a critic's output is an unconstrained scalar, not an internal
+      # representation feeding another layer).
+      use_layer_norm: False
+      use_layer_norm_cost: ~
+      # spectral-normalize each hidden layer (never the output layer), bounding the hidden
+      # stack's Lipschitz constant -- a regularizer on sensitivity to small input perturbations,
+      # distinct from (and stackable with) weight_decay/critic_norm_coef, which only bound
+      # parameter magnitude.
+      use_spectral_norm: False
+      use_spectral_norm_cost: ~
+      # decoupled weight decay (AdamW), the standard current meaning of "weight decay" -- not
+      # the same as critic_norm_coef's L2-added-to-the-loss (equivalent only under plain SGD,
+      # not under Adam's adaptive per-parameter scaling; see Loshchilov & Hutter). 0.0 makes
+      # AdamW behave identically to the previous plain Adam, so this is a no-op unless set.
+      weight_decay: 0.0
+      weight_decay_cost: ~
     # whether to use a shared successor-representation value function for reward and cost,
     # instead of two independent critics
     use_successor_representation: False

@@ -75,6 +75,9 @@ def build_mlp_network(
     activation: Activation,
     output_activation: Activation = 'identity',
     weight_initialization_mode: InitFunction = 'kaiming_uniform',
+    dropout: float = 0.0,
+    use_layer_norm: bool = False,
+    use_spectral_norm: bool = False,
 ) -> nn.Module:
     """Build the MLP network.
 
@@ -96,6 +99,27 @@ def build_mlp_network(
             ``identity``.
         weight_initialization_mode (InitFunction, optional): Weight initialization mode. Defaults to
             ``'kaiming_uniform'``.
+        dropout (float, optional): Dropout probability applied after each hidden layer's
+            activation. ``0.0`` (the default) omits the ``nn.Dropout`` module entirely rather
+            than adding a no-op ``p=0`` one, so existing callers/checkpoints are byte-for-byte
+            unaffected unless they opt in. Never applied after the output layer -- regularizing
+            away part of the network's own output distribution (as opposed to its internal
+            representation) is a different, not-requested thing.
+        use_layer_norm (bool, optional): If ``True``, insert ``nn.LayerNorm`` between each hidden
+            layer's affine transform and its activation (i.e. pre-activation norm: Linear ->
+            LayerNorm -> activation -> Dropout), standard placement for stabilizing a small MLP's
+            layer input distributions. Not applied to the output layer, for the same reason as
+            ``dropout`` above -- a critic's output is an unconstrained scalar (a value, not an
+            activation feeding another layer), and LayerNorm's mean/variance normalization would
+            work against exactly the free scale that scalar needs to have. Defaults to ``False``.
+        use_spectral_norm (bool, optional): If ``True``, wrap each hidden layer's ``nn.Linear``
+            with spectral normalization (``nn.utils.parametrizations.spectral_norm``), bounding
+            its spectral norm to 1 and so the whole hidden stack's Lipschitz constant -- a
+            regularizer on how sharply the network's internal representation can respond to a
+            small input perturbation, distinct from (and stackable with) weight-decay/L2, which
+            only bounds parameter magnitude, not sensitivity. Not applied to the output layer, so
+            the critic's output scale stays unconstrained, matching ``dropout``/``use_layer_norm``
+            above. Defaults to ``False``.
 
     Returns:
         The MLP network.
@@ -104,8 +128,16 @@ def build_mlp_network(
     output_activation_fn = get_activation(output_activation)
     layers = []
     for j in range(len(sizes) - 1):
-        act_fn = activation_fn if j < len(sizes) - 2 else output_activation_fn
+        is_output_layer = j == len(sizes) - 2
+        act_fn = output_activation_fn if is_output_layer else activation_fn
         affine_layer = nn.Linear(sizes[j], sizes[j + 1])
         initialize_layer(weight_initialization_mode, affine_layer)
-        layers += [affine_layer, act_fn()]
+        if use_spectral_norm and not is_output_layer:
+            affine_layer = nn.utils.parametrizations.spectral_norm(affine_layer)
+        layers.append(affine_layer)
+        if use_layer_norm and not is_output_layer:
+            layers.append(nn.LayerNorm(sizes[j + 1]))
+        layers.append(act_fn())
+        if dropout > 0.0 and not is_output_layer:
+            layers.append(nn.Dropout(p=dropout))
     return nn.Sequential(*layers)

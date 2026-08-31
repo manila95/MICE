@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import itertools
+from typing import Any
 
 import torch
 from torch import optim
@@ -102,6 +103,15 @@ class ConstraintActorCritic(ActorCritic):
             )
 
         if not self._use_sr:
+            # Cost gets its own dropout/layer-norm/spectral-norm/weight-decay, each falling back
+            # to the shared (reward-side) value when null -- same null-fallback convention as
+            # critic_norm_coef_cost / ridge_kappa_cost / w_weight_decay_cost: a sparser,
+            # differently-scaled cost target generally wants different regularization strength
+            # than the dense reward critic it shares no parameters with.
+            def _cost_or_shared(name: str, default: Any) -> Any:
+                cost_val = model_cfgs.critic.get(f'{name}_cost', None)
+                return model_cfgs.critic.get(name, default) if cost_val is None else cost_val
+
             self.cost_critic: Critic = CriticBuilder(
                 obs_space=obs_space,
                 act_space=act_space,
@@ -110,14 +120,21 @@ class ConstraintActorCritic(ActorCritic):
                 weight_initialization_mode=model_cfgs.weight_initialization_mode,
                 num_critics=1,
                 use_obs_encoder=False,
+                dropout=float(_cost_or_shared('dropout', 0.0) or 0.0),
+                use_layer_norm=bool(_cost_or_shared('use_layer_norm', False)),
+                use_spectral_norm=bool(_cost_or_shared('use_spectral_norm', False)),
             ).build_critic('v')
             self.add_module('cost_critic', self.cost_critic)
+            # See ActorCritic.__init__'s matching call for why this defaults to eval() and is
+            # only flipped to train() around _update_cost_critic's own backward/step call.
+            self.cost_critic.eval()
 
             if model_cfgs.critic.lr is not None:
                 self.cost_critic_optimizer: optim.Optimizer
-                self.cost_critic_optimizer = optim.Adam(
+                self.cost_critic_optimizer = optim.AdamW(
                     self.cost_critic.parameters(),
                     lr=model_cfgs.critic.lr,
+                    weight_decay=float(_cost_or_shared('weight_decay', 0.0) or 0.0),
                 )
             return
 

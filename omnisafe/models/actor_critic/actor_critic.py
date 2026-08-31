@@ -84,17 +84,39 @@ class ActorCritic(nn.Module):
             weight_initialization_mode=model_cfgs.weight_initialization_mode,
             num_critics=1,
             use_obs_encoder=False,
+            dropout=float(model_cfgs.critic.get('dropout', 0.0) or 0.0),
+            use_layer_norm=bool(model_cfgs.critic.get('use_layer_norm', False)),
+            use_spectral_norm=bool(model_cfgs.critic.get('use_spectral_norm', False)),
         ).build_critic(critic_type='v')
         self.add_module('actor', self.actor)
         self.add_module('reward_critic', self.reward_critic)
+        # Dropout is the only submodule build_mlp_network can add whose behavior depends on
+        # nn.Module.training (LayerNorm/spectral-norm are both mode-invariant) -- default the
+        # critic to eval() so every *read* of it (rollout GAE, Eval_s0/Eval_all, the MC value
+        # study, the intermediate-state study -- all of which funnel through ActorCritic.step())
+        # gets a deterministic, dropout-off prediction. _update_reward_critic flips it to
+        # train() for just its own backward/step call, then back to eval() immediately after --
+        # dropout only ever fires during that critic's own gradient update, never during a value
+        # read used for logging/GAE/correlation. A no-op when dropout=0.0 (no Dropout module
+        # exists to have a mode at all).
+        self.reward_critic.eval()
 
         if model_cfgs.actor.lr is not None:
             self.actor_optimizer: optim.Optimizer
             self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=model_cfgs.actor.lr)
         if model_cfgs.critic.lr is not None:
-            self.reward_critic_optimizer: optim.Optimizer = optim.Adam(
+            # AdamW rather than Adam: decoupled weight decay (the standard, current meaning of
+            # "weight decay") is only equivalent to Adam's built-in L2-via-gradient weight_decay
+            # under plain SGD, not under Adam's per-parameter adaptive scaling -- see Loshchilov &
+            # Hutter, "Decoupled Weight Decay Regularization". weight_decay=0.0 (the default)
+            # makes AdamW behave identically to Adam, so this is a no-op unless opted into. This
+            # is deliberately a *different* regularizer from algo_cfgs.critic_norm_coef (L2 added
+            # directly to the loss, present since before this change) -- both are available, not
+            # exclusive.
+            self.reward_critic_optimizer: optim.Optimizer = optim.AdamW(
                 self.reward_critic.parameters(),
                 lr=model_cfgs.critic.lr,
+                weight_decay=float(model_cfgs.critic.get('weight_decay', 0.0) or 0.0),
             )
         if model_cfgs.actor.lr is not None:
             self.actor_scheduler: LinearLR | ConstantLR

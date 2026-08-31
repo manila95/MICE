@@ -43,6 +43,12 @@ class CriticBuilder:
         num_critics (int, optional): Number of critics. Defaults to 1.
         use_obs_encoder (bool, optional): Whether to use observation encoder, only used in q critic.
             Defaults to False.
+        dropout (float, optional): Dropout probability for the ``v`` critic's hidden layers
+            (ignored by ``q``). Defaults to ``0.0``.
+        use_layer_norm (bool, optional): Whether to LayerNorm the ``v`` critic's hidden layers
+            (ignored by ``q``). Defaults to ``False``.
+        use_spectral_norm (bool, optional): Whether to spectral-normalize the ``v`` critic's
+            hidden layers (ignored by ``q``). Defaults to ``False``.
     """
 
     # pylint: disable-next=too-many-arguments
@@ -55,6 +61,9 @@ class CriticBuilder:
         weight_initialization_mode: InitFunction = 'kaiming_uniform',
         num_critics: int = 1,
         use_obs_encoder: bool = False,
+        dropout: float = 0.0,
+        use_layer_norm: bool = False,
+        use_spectral_norm: bool = False,
     ) -> None:
         """Initialize an instance of :class:`CriticBuilder`."""
         self._obs_space: OmnisafeSpace = obs_space
@@ -64,6 +73,11 @@ class CriticBuilder:
         self._hidden_sizes: list[int] = hidden_sizes
         self._num_critics: int = num_critics
         self._use_obs_encoder: bool = use_obs_encoder
+        # v-critic-only regularization options (see build_mlp_network); QCritic doesn't take
+        # these, so build_critic('q') below never passes them on.
+        self._dropout: float = dropout
+        self._use_layer_norm: bool = use_layer_norm
+        self._use_spectral_norm: bool = use_spectral_norm
 
     def build_critic(
         self,
@@ -101,6 +115,9 @@ class CriticBuilder:
                 activation=self._activation,
                 weight_initialization_mode=self._weight_initialization_mode,
                 num_critics=self._num_critics,
+                dropout=self._dropout,
+                use_layer_norm=self._use_layer_norm,
+                use_spectral_norm=self._use_spectral_norm,
             )
 
         raise NotImplementedError(

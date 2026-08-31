@@ -1810,7 +1810,8 @@ class PolicyGradient(BaseAlgo):
     def _update_reward_critic(self, obs: torch.Tensor, target_value_r: torch.Tensor) -> None:
         r"""Update value network under a double for loop.
 
-        The loss function is ``MSE loss``, which is defined in ``torch.nn.MSELoss``.
+        The loss function is ``MSE`` by default, or ``Huber`` if ``algo_cfgs.critic_loss`` (or
+        the stream-specific ``_cost`` override) is set to ``'huber'`` -- see :meth:`_critic_loss`.
         Specifically, the loss function is defined as:
 
         .. math::
@@ -1828,8 +1829,16 @@ class PolicyGradient(BaseAlgo):
             obs (torch.Tensor): The ``observation`` sampled from buffer.
             target_value_r (torch.Tensor): The ``target_value_r`` sampled from buffer.
         """
+        # See ActorCritic.__init__'s reward_critic.eval() call: the critic defaults to eval()
+        # mode so dropout (if any) never affects a value *read*, and is only made stochastic
+        # for the duration of its own gradient update, right here.
+        self._actor_critic.reward_critic.train()
         self._actor_critic.reward_critic_optimizer.zero_grad()
-        loss = nn.functional.mse_loss(self._actor_critic.reward_critic(obs)[0], target_value_r)
+        loss = self._critic_loss(
+            self._actor_critic.reward_critic(obs)[0],
+            target_value_r,
+            stream='r',
+        )
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             excluded_ids = getattr(self._actor_critic, '_sr_critic_norm_excluded_ids', set())
@@ -1850,13 +1859,15 @@ class PolicyGradient(BaseAlgo):
             )
         distributed.avg_grads(self._actor_critic.reward_critic)
         self._actor_critic.reward_critic_optimizer.step()
+        self._actor_critic.reward_critic.eval()
 
         self._logger.store({'Loss/Loss_reward_critic': loss.mean().item()})
 
     def _update_cost_critic(self, obs: torch.Tensor, target_value_c: torch.Tensor) -> None:
         r"""Update value network under a double for loop.
 
-        The loss function is ``MSE loss``, which is defined in ``torch.nn.MSELoss``.
+        The loss function is ``MSE`` by default, or ``Huber`` if ``algo_cfgs.critic_loss`` (or
+        the stream-specific ``_cost`` override) is set to ``'huber'`` -- see :meth:`_critic_loss`.
         Specifically, the loss function is defined as:
 
         .. math::
@@ -1874,8 +1885,15 @@ class PolicyGradient(BaseAlgo):
             obs (torch.Tensor): The ``observation`` sampled from buffer.
             target_value_c (torch.Tensor): The ``target_value_c`` sampled from buffer.
         """
+        # See ActorCritic.__init__'s reward_critic.eval() call (and ConstraintActorCritic's
+        # matching cost_critic.eval() call) for why this needs to flip to train() only here.
+        self._actor_critic.cost_critic.train()
         self._actor_critic.cost_critic_optimizer.zero_grad()
-        loss = nn.functional.mse_loss(self._actor_critic.cost_critic(obs)[0], target_value_c)
+        loss = self._critic_loss(
+            self._actor_critic.cost_critic(obs)[0],
+            target_value_c,
+            stream='c',
+        )
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             # Cost gets its own coefficient (null falls back to critic_norm_coef), the same
@@ -1903,8 +1921,49 @@ class PolicyGradient(BaseAlgo):
             )
         distributed.avg_grads(self._actor_critic.cost_critic)
         self._actor_critic.cost_critic_optimizer.step()
+        self._actor_critic.cost_critic.eval()
 
         self._logger.store({'Loss/Loss_cost_critic': loss.mean().item()})
+
+    def _critic_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        stream: str,
+    ) -> torch.Tensor:
+        """Compute the reward/cost critic's regression loss: MSE (default) or Huber.
+
+        Huber (``nn.functional.huber_loss``) is quadratic near zero and linear past ``delta``,
+        so a handful of large-magnitude targets -- exactly the shape of a sparse cost signal,
+        where most transitions have cost 0 and a rare few have a large one -- can't dominate the
+        gradient the way they do under plain MSE's squared error. ``algo_cfgs.critic_loss_cost``
+        (and ``huber_delta_cost``) follow the same null-fallback-to-the-reward-side convention as
+        ``critic_norm_coef_cost`` etc., so reward and cost can use different loss functions.
+
+        Args:
+            pred: The critic's prediction for this minibatch.
+            target: The regression target (GAE/GAE-RTG/etc. value target) for this minibatch.
+            stream: ``'r'`` (reward) or ``'c'`` (cost) -- selects which config knobs apply.
+
+        Returns:
+            The scalar loss (before any critic-norm L2 term is added by the caller).
+        """
+        assert stream in ('r', 'c')
+        loss_type = self._cfgs.algo_cfgs.get('critic_loss', 'mse')
+        if stream == 'c':
+            loss_type_cost = self._cfgs.algo_cfgs.get('critic_loss_cost', None)
+            if loss_type_cost is not None:
+                loss_type = loss_type_cost
+        if loss_type == 'mse':
+            return nn.functional.mse_loss(pred, target)
+        if loss_type == 'huber':
+            delta = self._cfgs.algo_cfgs.get('huber_delta', 1.0)
+            if stream == 'c':
+                delta_cost = self._cfgs.algo_cfgs.get('huber_delta_cost', None)
+                if delta_cost is not None:
+                    delta = delta_cost
+            return nn.functional.huber_loss(pred, target, delta=float(delta))
+        raise ValueError(f"algo_cfgs.critic_loss must be 'mse' or 'huber', got {loss_type!r}")
 
     def _ridge_update_successor_weights(self, train_data: dict[str, torch.Tensor]) -> None:
         """Refresh the ``td_ridge`` successor-representation read-out weights.

@@ -39,6 +39,12 @@ class VCritic(Critic):
         weight_initialization_mode (InitFunction, optional): Weight initialization mode. Defaults to
             ``'kaiming_uniform'``.
         num_critics (int, optional): Number of critics. Defaults to 1.
+        dropout (float, optional): Dropout probability after each hidden layer. ``0.0`` (default)
+            adds no dropout module -- see :func:`omnisafe.utils.model.build_mlp_network`.
+        use_layer_norm (bool, optional): Whether to insert LayerNorm after each hidden layer's
+            affine transform. Defaults to ``False``.
+        use_spectral_norm (bool, optional): Whether to spectral-normalize each hidden layer.
+            Defaults to ``False``.
     """
 
     def __init__(
@@ -49,6 +55,9 @@ class VCritic(Critic):
         activation: Activation = 'relu',
         weight_initialization_mode: InitFunction = 'kaiming_uniform',
         num_critics: int = 1,
+        dropout: float = 0.0,
+        use_layer_norm: bool = False,
+        use_spectral_norm: bool = False,
     ) -> None:
         """Initialize an instance of :class:`VCritic`."""
         super().__init__(
@@ -68,6 +77,9 @@ class VCritic(Critic):
                 sizes=[self._obs_dim, *self._hidden_sizes, 1],
                 activation=self._activation,
                 weight_initialization_mode=self._weight_initialization_mode,
+                dropout=dropout,
+                use_layer_norm=use_layer_norm,
+                use_spectral_norm=use_spectral_norm,
             )
             self.net_lst.append(net)
             self.add_module(f'critic_{idx}', net)
