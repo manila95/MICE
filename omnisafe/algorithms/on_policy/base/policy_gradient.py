@@ -2005,6 +2005,14 @@ class PolicyGradient(BaseAlgo):
                 :meth:`_make_train_val_split`), including the ``phi``, ``reward``, and ``cost``
                 fields used for the ridge solve.
         """
+        # Defensive: sr_trunk should already be in eval() mode here by construction (it defaults
+        # to eval() and every gradient-training call site brackets its own train()/eval() around
+        # just its own backward() -- see _update_reward_critic/_update_cost_critic/
+        # _update_successor_features), but this call recomputes phi/psi to build the ridge design
+        # matrix itself, not to train the trunk -- an explicit eval() here doesn't rely on that
+        # invariant holding across future refactors to guarantee the ridge solve never
+        # accidentally fits w_r/w_c against dropout-corrupted features.
+        self._actor_critic.sr_trunk.eval()
         sr_cfgs = self._cfgs.model_cfgs.sr_cfgs
         if self._sr_w_source == 'psi':
             stats = self._actor_critic.sr_trunk.ridge_update_on_return(
@@ -2492,6 +2500,17 @@ class PolicyGradient(BaseAlgo):
             # rather than at the three call sites keeps the check in one place -- NaturalPG and
             # FOCOPS reimplement _update independently and would each need their own otherwise.
             return
+        # See ActorCritic.__init__'s reward_critic.eval() call for the general pattern: sr_trunk
+        # defaults to eval() (see _build_successor_representation_critics), and is only made
+        # stochastic (if sr_cfgs.dropout > 0) for the duration of its own gradient update. This
+        # is a *separate* gradient step on the same trunk from _update_reward_critic/
+        # _update_cost_critic's (those toggle train()/eval() around their own backward() calls
+        # too, on reward_critic/cost_critic -- which, being wrapper objects holding sr_trunk as a
+        # submodule, propagate the mode change into sr_trunk automatically) -- without this
+        # explicit bracket here, sr_trunk would still be sitting in eval() (left there by
+        # whichever critic-update call ran immediately before this one in the same minibatch
+        # loop), so dropout would silently never fire for this loss at all.
+        self._actor_critic.sr_trunk.train()
         self._actor_critic.sr_optimizer.zero_grad()
         psi = self._actor_critic.sr_trunk.psi(obs)
         loss = nn.functional.mse_loss(psi, target_sr)
@@ -2515,6 +2534,7 @@ class PolicyGradient(BaseAlgo):
             )
         distributed.avg_grads(self._actor_critic.sr_trunk)
         self._actor_critic.sr_optimizer.step()
+        self._actor_critic.sr_trunk.eval()
 
         self._logger.store({'Loss/Loss_sr': loss.mean().item()})
 

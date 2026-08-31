@@ -182,6 +182,16 @@ class ConstraintActorCritic(ActorCritic):
         # point of that mode.
         phi_hidden_sizes = list(sr_cfgs.get('phi_hidden_sizes', []) or [])
 
+        # SR-trunk regularization (dropout/LayerNorm/spectral-norm/weight_decay): shared across
+        # both reward and cost since the trunk itself is shared between them (see the class
+        # docstring's cost_only note for the one case where the trunk is cost-exclusive instead --
+        # regularizing it there already only affects cost, with no separate "_cost" knob needed).
+        # Out of scope: the frozen/contrastive/laplacian phi sources (phi_head/phi_net), which
+        # have their own separate training paths and hyperparameter surfaces already.
+        sr_dropout = float(sr_cfgs.get('dropout', 0.0) or 0.0)
+        sr_use_layer_norm = bool(sr_cfgs.get('use_layer_norm', False))
+        sr_use_spectral_norm = bool(sr_cfgs.get('use_spectral_norm', False))
+
         if self._sr_mode == 'shared_trunk':
             trunk = SuccessorRepresentationTrunk(
                 obs_dim=obs_dim,
@@ -189,6 +199,9 @@ class ConstraintActorCritic(ActorCritic):
                 sr_dim=sr_cfgs.sr_dim,
                 activation=sr_cfgs.activation,
                 weight_initialization_mode=model_cfgs.weight_initialization_mode,
+                dropout=sr_dropout,
+                use_layer_norm=sr_use_layer_norm,
+                use_spectral_norm=sr_use_spectral_norm,
             )
             self.reward_critic = SuccessorRepresentationReadout(
                 obs_space,
@@ -233,12 +246,18 @@ class ConstraintActorCritic(ActorCritic):
                 phi_orthogonal_init=sr_cfgs.get('phi_orthogonal_init', False),
                 phi_rff_bandwidth=sr_cfgs.get('phi_rff_bandwidth', 1.0),
                 phi_ensemble_sources=sr_cfgs.get('phi_ensemble_sources', None),
+                dropout=sr_dropout,
+                use_layer_norm=sr_use_layer_norm,
+                use_spectral_norm=sr_use_spectral_norm,
             )
             if self._sr_cost_only:
                 # Reward critic is a plain, independent V critic -- see the class docstring's
                 # "cost_only" note. The trunk still fits w_r each ridge/sgd update (see
                 # PolicyGradient._ridge_update_successor_weights), it just never backs an actual
-                # critic.
+                # critic. Being a genuine standalone VCritic (not part of the SR trunk at all),
+                # it takes the plain model_cfgs.critic.* regularization knobs, same as the
+                # not-self._use_sr path in ActorCritic.__init__ -- not sr_cfgs's, which govern
+                # the trunk/cost side only.
                 self.reward_critic = CriticBuilder(
                     obs_space=obs_space,
                     act_space=act_space,
@@ -247,7 +266,11 @@ class ConstraintActorCritic(ActorCritic):
                     weight_initialization_mode=model_cfgs.weight_initialization_mode,
                     num_critics=1,
                     use_obs_encoder=False,
+                    dropout=float(model_cfgs.critic.get('dropout', 0.0) or 0.0),
+                    use_layer_norm=bool(model_cfgs.critic.get('use_layer_norm', False)),
+                    use_spectral_norm=bool(model_cfgs.critic.get('use_spectral_norm', False)),
                 ).build_critic('v')
+                self.reward_critic.eval()
             else:
                 self.reward_critic = SuccessorRepresentationLinearReadout(
                     obs_space,
@@ -307,19 +330,40 @@ class ConstraintActorCritic(ActorCritic):
         self.add_module('reward_critic', self.reward_critic)
         self.add_module('cost_critic', self.cost_critic)
         self.add_module('sr_trunk', self.sr_trunk)
+        # See ActorCritic.__init__'s reward_critic.eval() call: sr_trunk defaults to eval() so
+        # dropout (if sr_cfgs.dropout > 0) never affects a value read (rollout GAE, Eval_s0/
+        # Eval_all, the MC value study, the intermediate-state study). Calling .eval() on either
+        # readout wrapper recurses into sr_trunk (it's a registered submodule of both), but both
+        # calls are kept for symmetry with the not-self._use_sr path and because in
+        # sr_cfgs.cost_only mode reward_critic is a *different* module (the plain VCritic above,
+        # already eval()'d there) that doesn't touch sr_trunk at all.
+        self.reward_critic.eval()
+        self.cost_critic.eval()
 
         if sr_cfgs.lr is not None:
-            sr_optimizer = optim.Adam(list(trainable_params), lr=sr_cfgs.lr)
+            # AdamW rather than Adam: decoupled weight decay -- see ActorCritic.__init__'s
+            # matching comment. sr_cfgs.weight_decay=0.0 (the default) makes this identical to the
+            # previous plain Adam, a no-op unless set. Shared across reward+cost since the trunk
+            # itself is shared between them (except under cost_only, where the trunk is
+            # cost-exclusive already and reward_critic_optimizer below is a wholly separate
+            # optimizer over the plain reward critic instead).
+            sr_optimizer = optim.AdamW(
+                list(trainable_params),
+                lr=sr_cfgs.lr,
+                weight_decay=float(sr_cfgs.get('weight_decay', 0.0) or 0.0),
+            )
             self.cost_critic_optimizer: optim.Optimizer = sr_optimizer
             self.sr_optimizer: optim.Optimizer = sr_optimizer
             self.reward_critic_optimizer: optim.Optimizer
             if self._sr_cost_only:
                 # Trained the normal way, on the standard critic learning rate -- not sr_cfgs.lr,
-                # which governs the SR trunk/cost-critic optimizer above.
+                # which governs the SR trunk/cost-critic optimizer above. AdamW for the same
+                # decoupled-weight-decay reason as sr_optimizer above.
                 if model_cfgs.critic.lr is not None:
-                    self.reward_critic_optimizer = optim.Adam(
+                    self.reward_critic_optimizer = optim.AdamW(
                         self.reward_critic.parameters(),
                         lr=model_cfgs.critic.lr,
+                        weight_decay=float(model_cfgs.critic.get('weight_decay', 0.0) or 0.0),
                     )
             else:
                 self.reward_critic_optimizer = sr_optimizer

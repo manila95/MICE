@@ -286,6 +286,36 @@ defaults:
       ridge_kappa_cost: ~
       # EMA smoothing coefficient for w_r / w_c across iterations, 1.0 = no smoothing (td_ridge mode only)
       ema_tau: 1.0
+      # --- trunk regularization (dropout/LayerNorm/spectral-norm/weight_decay; all off by
+      # default), applied to the shared trunk body + psi_head (td_ridge) or the trunk's own
+      # feature layer (shared_trunk) -- see SuccessorRepresentationTrunk/
+      # TDRidgeSuccessorRepresentationTrunk and _build_successor_representation_critics. Shared
+      # across reward AND cost since the trunk itself is shared between them (except under
+      # sr_cfgs.cost_only, where the trunk is cost-exclusive already, so these already only
+      # affect cost with no separate "_cost" knob needed -- unlike model_cfgs.critic.dropout_cost
+      # etc, there is no architecturally-coherent way to regularize "cost only" on a trunk both
+      # streams flow through). Out of scope: phi_head/phi_net under the frozen/contrastive/
+      # laplacian phi_source options, which have their own separate training paths already.
+      #
+      # dropout probability, applied to every layer of the regularized networks including their
+      # own last layer (see build_mlp_network's regularize_last_layer) -- unlike a plain critic's
+      # output layer, none of these layers is an unconstrained scalar value; they all just
+      # produce a feature vector consumed downstream (by SuccessorRepresentationReadout's head,
+      # or by the w_r/w_c ridge solve). sr_trunk defaults to eval() everywhere except its own
+      # gradient-update step (_update_reward_critic/_update_cost_critic/
+      # _update_successor_features), so dropout never affects a value read or the ridge solve's
+      # design matrix -- see those methods.
+      dropout: 0.0
+      # LayerNorm between each regularized layer's affine transform and its activation.
+      use_layer_norm: False
+      # spectral-normalize each regularized layer, bounding the trunk's Lipschitz constant.
+      use_spectral_norm: False
+      # decoupled weight decay (AdamW) on the trunk-training optimizer (sr_optimizer). Distinct
+      # from algo_cfgs.critic_norm_coef's existing L2-added-to-the-loss (also applied to the
+      # trunk via _update_reward_critic/_update_cost_critic/_update_successor_features) for the
+      # same coupled-vs-decoupled reason as model_cfgs.critic.weight_decay -- see that comment.
+      # 0.0 (default) makes AdamW behave identically to the previous plain Adam.
+      weight_decay: 0.0
       # read-out weight learning (td_ridge mode): 'ridge' (closed-form each epoch) or 'sgd'
       # (gradient descent over a persistent cross-epoch replay buffer; principled with a frozen
       # phi_source: random / separate). On-policy 'sgd' keeps its own buffer since the rollout
