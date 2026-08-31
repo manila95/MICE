@@ -78,6 +78,7 @@ def build_mlp_network(
     dropout: float = 0.0,
     use_layer_norm: bool = False,
     use_spectral_norm: bool = False,
+    regularize_last_layer: bool = False,
 ) -> nn.Module:
     """Build the MLP network.
 
@@ -120,6 +121,14 @@ def build_mlp_network(
             only bounds parameter magnitude, not sensitivity. Not applied to the output layer, so
             the critic's output scale stays unconstrained, matching ``dropout``/``use_layer_norm``
             above. Defaults to ``False``.
+        regularize_last_layer (bool, optional): If ``True``, ``dropout``/``use_layer_norm``/
+            ``use_spectral_norm`` also apply to the final layer -- for callers where ``sizes[-1]``
+            is *not* an unconstrained scalar output (e.g. a shared feature trunk whose "last
+            layer" is really just its last hidden layer, with separate head(s) doing the actual
+            value projection downstream) but just another internal representation. Leave ``False``
+            (the default) for any network whose own final layer *is* the thing being predicted
+            (a critic's value, a Q-function's Q-value, etc.) -- see the three regularizers' own
+            docstrings above for why that layer stays unregularized.
 
     Returns:
         The MLP network.
@@ -128,8 +137,8 @@ def build_mlp_network(
     output_activation_fn = get_activation(output_activation)
     layers = []
     for j in range(len(sizes) - 1):
-        is_output_layer = j == len(sizes) - 2
-        act_fn = output_activation_fn if is_output_layer else activation_fn
+        is_output_layer = j == len(sizes) - 2 and not regularize_last_layer
+        act_fn = output_activation_fn if j == len(sizes) - 2 else activation_fn
         affine_layer = nn.Linear(sizes[j], sizes[j + 1])
         initialize_layer(weight_initialization_mode, affine_layer)
         if use_spectral_norm and not is_output_layer:

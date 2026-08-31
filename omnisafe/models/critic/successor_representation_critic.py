@@ -144,6 +144,14 @@ class SuccessorRepresentationTrunk(nn.Module):
         sr_dim (int): Dimensionality of the shared feature vector.
         activation (Activation): Activation function.
         weight_initialization_mode (InitFunction): Weight initialization mode.
+        dropout (float): Dropout probability -- see :func:`build_mlp_network`. Applied to every
+            layer including the last: this trunk's own final layer produces the shared feature
+            vector consumed by :class:`SuccessorRepresentationReadout`'s downstream ``head``, not
+            an unconstrained scalar value itself (that final projection is a different, later
+            layer), so it is treated as just another internal representation, not exempted the
+            way a critic's true output layer is.
+        use_layer_norm (bool): See :func:`build_mlp_network`.
+        use_spectral_norm (bool): See :func:`build_mlp_network`.
     """
 
     def __init__(
@@ -153,6 +161,9 @@ class SuccessorRepresentationTrunk(nn.Module):
         sr_dim: int,
         activation: Activation,
         weight_initialization_mode: InitFunction,
+        dropout: float = 0.0,
+        use_layer_norm: bool = False,
+        use_spectral_norm: bool = False,
     ) -> None:
         """Initialize an instance of :class:`SuccessorRepresentationTrunk`."""
         super().__init__()
@@ -160,6 +171,10 @@ class SuccessorRepresentationTrunk(nn.Module):
             sizes=[obs_dim, *hidden_sizes, sr_dim],
             activation=activation,
             weight_initialization_mode=weight_initialization_mode,
+            dropout=dropout,
+            use_layer_norm=use_layer_norm,
+            use_spectral_norm=use_spectral_norm,
+            regularize_last_layer=True,
         )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
@@ -809,6 +824,17 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         phi_orthogonal_init (bool): See :func:`build_frozen_phi`.
         phi_rff_bandwidth (float): See :func:`build_frozen_phi`.
         phi_ensemble_sources (list of str or None): See :func:`build_frozen_phi`.
+        dropout (float): Dropout probability applied to the shared ``trunk`` body and to
+            ``psi_head`` -- see :func:`build_mlp_network`. Not applied to ``phi_head``/``phi_net``
+            (the frozen/contrastive/laplacian phi sources have their own separate training paths
+            and hyperparameter surfaces already -- out of scope here). Both regularized networks
+            use ``regularize_last_layer=True``: neither ``trunk``'s own last layer nor
+            ``psi_head`` (a single ``Linear`` -- every one of its layers *is* "the last layer")
+            is an unconstrained scalar output the way a critic's final layer is; both just
+            produce a shared feature vector that :class:`SuccessorRepresentationLinearReadout`
+            dots with ``w_r``/``w_c`` afterward.
+        use_layer_norm (bool): See :func:`build_mlp_network`.
+        use_spectral_norm (bool): See :func:`build_mlp_network`.
     """
 
     def __init__(
@@ -824,6 +850,9 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         phi_orthogonal_init: bool = False,
         phi_rff_bandwidth: float = 1.0,
         phi_ensemble_sources: list[str] | None = None,
+        dropout: float = 0.0,
+        use_layer_norm: bool = False,
+        use_spectral_norm: bool = False,
     ) -> None:
         """Initialize an instance of :class:`TDRidgeSuccessorRepresentationTrunk`."""
         super().__init__(sr_dim, learnable_readout=learnable_readout)
@@ -834,6 +863,10 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
                 activation=activation,
                 output_activation=activation,
                 weight_initialization_mode=weight_initialization_mode,
+                dropout=dropout,
+                use_layer_norm=use_layer_norm,
+                use_spectral_norm=use_spectral_norm,
+                regularize_last_layer=True,
             )
             if hidden_sizes
             else nn.Identity()
@@ -886,6 +919,10 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
             sizes=[trunk_out, sr_dim],
             activation=activation,
             weight_initialization_mode=weight_initialization_mode,
+            dropout=dropout,
+            use_layer_norm=use_layer_norm,
+            use_spectral_norm=use_spectral_norm,
+            regularize_last_layer=True,
         )
 
     def features(self, obs: torch.Tensor) -> torch.Tensor:
