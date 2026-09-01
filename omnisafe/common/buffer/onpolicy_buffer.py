@@ -21,6 +21,7 @@ import torch
 from omnisafe.common.buffer.base import BaseBuffer
 from omnisafe.typing import DEVICE_CPU, AdvatageEstimator, OmnisafeSpace
 from omnisafe.utils import distributed
+from omnisafe.utils.gae import calculate_adv_and_value_targets
 from omnisafe.utils.math import discount_cumsum
 
 
@@ -393,133 +394,23 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         """  # pylint: disable=line-too-long
         g = gamma if gamma is not None else self._gamma
         estimator = advantage_estimator if advantage_estimator is not None else self._advantage_estimator
-        if estimator == 'gae':
-            # GAE formula: A_t = \sum_{k=0}^{n-1} (lam*gamma)^k delta_{t+k}
-            deltas = rewards[:-1] + g * values[1:] - values[:-1]
-            adv = discount_cumsum(deltas, g * lam)
-            target_value = adv + values[:-1]
-
-        elif estimator == 'gae-rtg':
-            # GAE formula: A_t = \sum_{k=0}^{n-1} (lam*gamma)^k delta_{t+k}
-            deltas = rewards[:-1] + g * values[1:] - values[:-1]
-            adv = discount_cumsum(deltas, g * lam)
-            # compute rewards-to-go, to be targets for the value function update
-            target_value = discount_cumsum(rewards, g)[:-1]
-
-        elif estimator == 'vtrace':
+        action_probs = None
+        if estimator == 'vtrace':
             #  v_s = V(x_s) + \sum^{T-1}_{t=s} \gamma^{t-s}
             #                * \prod_{i=s}^{t-1} c_i
             #                 * \rho_t (r_t + \gamma V(x_{t+1}) - V(x_t))
             path_slice = slice(self.path_start_idx, self.ptr)
             action_probs = self.data['logp'][path_slice].exp()
-            target_value, adv, _ = self._calculate_v_trace(
-                policy_action_probs=action_probs,
-                values=values,
-                rewards=rewards,
-                behavior_action_probs=action_probs,
-                gamma=g,
-                rho_bar=1.0,
-                c_bar=1.0,
-            )
+        # Delegates to the standalone implementation (omnisafe.utils.gae) so this formula has
+        # exactly one copy, shared with the eval value studies' target computation -- see that
+        # module's docstring.
+        return calculate_adv_and_value_targets(
+            values=values,
+            rewards=rewards,
+            lam=lam,
+            gamma=g,
+            advantage_estimator=estimator,
+            action_probs=action_probs,
+            behavior_action_probs=action_probs,
+        )
 
-        elif estimator == 'plain':
-            # A(x, u) = Q(x, u) - V(x) = r(x, u) + gamma V(x+1) - V(x)
-            adv = rewards[:-1] + g * values[1:] - values[:-1]
-            target_value = discount_cumsum(rewards, g)[:-1]
-
-        elif estimator == 'reinforce':
-            # Pure REINFORCE: A_t = G_t (no value baseline subtracted)
-            # G_t is the full bootstrapped discounted return (last_value already appended)
-            returns = discount_cumsum(rewards, g)[:-1]
-            adv = returns
-            target_value = returns
-        
-        elif estimator == "td_zero":
-            # TD(0): A_t = r_t + gamma * V(s_{t+1}) - V(s_t)
-            adv = rewards[:-1] + g * values[1:] - values[:-1]
-            target_value = rewards[:-1] + g * values[1:]
-
-        elif estimator == "td_zero_gae":
-            # TD(0): A_t = r_t + gamma * V(s_{t+1}) - V(s_t)
-            deltas = rewards[:-1] + g * values[1:] - values[:-1]
-            adv = discount_cumsum(deltas, g * lam)
-            target_value = rewards[:-1] + g * values[1:]
-
-        else:
-            raise NotImplementedError
-
-        return adv, target_value
-
-    @staticmethod
-    # pylint: disable-next=too-many-arguments,too-many-locals
-    def _calculate_v_trace(
-        policy_action_probs: torch.Tensor,
-        values: torch.Tensor,  # including bootstrap
-        rewards: torch.Tensor,  # including bootstrap
-        behavior_action_probs: torch.Tensor,
-        gamma: float = 0.99,
-        rho_bar: float = 1.0,
-        c_bar: float = 1.0,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        r"""This function is used to calculate V-trace targets.
-
-        .. math::
-
-            A_t = \sum_{k=0}^{n-1} (\lambda \gamma)^k \delta_{t+k} +
-                (\lambda \gamma)^n \rho_{t+n} (1 - d_{t+n}) (V(x_{t+n}) - b_{t+n})
-
-        Calculate V-trace targets for off-policy actor-critic learning recursively. For more
-        details, please refer to the paper: `Espeholt et al. 2018, IMPALA <https://arxiv.org/abs/1802.01561>`_.
-
-        Args:
-            policy_action_probs (torch.Tensor): Action probabilities of the policy.
-            values (torch.Tensor): The value of states.
-            rewards (torch.Tensor): The reward of states.
-            behavior_action_probs (torch.Tensor): Action probabilities of the behavior policy.
-            gamma (float, optional): The discount factor. Defaults to 0.99.
-            rho_bar (float, optional): The maximum value of importance weights. Defaults to 1.0.
-            c_bar (float, optional): The maximum value of clipped importance weights. Defaults to 1.0.
-
-        Returns:
-            V-trace targets, shape=(batch_size, sequence_length)
-
-        Raises:
-            AssertionError: If the input tensors are scalars.
-            AssertionError: If c_bar is greater than rho_bar.
-        """
-        assert values.ndim in (1, 2), 'Please provide arrays instead of scalars'
-        assert rewards.ndim in (1, 2), 'Please provide arrays instead of scalars'
-        assert policy_action_probs.ndim == 1, 'Please provide arrays instead of scalars'
-        assert behavior_action_probs.ndim == 1, 'Please provide arrays instead of scalars'
-        assert c_bar <= rho_bar, 'c_bar should be less than or equal to rho_bar'
-
-        sequence_length = policy_action_probs.shape[0]
-        # pylint: disable-next=assignment-from-no-return
-        rhos = torch.div(policy_action_probs, behavior_action_probs)
-        clip_rhos = torch.min(
-            rhos,
-            torch.as_tensor(rho_bar),
-        )  # pylint: disable=assignment-from-no-return
-        clip_cs = torch.min(
-            rhos,
-            torch.as_tensor(c_bar),
-        )  # pylint: disable=assignment-from-no-return
-        if values.ndim == 2:
-            # broadcast the per-timestep scalar importance ratio against a (T, D) feature
-            # stream (used for the successor-representation vector target).
-            clip_rhos = clip_rhos.unsqueeze(-1)
-            clip_cs = clip_cs.unsqueeze(-1)
-        v_s = values[:-1].clone()  # copy all values except bootstrap value
-        last_v_s = values[-1]  # bootstrap from last state
-
-        # calculate v_s
-        for index in reversed(range(sequence_length)):
-            delta = clip_rhos[index] * (rewards[index] + gamma * values[index + 1] - values[index])
-            v_s[index] += delta + gamma * clip_cs[index] * (last_v_s - values[index + 1])
-            last_v_s = v_s[index]  # accumulate current v_s for next iteration
-
-        # calculate q_targets
-        v_s_plus_1 = torch.cat((v_s[1:], values[-1:]))
-        policy_advantage = clip_rhos * (rewards[:-1] + gamma * v_s_plus_1 - values[:-1])
-
-        return v_s, policy_advantage, clip_rhos
