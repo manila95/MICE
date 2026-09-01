@@ -93,8 +93,14 @@ defaults:
     early_eval_freq: 5
     value_eval_freq: 25
     # whether to run the full-episode true-vs-estimated value calibration rollout
-    # (see omnisafe.utils.value_eval.estimate_true_value)
-    test_estimate: True
+    # (see omnisafe.utils.value_eval.estimate_true_value). Off by default: it's a one-sample-
+    # per-state proxy (a single fresh rollout per probe, freshly reset each eval epoch) that
+    # mc_value_study/intermediate_state_study superseded with a genuine MC-repeated estimate on
+    # fixed/on-policy probes -- see their own comments below. Running both (the old way and the
+    # new way) was useful for validating the new studies against the old baseline; now that
+    # that's done, this just triples eval-epoch cost (Eval_s0/Eval_all's own eval_episodes
+    # rollouts, on top of the MC studies') for numbers the MC studies already supersede.
+    test_estimate: False
     # number of full episodes rolled out per calibration eval (see test_estimate above)
     value_eval_episodes: 100
     # same-layout Monte-Carlo value study (see omnisafe.utils.value_eval.
