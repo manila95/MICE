@@ -624,6 +624,14 @@ def estimate_true_value_same_state_mc(
     mc_var_c_list: list[float] = []
     target_r_list: list[float] = []
     target_c_list: list[float] = []
+    # Per-repeat raw values (mc_repeats-length list per probe), not just their mean/var --
+    # needed for anything downstream that wants the actual repeat-to-repeat distribution (a
+    # variance-distribution plot, a bootstrap CI, etc.), which mc_mean/mc_var alone can't
+    # reconstruct (they're already a lossy reduction of exactly this).
+    returns_r_list: list[list[float]] = []
+    returns_c_list: list[list[float]] = []
+    target_repeats_r_list: list[list[float]] = []
+    target_repeats_c_list: list[list[float]] = []
     idx = 0
     for _seed in probe_seeds:
         idxs = range(idx, idx + mc_repeats)
@@ -636,11 +644,17 @@ def estimate_true_value_same_state_mc(
         mc_mean_c_list.append(float(np.mean(returns_c)))
         mc_var_r_list.append(float(np.var(returns_r)))
         mc_var_c_list.append(float(np.var(returns_c)))
+        returns_r_list.append(returns_r)
+        returns_c_list.append(returns_c)
         # Averaged across the mc_repeats independent rollouts, same as mc_mean -- the target
         # genuinely varies per repeat (it depends on the realized trajectory, unlike pred which
         # only depends on s0), so this is the same kind of reduction, not a different one.
-        target_r_list.append(float(np.mean([target_r_of[i] for i in idxs])))
-        target_c_list.append(float(np.mean([target_c_of[i] for i in idxs])))
+        targets_r = [target_r_of[i] for i in idxs]
+        targets_c = [target_c_of[i] for i in idxs]
+        target_r_list.append(float(np.mean(targets_r)))
+        target_c_list.append(float(np.mean(targets_c)))
+        target_repeats_r_list.append(targets_r)
+        target_repeats_c_list.append(targets_c)
 
     def _t(lst):
         return torch.tensor(lst, device=device, dtype=torch.float32)
@@ -689,8 +703,18 @@ def estimate_true_value_same_state_mc(
         return stats
     raw = {
         'probe_seeds': list(probe_seeds),
-        'r': {'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list, 'target': target_r_list},
-        'c': {'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list, 'target': target_c_list},
+        'r': {
+            'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list,
+            'target': target_r_list,
+            # Per-repeat raw values (mc_repeats-length list per probe) -- see the comment where
+            # these are collected, above.
+            'returns': returns_r_list, 'target_repeats': target_repeats_r_list,
+        },
+        'c': {
+            'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list,
+            'target': target_c_list,
+            'returns': returns_c_list, 'target_repeats': target_repeats_c_list,
+        },
     }
     return stats, raw
 
@@ -863,6 +887,10 @@ def estimate_value_from_snapshots(
     mc_var_c_list: list[float] = []
     target_r_list: list[float] = []
     target_c_list: list[float] = []
+    returns_r_list: list[list[float]] = []
+    returns_c_list: list[list[float]] = []
+    target_repeats_r_list: list[list[float]] = []
+    target_repeats_c_list: list[list[float]] = []
     idx = 0
     for _snap in snapshots:
         idxs = range(idx, idx + mc_repeats)
@@ -875,8 +903,14 @@ def estimate_value_from_snapshots(
         mc_mean_c_list.append(float(np.mean(returns_c)))
         mc_var_r_list.append(float(np.var(returns_r)))
         mc_var_c_list.append(float(np.var(returns_c)))
-        target_r_list.append(float(np.mean([target_r_of[i] for i in idxs])))
-        target_c_list.append(float(np.mean([target_c_of[i] for i in idxs])))
+        returns_r_list.append(returns_r)
+        returns_c_list.append(returns_c)
+        targets_r = [target_r_of[i] for i in idxs]
+        targets_c = [target_c_of[i] for i in idxs]
+        target_r_list.append(float(np.mean(targets_r)))
+        target_c_list.append(float(np.mean(targets_c)))
+        target_repeats_r_list.append(targets_r)
+        target_repeats_c_list.append(targets_c)
 
     def _t(lst):
         return torch.tensor(lst, device=device, dtype=torch.float32)
@@ -916,8 +950,16 @@ def estimate_value_from_snapshots(
     if not return_raw:
         return stats
     raw = {
-        'r': {'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list, 'target': target_r_list},
-        'c': {'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list, 'target': target_c_list},
+        'r': {
+            'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list,
+            'target': target_r_list,
+            'returns': returns_r_list, 'target_repeats': target_repeats_r_list,
+        },
+        'c': {
+            'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list,
+            'target': target_c_list,
+            'returns': returns_c_list, 'target_repeats': target_repeats_c_list,
+        },
     }
     return stats, raw
 
@@ -965,12 +1007,18 @@ def pool_correlation_stats(raw_list: list[dict], prefix: str = '') -> tuple[dict
         pred_list: list[float] = []
         mc_mean_list: list[float] = []
         target_list: list[float] = []
+        returns_list: list[list[float]] = []
+        target_repeats_list: list[list[float]] = []
         has_target = all('target' in src[stream] for src in raw_list)
+        has_repeats = all('returns' in src[stream] for src in raw_list)
         for src in raw_list:
             pred_list.extend(src[stream]['pred'])
             mc_mean_list.extend(src[stream]['mc_mean'])
             if has_target:
                 target_list.extend(src[stream]['target'])
+            if has_repeats:
+                returns_list.extend(src[stream]['returns'])
+                target_repeats_list.extend(src[stream].get('target_repeats', []))
         pred_t, mc_mean_t = _t(pred_list), _t(mc_mean_list)
         stats[f'{prefix}EstimationError_{stream}'] = (mc_mean_t - pred_t).mean().item()
         stats[f'{prefix}Correlation_{stream}'] = _corr(pred_t, mc_mean_t)
@@ -984,6 +1032,9 @@ def pool_correlation_stats(raw_list: list[dict], prefix: str = '') -> tuple[dict
             stats[f'{prefix}Correlation_pred_target_{stream}'] = _corr(pred_t, target_t)
             stats[f'{prefix}MeanTarget_{stream}'] = target_t.mean().item()
             raw[stream]['target'] = target_list
+        if has_repeats:
+            raw[stream]['returns'] = returns_list
+            raw[stream]['target_repeats'] = target_repeats_list
         num_probes = len(pred_list)
     stats[f'{prefix}NumProbes'] = float(num_probes or 0)
     return stats, raw
