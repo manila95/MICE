@@ -37,6 +37,7 @@ from omnisafe.envs.core import make as make_env
 from omnisafe.envs.wrapper import ActionScale, AutoReset, ObsNormalize, TimeLimit, Unsqueeze
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
 from omnisafe.utils import clearning, contrastive, distributed, laplacian, sr_diagnostics
+from omnisafe.utils.critic_ensemble import GPLBetaAdapter, TOPBanditAdapter
 from omnisafe.utils.eval_data_dump import log_scatter_to_wandb, save_eval_data, save_scatter_grid
 from omnisafe.utils.state_snapshot import (
     collect_on_policy_snapshots,
@@ -104,6 +105,13 @@ class PolicyGradient(BaseAlgo):
     # learn()) so the getattr(self, '_current_epoch', 0) fallback used elsewhere in this class has
     # a real class-level default to fall back to.
     _current_epoch: int = 0
+    # Critic-ensemble bias-correction adaptive state (algo_cfgs.critic_ensemble_method in
+    # ('gpl', 'top') only; None under 'none'/'cdq', which have no adaptive state at all -- see
+    # omnisafe.utils.critic_ensemble and _update_critic_ensemble_beta). One adapter per stream,
+    # since reward and cost adapt independently (same outcome-feedback *mechanism*, opposite
+    # aggregation direction and a different outcome metric -- EpRet vs -EpCost).
+    _ensemble_beta_adapter_r: Any = None
+    _ensemble_beta_adapter_c: Any = None
 
     def _init_env(self) -> None:
         """Initialize the environment.
@@ -619,6 +627,17 @@ class PolicyGradient(BaseAlgo):
                 self._logger.register_key(f'PooledMC/MeanPred_{stream}')
             self._logger.register_key('PooledMC/NumProbes')
 
+        # Critic-ensemble bias correction (CDQ/GPL/TOP -- see omnisafe.utils.critic_ensemble and
+        # _update_critic_ensemble_beta). Only 'gpl'/'top' have an adaptive beta worth logging;
+        # 'cdq' is a fixed min/max with nothing to track, 'none' has no ensemble at all.
+        ensemble_method = str(self._cfgs.model_cfgs.critic.get('ensemble_method', 'none'))
+        if ensemble_method in ('gpl', 'top'):
+            self._logger.register_key('Ensemble/beta_r')
+            self._logger.register_key('Ensemble/beta_c')
+            if ensemble_method == 'top':
+                self._logger.register_key('Ensemble/arm_r')
+                self._logger.register_key('Ensemble/arm_c')
+
         if self._sr_td_ridge:
             # log information about the td_ridge successor-representation critic
             self._logger.register_key('Loss/Loss_sr', delta=True)
@@ -780,6 +799,11 @@ class PolicyGradient(BaseAlgo):
                 buffer=self._buf,
                 logger=self._logger,
             )
+            # Must run after rollout (needs this epoch's just-collected Metrics/EpRet/EpCost as
+            # the adaptation signal) and before _update() (below) so this epoch's critic training
+            # actually uses the freshly-adapted beta -- see _update_critic_ensemble_beta's
+            # docstring. No-op under critic_ensemble_method 'none'/'cdq'.
+            self._update_critic_ensemble_beta()
 
             eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
             early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
@@ -1763,6 +1787,79 @@ class PolicyGradient(BaseAlgo):
                     ylabel='Predicted V_c',
                 )
 
+    def _update_critic_ensemble_beta(self) -> None:
+        """Adapt (``'gpl'``) or select (``'top'``) this epoch's pessimism/conservatism beta.
+
+        A no-op under ``'none'``/``'cdq'`` (no adaptive state to update). Must run after
+        :meth:`_env.rollout` (needs that rollout's ``Metrics/EpRet``/``Metrics/EpCost`` as the
+        outcome signal) and before :meth:`_update` (writes the new beta into
+        ``reward_critic``/``cost_critic``'s ``beta`` buffer so this epoch's critic training uses
+        it) -- see :mod:`omnisafe.utils.critic_ensemble` for why an outcome-driven signal, and
+        why the one-epoch lag (this call's outcome reflects the rollout collected under *last*
+        epoch's beta, not this one) is inherent to this kind of online adaptation, not a bug.
+
+        Reward's outcome is the epoch's mean episode return (higher is better, matching what the
+        policy gradient itself already optimizes for). Cost's is the negative of the epoch's mean
+        episode cost (lower realized cost is a better outcome) -- deliberately not "distance from
+        the cost limit," which would reward hovering exactly at the limit; here, less cost is
+        always credited as better, matching the safety-conservative framing this whole mechanism
+        exists for.
+        """
+        method = str(self._cfgs.model_cfgs.critic.get('ensemble_method', 'none'))
+        if method not in ('gpl', 'top'):
+            return
+        critic_cfgs = self._cfgs.model_cfgs.critic
+        outcome_r = self._logger.get_stats('Metrics/EpRet')[0]
+        outcome_c = -self._logger.get_stats('Metrics/EpCost')[0]
+
+        if method == 'gpl':
+            if self._ensemble_beta_adapter_r is None:
+                self._ensemble_beta_adapter_r = GPLBetaAdapter(
+                    beta_init=float(critic_cfgs.get('beta_init', 0.0) or 0.0),
+                    lr=float(critic_cfgs.get('gpl_beta_lr', 0.05)),
+                    beta_max=float(critic_cfgs.get('gpl_beta_max', 3.0)),
+                )
+                self._ensemble_beta_adapter_c = GPLBetaAdapter(
+                    beta_init=float(critic_cfgs.get('beta_init', 0.0) or 0.0),
+                    lr=float(critic_cfgs.get('gpl_beta_lr', 0.05)),
+                    beta_max=float(critic_cfgs.get('gpl_beta_max', 3.0)),
+                )
+            beta_r = self._ensemble_beta_adapter_r.step(outcome_r)
+            beta_c = self._ensemble_beta_adapter_c.step(outcome_c)
+        else:  # 'top'
+            if self._ensemble_beta_adapter_r is None:
+                beta_grid = list(critic_cfgs.get('top_beta_grid', [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]))
+                total_epochs = int(getattr(self._cfgs.train_cfgs, 'epochs', 300))
+                common = {
+                    'beta_grid': beta_grid,
+                    'bandit_lr': float(critic_cfgs.get('top_bandit_lr', 0.1)),
+                    'temperature': float(critic_cfgs.get('top_temperature', 2.0)),
+                    'temperature_min': float(critic_cfgs.get('top_temperature_min', 0.2)),
+                    'decay_steps': int(critic_cfgs.get('top_decay_steps', 0) or total_epochs),
+                }
+                self._ensemble_beta_adapter_r = TOPBanditAdapter(seed=self._seed, **common)
+                self._ensemble_beta_adapter_c = TOPBanditAdapter(
+                    seed=(self._seed + 1 if isinstance(self._seed, int) else None),
+                    **common,
+                )
+            # Credit the arm selected last epoch with the outcome it produced, *then* pick this
+            # epoch's arm -- select() before update() would credit the wrong (about-to-be-picked)
+            # arm with an outcome it had nothing to do with.
+            self._ensemble_beta_adapter_r.update(outcome_r)
+            self._ensemble_beta_adapter_c.update(outcome_c)
+            beta_r = self._ensemble_beta_adapter_r.select()
+            beta_c = self._ensemble_beta_adapter_c.select()
+            self._logger.store(
+                {
+                    'Ensemble/arm_r': float(self._ensemble_beta_adapter_r.last_arm),
+                    'Ensemble/arm_c': float(self._ensemble_beta_adapter_c.last_arm),
+                },
+            )
+
+        self._actor_critic.reward_critic.beta.fill_(beta_r)
+        self._actor_critic.cost_critic.beta.fill_(beta_c)
+        self._logger.store({'Ensemble/beta_r': beta_r, 'Ensemble/beta_c': beta_c})
+
     def _update_reward_critic(self, obs: torch.Tensor, target_value_r: torch.Tensor) -> None:
         r"""Update value network under a double for loop.
 
@@ -1785,7 +1882,19 @@ class PolicyGradient(BaseAlgo):
             target_value_r (torch.Tensor): The ``target_value_r`` sampled from buffer.
         """
         self._actor_critic.reward_critic_optimizer.zero_grad()
-        loss = nn.functional.mse_loss(self._actor_critic.reward_critic(obs)[0], target_value_r)
+        # Under critic_ensemble_method != 'none', reward_critic(obs)[0] would be the *aggregated*
+        # (pessimistic) prediction -- raw_values() instead gives every ensemble member's own raw
+        # prediction, each trained independently against the same target. The aggregation
+        # (min/mean-beta*std) that produces the pessimistic read happens only at prediction time,
+        # in VCritic.forward(); it must not also gate which member gets gradient here, or the
+        # ensemble members currently *not* selected by the aggregation for a given sample would
+        # never be trained on it -- defeating the point of having independent members at all.
+        loss = torch.stack(
+            [
+                nn.functional.mse_loss(v, target_value_r)
+                for v in self._actor_critic.reward_critic.raw_values(obs)
+            ],
+        ).mean()
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             excluded_ids = getattr(self._actor_critic, '_sr_critic_norm_excluded_ids', set())
@@ -1831,7 +1940,14 @@ class PolicyGradient(BaseAlgo):
             target_value_c (torch.Tensor): The ``target_value_c`` sampled from buffer.
         """
         self._actor_critic.cost_critic_optimizer.zero_grad()
-        loss = nn.functional.mse_loss(self._actor_critic.cost_critic(obs)[0], target_value_c)
+        # See _update_reward_critic's matching comment: raw_values() (every ensemble member's own
+        # raw prediction, each trained independently) not the aggregated conservative read.
+        loss = torch.stack(
+            [
+                nn.functional.mse_loss(v, target_value_c)
+                for v in self._actor_critic.cost_critic.raw_values(obs)
+            ],
+        ).mean()
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             # Cost gets its own coefficient (null falls back to critic_norm_coef), the same

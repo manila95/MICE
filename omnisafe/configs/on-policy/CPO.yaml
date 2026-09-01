@@ -180,6 +180,54 @@ defaults:
       activation: tanh
       # learning rate
       lr: 0.001
+      # --- critic-ensemble bias correction (CDQ/GPL/TOP -- see omnisafe.utils.critic_ensemble).
+      # Off by default ('none' = single critic, byte-for-byte the previous behavior). Shared
+      # between reward and cost, not independently configurable per stream: the whole point of
+      # all three techniques is that the aggregation *direction* flips between them (pessimistic
+      # for reward -- the policy chases high estimates, so overestimation is what gets exploited;
+      # conservative for cost -- the policy chases LOW estimates via the Lagrange penalty/trust
+      # region, so UNDERestimation is what gets exploited, and is the more dangerous direction
+      # since it makes an unsafe action look constraint-satisfying). Setting this per-stream
+      # independently would risk getting that sign backwards.
+      #   'none' (default): single critic.
+      #   'cdq'  : Clipped Double Q-learning (Fujimoto et al. 2018) -- min of the ensemble for
+      #            reward, max for cost. A fixed rule, no adaptive state.
+      #   'gpl'  : Generalized Pessimism Learning (Cetin & Celiktutan 2023), adapted -- a
+      #            continuously-learned beta in mean -/+ beta*std (reward/cost), adapted online by
+      #            a hill-climbing rule driven by the epoch's realized training outcome (not the
+      #            critic's own fit loss -- see GPLBetaAdapter's docstring for why that would
+      #            degenerate to beta=0).
+      #   'top'  : Tactical Optimism/Pessimism (Moskovitz et al. 2021), adapted -- a K-armed
+      #            bandit over a discrete beta grid, selecting by recent outcome track record
+      #            rather than committing to one level (cdq) or learning one continuously (gpl).
+      # NOTE: gpl/top here are faithful-in-spirit *adaptations* to this on-policy V-critic
+      # setting, not literal reproductions of either paper's own (off-policy-specific) update
+      # equations -- see critic_ensemble.py's module docstring before comparing against reported
+      # paper numbers.
+      ensemble_method: none
+      # number of independently-trained critics per stream (ignored under 'none'). 2 is the
+      # standard choice (matches CDQ's "twin" critics); gpl/top can use more.
+      ensemble_size: 2
+      # initial pessimism/conservatism coefficient (gpl/top only; cdq has none, it's a fixed
+      # min/max). 0.0 = start at the plain ensemble mean, no correction, and let the adaptation
+      # rule discover how much is warranted.
+      beta_init: 0.0
+      # GPL step size for the hill-climbing beta update, and the coefficient's upper bound.
+      gpl_beta_lr: 0.05
+      gpl_beta_max: 3.0
+      # TOP's discrete beta candidates (mean +/- beta*std) the bandit selects among each epoch.
+      top_beta_grid: [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]
+      # TOP bandit step size (per-arm running outcome average) and softmax temperature, decaying
+      # from top_temperature down to top_temperature_min over top_decay_steps calls to select() --
+      # see TOPBanditAdapter's docstring: a *fixed* temperature either explores too little (locks
+      # onto a suboptimal arm before the best one is ever sampled enough to reveal itself) or too
+      # much (converges too slowly for the few-hundred-epoch budget on-policy training actually
+      # has, unlike the thousands-of-rounds budgets typical off-policy bandit settings assume).
+      top_bandit_lr: 0.1
+      top_temperature: 2.0
+      top_temperature_min: 0.2
+      # null = use train_cfgs.epochs (the whole run) as the decay horizon.
+      top_decay_steps: ~
     # whether to use a shared successor-representation value function for reward and cost,
     # instead of two independent critics
     use_successor_representation: False

@@ -102,14 +102,25 @@ class ConstraintActorCritic(ActorCritic):
             )
 
         if not self._use_sr:
+            # Same critic-ensemble bias-correction knobs as ActorCritic.reward_critic -- see its
+            # matching comment. stream='c' here is what actually gives the cost critic the
+            # opposite (conservative, not pessimistic) aggregation direction.
+            ensemble_method = str(model_cfgs.critic.get('ensemble_method', 'none'))
+            ensemble_size = (
+                int(model_cfgs.critic.get('ensemble_size', 2)) if ensemble_method != 'none' else 1
+            )
+            beta_init = float(model_cfgs.critic.get('beta_init', 0.0) or 0.0)
             self.cost_critic: Critic = CriticBuilder(
                 obs_space=obs_space,
                 act_space=act_space,
                 hidden_sizes=model_cfgs.critic.hidden_sizes,
                 activation=model_cfgs.critic.activation,
                 weight_initialization_mode=model_cfgs.weight_initialization_mode,
-                num_critics=1,
+                num_critics=ensemble_size,
                 use_obs_encoder=False,
+                ensemble_method=ensemble_method,
+                stream='c',
+                beta_init=beta_init,
             ).build_critic('v')
             self.add_module('cost_critic', self.cost_critic)
 

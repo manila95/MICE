@@ -209,3 +209,19 @@ class Critic(nn.Module, ABC):
             self._act_dim = self._act_space.shape[0]
         else:
             raise NotImplementedError
+
+    def raw_values(self, obs: torch.Tensor) -> list[torch.Tensor]:
+        """Un-aggregated per-critic predictions, for training each independently.
+
+        Default implementation: just ``self.forward(obs)`` -- correct for every critic that
+        either has one member, or otherwise doesn't distinguish "raw" from "aggregated" (nothing
+        aggregates its members). :class:`~omnisafe.models.critic.v_critic.VCritic` overrides this
+        under ``ensemble_method != 'none'`` to return every ensemble member's own raw prediction
+        rather than the pessimistic/conservative aggregate ``forward`` returns in that case -- see
+        its docstring. Having this default here (rather than only on ``VCritic``) means callers
+        like ``PolicyGradient._update_reward_critic``/``_update_cost_critic`` can call
+        ``raw_values`` unconditionally on whatever critic type is active (including the
+        successor-representation readouts, which never have more than one member) without needing
+        to know or check which one it is.
+        """
+        return self.forward(obs)
