@@ -588,6 +588,12 @@ class PolicyGradient(BaseAlgo):
                 self._logger.register_key(f'MCStudy/MeanVar_{stream}')
                 self._logger.register_key(f'MCStudy/MeanTrue_{stream}')
                 self._logger.register_key(f'MCStudy/MeanPred_{stream}')
+                # Decomposes Correlation_{stream} above into target-construction bias vs. pure
+                # critic-fitting quality -- see value_eval._rollout_target's docstring.
+                self._logger.register_key(f'MCStudy/Correlation_target_true_{stream}')
+                self._logger.register_key(f'MCStudy/Correlation_pred_target_{stream}')
+                self._logger.register_key(f'MCStudy/EstimationError_target_true_{stream}')
+                self._logger.register_key(f'MCStudy/MeanTarget_{stream}')
             self._logger.register_key('MCStudy/NumProbes')
             self._logger.register_key('MCStudy/MCRepeats')
 
@@ -605,6 +611,10 @@ class PolicyGradient(BaseAlgo):
                     self._logger.register_key(f'IntermediateMC/pos{pos}/MeanVar_{stream}')
                     self._logger.register_key(f'IntermediateMC/pos{pos}/MeanTrue_{stream}')
                     self._logger.register_key(f'IntermediateMC/pos{pos}/MeanPred_{stream}')
+                    self._logger.register_key(f'IntermediateMC/pos{pos}/Correlation_target_true_{stream}')
+                    self._logger.register_key(f'IntermediateMC/pos{pos}/Correlation_pred_target_{stream}')
+                    self._logger.register_key(f'IntermediateMC/pos{pos}/EstimationError_target_true_{stream}')
+                    self._logger.register_key(f'IntermediateMC/pos{pos}/MeanTarget_{stream}')
                 self._logger.register_key(f'IntermediateMC/pos{pos}/NumProbes')
                 self._logger.register_key(f'IntermediateMC/pos{pos}/MCRepeats')
 
@@ -617,6 +627,10 @@ class PolicyGradient(BaseAlgo):
                 self._logger.register_key(f'PooledMC/EstimationError_{stream}')
                 self._logger.register_key(f'PooledMC/MeanTrue_{stream}')
                 self._logger.register_key(f'PooledMC/MeanPred_{stream}')
+                self._logger.register_key(f'PooledMC/Correlation_target_true_{stream}')
+                self._logger.register_key(f'PooledMC/Correlation_pred_target_{stream}')
+                self._logger.register_key(f'PooledMC/EstimationError_target_true_{stream}')
+                self._logger.register_key(f'PooledMC/MeanTarget_{stream}')
             self._logger.register_key('PooledMC/NumProbes')
 
         if self._sr_td_ridge:

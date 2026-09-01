@@ -8,6 +8,8 @@ import numpy as np
 import torch
 from rich.progress import Progress
 
+from omnisafe.utils.gae import calculate_adv_and_value_targets
+
 
 def estimate_true_value(agent, env, cfgs, discount_r, discount_c, eval_episodes=100, epoch=None):
     """Estimate true V(s) vs. critic estimate by rolling out full episodes.
@@ -338,6 +340,65 @@ def sync_obs_normalizer(target_env, source_env) -> None:
         target_norm.load_state_dict(source_norm.state_dict())
 
 
+def _rollout_target(
+    r_seq,
+    v_seq_incl_boot,
+    terminated,
+    lam,
+    gamma,
+    advantage_estimator,
+    logp_seq=None,
+):
+    r"""The training-style regression target for one already-completed rollout.
+
+    Runs the *exact same* GAE/plain/vtrace/etc. formula (:func:`omnisafe.utils.gae.
+    calculate_adv_and_value_targets`) the training buffer uses on its own on-policy trajectories
+    -- applied here to a probe rollout's own reward/value sequence -- and returns the target at
+    that rollout's own first timestep (index 0), which is the value the current policy/critic
+    combination would actually have been trained to predict for that starting state, had this
+    rollout been part of a training batch.
+
+    Mirrors ``OnPolicyAdapter.rollout``'s bootstrap convention exactly (see
+    ``omnisafe.utils.gae``'s docstring): 0 if the rollout ended in a true terminal, otherwise the
+    critic's own value at the final observation, appended as both the last "value" *and* the last
+    "reward" entry (the latter so rewards-to-go-style targets fold the bootstrap in the same way
+    GAE's ``values[1:]`` does).
+
+    Args:
+        r_seq: ``(T,)`` per-step reward (or cost) sequence for this one rollout.
+        v_seq_incl_boot: ``(T+1,)`` per-step critic values *including* the bootstrap value as the
+            final entry (already zeroed by the caller for terminated rollouts).
+        terminated: Whether this rollout ended in a true terminal (vs. a horizon truncation) --
+            only used to decide whether the appended bootstrap "reward" should be 0 or the
+            bootstrap value itself (it's always the same value already in ``v_seq_incl_boot[-1]``
+            either way, this only controls the pseudo-reward, matching ``finish_path``'s
+            ``rewards = torch.cat([..., last_value_r])`` regardless of terminated/truncated --
+              the bootstrap value is 0 for a true terminal, so the appended pseudo-reward is 0
+              too automatically; kept as an explicit arg for clarity at call sites, not because
+              the formula branches on it).
+        lam: GAE lambda for this stream.
+        gamma: Discount factor for this stream.
+        advantage_estimator: ``algo_cfgs.adv_estimation_method`` / ``cost_adv_estimation_method``.
+        logp_seq: ``(T,)`` log-probabilities, only read under ``advantage_estimator == 'vtrace'``.
+
+    Returns:
+        The scalar target value at this rollout's first timestep.
+    """
+    del terminated  # see docstring -- already folded into v_seq_incl_boot[-1]
+    rewards = torch.cat([r_seq, v_seq_incl_boot[-1:]])
+    action_probs = logp_seq.exp() if advantage_estimator == 'vtrace' else None
+    _, target = calculate_adv_and_value_targets(
+        values=v_seq_incl_boot,
+        rewards=rewards,
+        lam=lam,
+        gamma=gamma,
+        advantage_estimator=advantage_estimator,
+        action_probs=action_probs,
+        behavior_action_probs=action_probs,
+    )
+    return target[0].item()
+
+
 def estimate_true_value_same_state_mc(
     agent,
     env,
@@ -440,6 +501,15 @@ def estimate_true_value_same_state_mc(
         max_episode_steps = env.max_episode_steps
     assert max_episode_steps and max_episode_steps > 0
 
+    # Which advantage estimator/lambda each stream's target should mirror -- the same config
+    # training itself reads (cost null-falls-back to reward's, same convention as
+    # cost_gamma/critic_norm_coef_cost/etc. elsewhere in this codebase).
+    adv_estimator_r = getattr(cfgs.algo_cfgs, 'adv_estimation_method', 'gae')
+    adv_estimator_c = getattr(cfgs.algo_cfgs, 'cost_adv_estimation_method', None) or adv_estimator_r
+    lam_r = getattr(cfgs.algo_cfgs, 'lam', 0.95)
+    lam_c = getattr(cfgs.algo_cfgs, 'lam_c', lam_r)
+    penalty_coef = getattr(cfgs.algo_cfgs, 'penalty_coef', 0.0)
+
     # Flat task list, mc_repeats consecutive entries per probe seed -- waves below cut across
     # this list without regard to seed boundaries; the seed-grouping happens afterward, purely
     # by array-index arithmetic, so it doesn't matter which wave a given repeat lands in.
@@ -449,6 +519,8 @@ def estimate_true_value_same_state_mc(
     pred_c_of: list[float | None] = [None] * n_tasks
     ret_r_of: list[float] = [0.0] * n_tasks
     ret_c_of: list[float] = [0.0] * n_tasks
+    target_r_of: list[float] = [0.0] * n_tasks
+    target_c_of: list[float] = [0.0] * n_tasks
 
     n_waves = (n_tasks + n_envs - 1) // n_envs
     for w in range(n_waves):
@@ -462,11 +534,23 @@ def estimate_true_value_same_state_mc(
             wave_seeds += [wave_seeds[0]] * (n_envs - wave_size)
 
         obs, _ = env.reset(seed=wave_seeds if n_envs > 1 else wave_seeds[0])
-        act, value_r, value_c, _ = agent.step(obs)
+        act, value_r, value_c, log_prob = agent.step(obs)
         # V(s0) is deterministic given s0 (no action taken yet), so it only needs computing once
         # per rollout -- cheap regardless (one batched NN forward pass vs. hundreds of env steps).
         pred_r_batch = value_r.reshape(-1).detach().cpu().numpy()
         pred_c_batch = value_c.reshape(-1).detach().cpu().numpy()
+
+        # Per-step sequences, needed (in addition to the running discounted sum below, which is
+        # all the *true* MC estimate needs) to compute the training-style target after the
+        # rollout -- see _rollout_target. Row max_episode_steps is the bootstrap slot, filled in
+        # after the loop.
+        r_seq = np.zeros((max_episode_steps + 1, n_envs), dtype=np.float64)
+        c_seq = np.zeros((max_episode_steps + 1, n_envs), dtype=np.float64)
+        v_r_seq = np.zeros((max_episode_steps + 1, n_envs), dtype=np.float64)
+        v_c_seq = np.zeros((max_episode_steps + 1, n_envs), dtype=np.float64)
+        logp_seq = np.zeros((max_episode_steps, n_envs), dtype=np.float64)
+        v_r_seq[0] = pred_r_batch
+        v_c_seq[0] = pred_c_batch
 
         g_r = np.zeros(n_envs, dtype=np.float64)
         g_c = np.zeros(n_envs, dtype=np.float64)
@@ -474,12 +558,19 @@ def estimate_true_value_same_state_mc(
         terminated = truncated = None
         for t in range(max_episode_steps):
             obs, r, c, terminated, truncated, _ = env.step(act)
-            g_r += disc_r * r.reshape(-1).detach().cpu().numpy()
-            g_c += disc_c * c.reshape(-1).detach().cpu().numpy()
+            r_np = r.reshape(-1).detach().cpu().numpy()
+            c_np = c.reshape(-1).detach().cpu().numpy()
+            r_seq[t] = r_np
+            c_seq[t] = c_np
+            g_r += disc_r * r_np
+            g_c += disc_c * c_np
             disc_r *= discount_r
             disc_c *= discount_c
             if t < max_episode_steps - 1:
-                act, _, _, _ = agent.step(obs)
+                act, value_r, value_c, log_prob = agent.step(obs)
+                v_r_seq[t + 1] = value_r.reshape(-1).detach().cpu().numpy()
+                v_c_seq[t + 1] = value_c.reshape(-1).detach().cpu().numpy()
+                logp_seq[t] = log_prob.reshape(-1).detach().cpu().numpy()
         done_at_end = terminated.reshape(-1).bool() | truncated.reshape(-1).bool()
         if not bool(done_at_end.all()):
             raise RuntimeError(
@@ -490,11 +581,40 @@ def estimate_true_value_same_state_mc(
                 'per-slot done mask added instead.',
             )
 
+        # Bootstrap value at the final observation -- 0 for a true terminal, the critic's own
+        # prediction there otherwise -- mirroring OnPolicyAdapter.rollout's last_value_r/c
+        # construction exactly (see omnisafe.utils.gae's docstring). Queried for every slot
+        # uniformly (cheap: one more batched forward pass) rather than branching per-env; the
+        # terminated slots' values are simply zeroed out afterward.
+        _, boot_value_r, boot_value_c, _ = agent.step(obs)
+        is_terminated = terminated.reshape(-1).bool().detach().cpu().numpy()
+        boot_r = np.where(is_terminated, 0.0, boot_value_r.reshape(-1).detach().cpu().numpy())
+        boot_c = np.where(is_terminated, 0.0, boot_value_c.reshape(-1).detach().cpu().numpy())
+        v_r_seq[max_episode_steps] = boot_r
+        v_c_seq[max_episode_steps] = boot_c
+
         for local_i, task_idx in enumerate(wave_task_idxs):
             pred_r_of[task_idx] = float(pred_r_batch[local_i])
             pred_c_of[task_idx] = float(pred_c_batch[local_i])
             ret_r_of[task_idx] = float(g_r[local_i])
             ret_c_of[task_idx] = float(g_c[local_i])
+
+            r_this = torch.from_numpy(r_seq[:max_episode_steps, local_i]).float()
+            c_this = torch.from_numpy(c_seq[:max_episode_steps, local_i]).float()
+            v_r_this = torch.from_numpy(v_r_seq[:, local_i]).float()
+            v_c_this = torch.from_numpy(v_c_seq[:, local_i]).float()
+            logp_this = torch.from_numpy(logp_seq[:, local_i]).float()
+            # Mirrors finish_path's `rewards -= penalty_coefficient * costs` -- an intrinsic-cost
+            # penalty folded into the reward stream's target only; a no-op at the (default) 0.0.
+            r_this_penalized = r_this - penalty_coef * c_this
+            target_r_of[task_idx] = _rollout_target(
+                r_this_penalized, v_r_this, bool(is_terminated[local_i]), lam_r, discount_r,
+                adv_estimator_r, logp_seq=logp_this,
+            )
+            target_c_of[task_idx] = _rollout_target(
+                c_this, v_c_this, bool(is_terminated[local_i]), lam_c, discount_c,
+                adv_estimator_c, logp_seq=logp_this,
+            )
 
     pred_r_list: list[float] = []
     pred_c_list: list[float] = []
@@ -502,6 +622,8 @@ def estimate_true_value_same_state_mc(
     mc_mean_c_list: list[float] = []
     mc_var_r_list: list[float] = []
     mc_var_c_list: list[float] = []
+    target_r_list: list[float] = []
+    target_c_list: list[float] = []
     idx = 0
     for _seed in probe_seeds:
         idxs = range(idx, idx + mc_repeats)
@@ -514,12 +636,18 @@ def estimate_true_value_same_state_mc(
         mc_mean_c_list.append(float(np.mean(returns_c)))
         mc_var_r_list.append(float(np.var(returns_r)))
         mc_var_c_list.append(float(np.var(returns_c)))
+        # Averaged across the mc_repeats independent rollouts, same as mc_mean -- the target
+        # genuinely varies per repeat (it depends on the realized trajectory, unlike pred which
+        # only depends on s0), so this is the same kind of reduction, not a different one.
+        target_r_list.append(float(np.mean([target_r_of[i] for i in idxs])))
+        target_c_list.append(float(np.mean([target_c_of[i] for i in idxs])))
 
     def _t(lst):
         return torch.tensor(lst, device=device, dtype=torch.float32)
 
     pred_r_t, pred_c_t = _t(pred_r_list), _t(pred_c_list)
     mc_mean_r_t, mc_mean_c_t = _t(mc_mean_r_list), _t(mc_mean_c_list)
+    target_r_t, target_c_t = _t(target_r_list), _t(target_c_list)
 
     def _corr(a, b):
         if a.numel() < 2 or a.std() <= 0 or b.std() <= 0:
@@ -531,6 +659,22 @@ def estimate_true_value_same_state_mc(
         'MCStudy/EstimationError_c': (mc_mean_c_t - pred_c_t).mean().item(),
         'MCStudy/Correlation_r': _corr(pred_r_t, mc_mean_r_t),
         'MCStudy/Correlation_c': _corr(pred_c_t, mc_mean_c_t),
+        # Decomposes the pred-vs-true correlation above into its two independent failure modes
+        # (mirrors Value/Train/*'s TargetTrueCorr/CriticCorr, applied here to the eval probes
+        # instead of the training buffer's own trajectories -- see PolicyGradient.
+        # _log_critic_diagnostics): is the *target construction itself* (whatever
+        # adv_estimation_method computes) biased relative to the true MC value, independent of how
+        # well the critic fits it (Correlation_target_true); and is the critic actually fitting
+        # what it's trained to fit, independent of whether that target is itself a good proxy for
+        # the truth (Correlation_pred_target).
+        'MCStudy/EstimationError_target_true_r': (mc_mean_r_t - target_r_t).mean().item(),
+        'MCStudy/EstimationError_target_true_c': (mc_mean_c_t - target_c_t).mean().item(),
+        'MCStudy/Correlation_target_true_r': _corr(target_r_t, mc_mean_r_t),
+        'MCStudy/Correlation_target_true_c': _corr(target_c_t, mc_mean_c_t),
+        'MCStudy/Correlation_pred_target_r': _corr(pred_r_t, target_r_t),
+        'MCStudy/Correlation_pred_target_c': _corr(pred_c_t, target_c_t),
+        'MCStudy/MeanTarget_r': target_r_t.mean().item(),
+        'MCStudy/MeanTarget_c': target_c_t.mean().item(),
         'MCStudy/MeanVar_r': float(np.mean(mc_var_r_list)),
         'MCStudy/MeanVar_c': float(np.mean(mc_var_c_list)),
         'MCStudy/MeanTrue_r': mc_mean_r_t.mean().item(),
@@ -545,8 +689,8 @@ def estimate_true_value_same_state_mc(
         return stats
     raw = {
         'probe_seeds': list(probe_seeds),
-        'r': {'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list},
-        'c': {'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list},
+        'r': {'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list, 'target': target_r_list},
+        'c': {'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list, 'target': target_c_list},
     }
     return stats, raw
 
@@ -612,6 +756,12 @@ def estimate_value_from_snapshots(
     n_envs = env.num_envs
     assert remaining_horizon and remaining_horizon > 0
 
+    adv_estimator_r = getattr(cfgs.algo_cfgs, 'adv_estimation_method', 'gae')
+    adv_estimator_c = getattr(cfgs.algo_cfgs, 'cost_adv_estimation_method', None) or adv_estimator_r
+    lam_r = getattr(cfgs.algo_cfgs, 'lam', 0.95)
+    lam_c = getattr(cfgs.algo_cfgs, 'lam_c', lam_r)
+    penalty_coef = getattr(cfgs.algo_cfgs, 'penalty_coef', 0.0)
+
     # Flat task list, mc_repeats consecutive entries per probe state -- same rationale as
     # estimate_true_value_same_state_mc's `tasks` list.
     tasks = [snap for snap in snapshots for _ in range(mc_repeats)]
@@ -620,6 +770,8 @@ def estimate_value_from_snapshots(
     pred_c_of: list[float | None] = [None] * n_tasks
     ret_r_of: list[float] = [0.0] * n_tasks
     ret_c_of: list[float] = [0.0] * n_tasks
+    target_r_of: list[float] = [0.0] * n_tasks
+    target_c_of: list[float] = [0.0] * n_tasks
 
     n_waves = (n_tasks + n_envs - 1) // n_envs
     for w in range(n_waves):
@@ -633,9 +785,19 @@ def estimate_value_from_snapshots(
             wave_snaps += [wave_snaps[0]] * (n_envs - wave_size)
 
         obs = restore_and_get_obs(env, wave_snaps, device)
-        act, value_r, value_c, _ = agent.step(obs)
+        act, value_r, value_c, log_prob = agent.step(obs)
         pred_r_batch = value_r.reshape(-1).detach().cpu().numpy()
         pred_c_batch = value_c.reshape(-1).detach().cpu().numpy()
+
+        # Per-step sequences, needed to compute the training-style target after the rollout --
+        # see estimate_true_value_same_state_mc's matching comment.
+        r_seq = np.zeros((remaining_horizon + 1, n_envs), dtype=np.float64)
+        c_seq = np.zeros((remaining_horizon + 1, n_envs), dtype=np.float64)
+        v_r_seq = np.zeros((remaining_horizon + 1, n_envs), dtype=np.float64)
+        v_c_seq = np.zeros((remaining_horizon + 1, n_envs), dtype=np.float64)
+        logp_seq = np.zeros((remaining_horizon, n_envs), dtype=np.float64)
+        v_r_seq[0] = pred_r_batch
+        v_c_seq[0] = pred_c_batch
 
         g_r = np.zeros(n_envs, dtype=np.float64)
         g_c = np.zeros(n_envs, dtype=np.float64)
@@ -643,12 +805,19 @@ def estimate_value_from_snapshots(
         terminated = truncated = None
         for t in range(remaining_horizon):
             obs, r, c, terminated, truncated, _ = env.step(act)
-            g_r += disc_r * r.reshape(-1).detach().cpu().numpy()
-            g_c += disc_c * c.reshape(-1).detach().cpu().numpy()
+            r_np = r.reshape(-1).detach().cpu().numpy()
+            c_np = c.reshape(-1).detach().cpu().numpy()
+            r_seq[t] = r_np
+            c_seq[t] = c_np
+            g_r += disc_r * r_np
+            g_c += disc_c * c_np
             disc_r *= discount_r
             disc_c *= discount_c
             if t < remaining_horizon - 1:
-                act, _, _, _ = agent.step(obs)
+                act, value_r, value_c, log_prob = agent.step(obs)
+                v_r_seq[t + 1] = value_r.reshape(-1).detach().cpu().numpy()
+                v_c_seq[t + 1] = value_c.reshape(-1).detach().cpu().numpy()
+                logp_seq[t] = log_prob.reshape(-1).detach().cpu().numpy()
         done_at_end = terminated.reshape(-1).bool() | truncated.reshape(-1).bool()
         if not bool(done_at_end.all()):
             raise RuntimeError(
@@ -658,11 +827,33 @@ def estimate_value_from_snapshots(
                 'snapshots were captured at.',
             )
 
+        _, boot_value_r, boot_value_c, _ = agent.step(obs)
+        is_terminated = terminated.reshape(-1).bool().detach().cpu().numpy()
+        boot_r = np.where(is_terminated, 0.0, boot_value_r.reshape(-1).detach().cpu().numpy())
+        boot_c = np.where(is_terminated, 0.0, boot_value_c.reshape(-1).detach().cpu().numpy())
+        v_r_seq[remaining_horizon] = boot_r
+        v_c_seq[remaining_horizon] = boot_c
+
         for local_i, task_idx in enumerate(wave_task_idxs):
             pred_r_of[task_idx] = float(pred_r_batch[local_i])
             pred_c_of[task_idx] = float(pred_c_batch[local_i])
             ret_r_of[task_idx] = float(g_r[local_i])
             ret_c_of[task_idx] = float(g_c[local_i])
+
+            r_this = torch.from_numpy(r_seq[:remaining_horizon, local_i]).float()
+            c_this = torch.from_numpy(c_seq[:remaining_horizon, local_i]).float()
+            v_r_this = torch.from_numpy(v_r_seq[:, local_i]).float()
+            v_c_this = torch.from_numpy(v_c_seq[:, local_i]).float()
+            logp_this = torch.from_numpy(logp_seq[:, local_i]).float()
+            r_this_penalized = r_this - penalty_coef * c_this
+            target_r_of[task_idx] = _rollout_target(
+                r_this_penalized, v_r_this, bool(is_terminated[local_i]), lam_r, discount_r,
+                adv_estimator_r, logp_seq=logp_this,
+            )
+            target_c_of[task_idx] = _rollout_target(
+                c_this, v_c_this, bool(is_terminated[local_i]), lam_c, discount_c,
+                adv_estimator_c, logp_seq=logp_this,
+            )
 
     pred_r_list: list[float] = []
     pred_c_list: list[float] = []
@@ -670,6 +861,8 @@ def estimate_value_from_snapshots(
     mc_mean_c_list: list[float] = []
     mc_var_r_list: list[float] = []
     mc_var_c_list: list[float] = []
+    target_r_list: list[float] = []
+    target_c_list: list[float] = []
     idx = 0
     for _snap in snapshots:
         idxs = range(idx, idx + mc_repeats)
@@ -682,12 +875,15 @@ def estimate_value_from_snapshots(
         mc_mean_c_list.append(float(np.mean(returns_c)))
         mc_var_r_list.append(float(np.var(returns_r)))
         mc_var_c_list.append(float(np.var(returns_c)))
+        target_r_list.append(float(np.mean([target_r_of[i] for i in idxs])))
+        target_c_list.append(float(np.mean([target_c_of[i] for i in idxs])))
 
     def _t(lst):
         return torch.tensor(lst, device=device, dtype=torch.float32)
 
     pred_r_t, pred_c_t = _t(pred_r_list), _t(pred_c_list)
     mc_mean_r_t, mc_mean_c_t = _t(mc_mean_r_list), _t(mc_mean_c_list)
+    target_r_t, target_c_t = _t(target_r_list), _t(target_c_list)
 
     def _corr(a, b):
         if a.numel() < 2 or a.std() <= 0 or b.std() <= 0:
@@ -699,6 +895,14 @@ def estimate_value_from_snapshots(
         'EstimationError_c': (mc_mean_c_t - pred_c_t).mean().item(),
         'Correlation_r': _corr(pred_r_t, mc_mean_r_t),
         'Correlation_c': _corr(pred_c_t, mc_mean_c_t),
+        'EstimationError_target_true_r': (mc_mean_r_t - target_r_t).mean().item(),
+        'EstimationError_target_true_c': (mc_mean_c_t - target_c_t).mean().item(),
+        'Correlation_target_true_r': _corr(target_r_t, mc_mean_r_t),
+        'Correlation_target_true_c': _corr(target_c_t, mc_mean_c_t),
+        'Correlation_pred_target_r': _corr(pred_r_t, target_r_t),
+        'Correlation_pred_target_c': _corr(pred_c_t, target_c_t),
+        'MeanTarget_r': target_r_t.mean().item(),
+        'MeanTarget_c': target_c_t.mean().item(),
         'MeanVar_r': float(np.mean(mc_var_r_list)),
         'MeanVar_c': float(np.mean(mc_var_c_list)),
         'MeanTrue_r': mc_mean_r_t.mean().item(),
@@ -712,8 +916,8 @@ def estimate_value_from_snapshots(
     if not return_raw:
         return stats
     raw = {
-        'r': {'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list},
-        'c': {'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list},
+        'r': {'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list, 'target': target_r_list},
+        'c': {'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list, 'target': target_c_list},
     }
     return stats, raw
 
@@ -760,15 +964,26 @@ def pool_correlation_stats(raw_list: list[dict], prefix: str = '') -> tuple[dict
     for stream in ('r', 'c'):
         pred_list: list[float] = []
         mc_mean_list: list[float] = []
+        target_list: list[float] = []
+        has_target = all('target' in src[stream] for src in raw_list)
         for src in raw_list:
             pred_list.extend(src[stream]['pred'])
             mc_mean_list.extend(src[stream]['mc_mean'])
+            if has_target:
+                target_list.extend(src[stream]['target'])
         pred_t, mc_mean_t = _t(pred_list), _t(mc_mean_list)
         stats[f'{prefix}EstimationError_{stream}'] = (mc_mean_t - pred_t).mean().item()
         stats[f'{prefix}Correlation_{stream}'] = _corr(pred_t, mc_mean_t)
         stats[f'{prefix}MeanTrue_{stream}'] = mc_mean_t.mean().item()
         stats[f'{prefix}MeanPred_{stream}'] = pred_t.mean().item()
         raw[stream] = {'pred': pred_list, 'mc_mean': mc_mean_list}
+        if has_target:
+            target_t = _t(target_list)
+            stats[f'{prefix}EstimationError_target_true_{stream}'] = (mc_mean_t - target_t).mean().item()
+            stats[f'{prefix}Correlation_target_true_{stream}'] = _corr(target_t, mc_mean_t)
+            stats[f'{prefix}Correlation_pred_target_{stream}'] = _corr(pred_t, target_t)
+            stats[f'{prefix}MeanTarget_{stream}'] = target_t.mean().item()
+            raw[stream]['target'] = target_list
         num_probes = len(pred_list)
     stats[f'{prefix}NumProbes'] = float(num_probes or 0)
     return stats, raw
