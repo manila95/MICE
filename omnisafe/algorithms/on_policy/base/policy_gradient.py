@@ -883,6 +883,7 @@ class PolicyGradient(BaseAlgo):
                     sync_normalizer_from=self._env._env,
                     max_episode_steps=self._mc_eval_max_episode_steps,
                     return_raw=True,
+                    bootstrap_threshold=getattr(self._cfgs.algo_cfgs, 'mc_eval_bootstrap_threshold', None),
                 )
                 self._logger.store(mc_stats)
                 eval_data_bundle['mc_study'] = {'stats': mc_stats, 'raw': mc_raw}
@@ -926,6 +927,7 @@ class PolicyGradient(BaseAlgo):
                         mc_repeats=repeats,
                         epoch=epoch,
                         return_raw=True,
+                        bootstrap_threshold=getattr(self._cfgs.algo_cfgs, 'mc_eval_bootstrap_threshold', None),
                     )
                     self._logger.store(
                         {f'IntermediateMC/pos{pos}/{k}': v for k, v in pos_stats.items()},

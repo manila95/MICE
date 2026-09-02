@@ -126,6 +126,14 @@ defaults:
     # however many other runs share the machine -- e.g. 20 (giving a clean 500/20=25 waves at the
     # defaults above) on a lightly-loaded 16+-core box.
     mc_value_study_vector_envs: 5
+    # Truncate mc_value_study/intermediate_state_study rollouts early once both streams'
+    # discounted tail contribution drops below this fraction, bootstrapping the remainder with
+    # the critic's own value there instead of continuing to simulate (see
+    # omnisafe.utils.value_eval._effective_rollout_horizon). Trades a small, bounded bias (the
+    # substituted quantity is exactly what these studies exist to validate) for wall-clock -- at
+    # the default gamma=0.99, 0.01 cuts a 1000-step rollout to ~460 steps. None (default) disables
+    # truncation entirely -- full horizon, zero approximation, matching all prior behavior.
+    mc_eval_bootstrap_threshold: null
     # On-policy intermediate-state value study (see omnisafe.utils.value_eval.
     # estimate_value_from_snapshots and omnisafe.utils.state_snapshot): the same same-state MC
     # trick mc_value_study uses for s0, but for states the CURRENT policy actually visits
