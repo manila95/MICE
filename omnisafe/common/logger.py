@@ -128,6 +128,15 @@ class Logger:  # pylint: disable=too-many-instance-attributes
         self._headers_minmax: dict[str, bool] = {}
         self._headers_delta: dict[str, bool] = {}
         self._current_row: dict[str, float] = {}
+        # Raw arrays behind every log_scatter_image call since the last pop_scatter_raw_data()
+        # -- log_scatter_image itself only ever pushes a rendered PNG (wandb.Image/tensorboard
+        # figure), so without this the x/y/c values behind e.g. Value/Train/RewardCriticScatter
+        # are computed, plotted, and thrown away every single call, unlike the MC-value-study
+        # eval data (see eval_data_dump.py), which does persist its raw arrays. Keyed by the same
+        # `key` log_scatter_image is called with, so multiple calls with the same key inside one
+        # epoch overwrite rather than accumulate (matches how the rendered image itself works --
+        # only the latest call's plot is ever visible on wandb for a given key/step).
+        self._pending_scatter_raw: dict[str, dict] = {}
 
         if config is not None:
             self.save_config(config)
@@ -397,10 +406,20 @@ class Logger:  # pylint: disable=too-many-instance-attributes
             return
         x_vals, y_vals = x_vals[:n], y_vals[:n]
 
-        fig, ax = plt.subplots(figsize=(6, 4))
+        c_vals = None
         if c_values is not None:
             c_vals = c_values.cpu().numpy() if isinstance(c_values, torch.Tensor) else np.asarray(c_values)
             c_vals = np.atleast_1d(c_vals).flatten()[:n]
+
+        # Stash the raw arrays behind this plot before anything renders/discards them -- see
+        # __init__'s comment on _pending_scatter_raw for why this needs to exist at all.
+        self._pending_scatter_raw[key] = {
+            'x': x_vals, 'y': y_vals, 'c': c_vals,
+            'xlabel': xlabel, 'ylabel': ylabel, 'c_label': c_label, 'step': step,
+        }
+
+        fig, ax = plt.subplots(figsize=(6, 4))
+        if c_vals is not None:
             sc = ax.scatter(x_vals, y_vals, c=c_vals, alpha=0.5, s=10, cmap='viridis')
             plt.colorbar(sc, ax=ax, label=c_label)
         else:
@@ -421,6 +440,25 @@ class Logger:  # pylint: disable=too-many-instance-attributes
             wandb.log({key: wandb.Image(img)}, step=step)
 
         plt.close(fig)
+
+    def pop_scatter_raw_data(self) -> dict[str, dict]:
+        """Return and clear every raw array accumulated by :meth:`log_scatter_image` since the
+        last call to this method.
+
+        Callers (see ``policy_gradient.py``'s ``learn()``) are expected to persist/push whatever
+        this returns once per epoch, the same way ``eval_data_dump.py`` does for the MC-value-
+        study data -- this method only hands the data off, it never writes anywhere itself, so a
+        caller that never calls it simply leaks the accumulated dict in memory across epochs
+        (bounded by the number of distinct scatter keys logged, not epochs, so this is cheap even
+        if unused).
+
+        Returns:
+            ``{key: {'x', 'y', 'c', 'xlabel', 'ylabel', 'c_label', 'step'}}`` for every
+            ``log_scatter_image`` key called since the last pop (empty dict if none were).
+        """
+        data = self._pending_scatter_raw
+        self._pending_scatter_raw = {}
+        return data
 
     def dump_tabular(self) -> None:
         """Dump the tabular data to the console and the file.

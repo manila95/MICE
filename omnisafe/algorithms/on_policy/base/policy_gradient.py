@@ -976,6 +976,23 @@ class PolicyGradient(BaseAlgo):
             self._logger.store({'Metrics/TotalCost': total_cost})
             self._logger.store({'Time/Update': time.time() - update_time})
 
+            # Persist + push the raw arrays behind every log_scatter_image call this epoch made
+            # (Value/Train, Value/Val critic diagnostics; SR diagnostics under td_ridge; any
+            # MICE-specific scatters) -- these run inside self._update(), above, so this has to
+            # happen after it returns, unlike the MC-value-study eval_data_bundle (built and
+            # persisted earlier this same epoch, before self._update()). Empty on any epoch that
+            # logged no scatters (most non-eval epochs), so this is a no-op there.
+            scatter_raw = self._logger.pop_scatter_raw_data()
+            if scatter_raw:
+                scatter_data_path = save_eval_data(
+                    self._logger.log_dir, epoch, scatter_raw, subdir='scatter_data',
+                )
+                log_eval_data_to_wandb(
+                    scatter_data_path, epoch,
+                    name_prefix='scatter-data', artifact_type='scatter_data',
+                    description=f'Raw x/y/c arrays behind every log_scatter_image plot, epoch {epoch}.',
+                )
+
             if self._cfgs.model_cfgs.exploration_noise_anneal:
                 self._actor_critic.annealing(epoch)
 
