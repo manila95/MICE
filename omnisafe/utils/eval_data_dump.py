@@ -124,3 +124,36 @@ def log_scatter_to_wandb(png_path: str | None, epoch: int) -> None:
     if wandb.run is None:
         return
     wandb.log({'eval_data/scatter': wandb.Image(png_path)}, step=epoch)
+
+
+def log_eval_data_to_wandb(pkl_path: str, epoch: int) -> None:
+    """Sync a per-epoch eval-data pickle (see :func:`save_eval_data`) to the active wandb run,
+    so the raw per-probe arrays are downloadable from the run page without SSH access to
+    whatever machine produced them -- previously only the aggregate stats (via
+    ``Logger.store``/``dump_tabular``) and the quick-look scatter PNG (:func:`log_scatter_to_wandb`)
+    ever left local disk; the raw pickle itself was local-only.
+
+    Uses a per-epoch :class:`wandb.Artifact` (type ``'eval_data'``, one version per epoch) rather
+    than ``wandb.save`` -- an Artifact gets its own content-addressed version history and survives
+    independently of the run's live file sync, so a pickle from epoch 100 stays fetchable
+    (``wandb.Api().artifact(...)``) even long after the run itself has finished or if the plain
+    run-files view gets pruned. The per-epoch granularity mirrors ``save_eval_data``'s own
+    filename scheme (``epoch_{epoch:05d}.pkl``) precisely so a downloaded artifact identifies
+    itself the same way the local copy does.
+
+    Args:
+        pkl_path: Path returned by :func:`save_eval_data`.
+        epoch: Current epoch -- used for both the artifact's name suffix and the wandb step, so
+            this lands on the same x-axis position as that epoch's numeric eval metrics.
+    """
+    import wandb  # noqa: PLC0415 -- see save_scatter_grid's matplotlib import for why this is local
+
+    if wandb.run is None:
+        return
+    artifact = wandb.Artifact(
+        name=f'eval-data-epoch-{epoch:05d}',
+        type='eval_data',
+        description=f'Raw per-probe MC value-study arrays + aggregate stats, epoch {epoch}.',
+    )
+    artifact.add_file(pkl_path, name=os.path.basename(pkl_path))
+    wandb.log_artifact(artifact)

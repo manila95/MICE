@@ -37,7 +37,12 @@ from omnisafe.envs.core import make as make_env
 from omnisafe.envs.wrapper import ActionScale, AutoReset, ObsNormalize, TimeLimit, Unsqueeze
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
 from omnisafe.utils import clearning, contrastive, distributed, laplacian, sr_diagnostics
-from omnisafe.utils.eval_data_dump import log_scatter_to_wandb, save_eval_data, save_scatter_grid
+from omnisafe.utils.eval_data_dump import (
+    log_eval_data_to_wandb,
+    log_scatter_to_wandb,
+    save_eval_data,
+    save_scatter_grid,
+)
 from omnisafe.utils.state_snapshot import (
     collect_on_policy_snapshots,
     enable_state_snapshots,
@@ -949,7 +954,8 @@ class PolicyGradient(BaseAlgo):
             # counter still equals `epoch` here -- torch_save() names the file accordingly,
             # consistent with eval_data_bundle's filename.
             if is_eval_epoch:
-                save_eval_data(self._logger.log_dir, epoch, eval_data_bundle)
+                eval_data_path = save_eval_data(self._logger.log_dir, epoch, eval_data_bundle)
+                log_eval_data_to_wandb(eval_data_path, epoch)
                 scatter_series = []
                 if 'mc_study' in eval_data_bundle:
                     scatter_series.append(('s0', eval_data_bundle['mc_study']['raw']))
