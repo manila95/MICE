@@ -158,16 +158,29 @@ def enable_state_snapshots() -> None:
     def set_snapshot_trigger_steps(self, trigger_steps: set[int] | None) -> None:
         self.snapshot_trigger_steps = trigger_steps
 
-    def restore_and_get_obs(self, snapshot: dict):
+    def restore_and_get_obs(self, snapshot: dict, reset_elapsed_steps: bool = False):
         restore_builder(self, snapshot)
+        if reset_elapsed_steps:
+            # Treat the restored physical state as a fresh start state (like a real
+            # env.reset()), not as "continuing episode N at step T" -- see
+            # estimate_value_from_snapshots's docstring for why this is the semantics an
+            # intermediate-state value study actually wants: a diverse *state*, evaluated with
+            # the same full max_episode_steps budget s0 gets, not truncated to however many
+            # steps happened to be physically left in the one episode instance it was captured
+            # from. Only the RL-episode bookkeeping resets here -- data.time (mujoco's own
+            # physics clock) is left exactly as captured, since that's a simulation-continuity
+            # concern, not an RL-horizon one.
+            self.steps = 0
+            self.terminated = False
+            self.truncated = False
         return self.task.obs()
 
-    def restore_and_get_obs_through_time_limit(self, snapshot: dict):
+    def restore_and_get_obs_through_time_limit(self, snapshot: dict, reset_elapsed_steps: bool = False):
         # self is the SafeTimeLimit wrapper, not the Builder -- see the module docstring's note
         # on why its own _elapsed_steps counter needs resetting too, separately from the inner
-        # Builder's own .steps.
-        self._elapsed_steps = snapshot['steps']
-        return self.env.restore_and_get_obs(snapshot)
+        # Builder's own .steps. See restore_and_get_obs above for why reset_elapsed_steps exists.
+        self._elapsed_steps = 0 if reset_elapsed_steps else snapshot['steps']
+        return self.env.restore_and_get_obs(snapshot, reset_elapsed_steps=reset_elapsed_steps)
 
     Builder.step = patched_step
     Builder.set_snapshot_trigger_steps = set_snapshot_trigger_steps
@@ -280,7 +293,12 @@ def _find_safety_gymnasium_target(env):
     return target
 
 
-def restore_and_get_obs(env, snapshots: list[dict], device: torch.device) -> torch.Tensor:
+def restore_and_get_obs(
+    env,
+    snapshots: list[dict],
+    device: torch.device,
+    reset_elapsed_steps: bool = False,
+) -> torch.Tensor:
     """Restore a (possibly vectorized) env to ``snapshots`` (one entry per env slot -- each slot
     gets its *own*, independent snapshot, unlike :func:`configure_snapshot_triggers` which
     broadcasts the same value everywhere) and return the resulting observation, processed exactly
@@ -296,6 +314,16 @@ def restore_and_get_obs(env, snapshots: list[dict], device: torch.device) -> tor
     case this talks to each worker's pipe directly, replicating ``call_async``/``call_wait``'s own
     protocol (including its ``_state`` bookkeeping, so subsequent ``step()``/``reset()`` calls on
     the vector env keep working normally) but with per-pipe arguments.
+
+    Args:
+        reset_elapsed_steps: If True, the restored state's RL-episode bookkeeping (the ``Builder``
+            step counter and the ``SafeTimeLimit`` wrapper's own ``_elapsed_steps``) is reset to 0
+            instead of restored to its captured value -- i.e. the physical state is treated as a
+            fresh start state with a full ``max_episode_steps`` budget ahead of it, not one bound
+            by however many steps happened to be physically left in the episode it was captured
+            from. See :func:`omnisafe.utils.value_eval.estimate_value_from_snapshots`'s docstring
+            for why this is what an intermediate-state value study wants. Defaults to False
+            (restore exactly as captured) for any other caller of this function.
     """
     # Local import: avoid import-time coupling between these two modules (value_eval.py doesn't
     # otherwise need to know state_snapshot.py exists, and vice versa).
@@ -307,7 +335,10 @@ def restore_and_get_obs(env, snapshots: list[dict], device: torch.device) -> tor
         assert len(snapshots) == target.num_envs
         target._assert_is_running()  # noqa: SLF001
         for pipe, snap in zip(target.parent_pipes, snapshots):
-            pipe.send(('_call', ('restore_and_get_obs', (snap,), {})))
+            pipe.send((
+                '_call',
+                ('restore_and_get_obs', (snap,), {'reset_elapsed_steps': reset_elapsed_steps}),
+            ))
         target._state = AsyncState.WAITING_CALL  # noqa: SLF001
         results, successes = zip(*[pipe.recv() for pipe in target.parent_pipes])
         target._raise_if_errors(successes)  # noqa: SLF001
@@ -315,12 +346,15 @@ def restore_and_get_obs(env, snapshots: list[dict], device: torch.device) -> tor
         raw_obs = np.stack(results)
     elif hasattr(target, 'envs'):  # SyncVectorEnv
         assert len(snapshots) == len(target.envs)
-        raw_obs = np.stack(
-            [e.unwrapped.restore_and_get_obs(s) for e, s in zip(target.envs, snapshots)],
-        )
+        raw_obs = np.stack([
+            e.unwrapped.restore_and_get_obs(s, reset_elapsed_steps=reset_elapsed_steps)
+            for e, s in zip(target.envs, snapshots)
+        ])
     else:  # single Builder
         assert len(snapshots) == 1
-        raw_obs = target.restore_and_get_obs(snapshots[0])[None, :]
+        raw_obs = target.restore_and_get_obs(
+            snapshots[0], reset_elapsed_steps=reset_elapsed_steps,
+        )[None, :]
 
     obs = torch.as_tensor(raw_obs, dtype=torch.float32, device=device)
     normalizer = _find_obs_normalizer(env)

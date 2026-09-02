@@ -399,6 +399,69 @@ def _rollout_target(
     return target[0].item()
 
 
+def _effective_rollout_horizon(
+    nominal_horizon: int,
+    discount_r: float,
+    discount_c: float,
+    bootstrap_threshold: float | None,
+) -> int:
+    r"""How many steps a same-state MC rollout actually needs to run, given how fast the discount
+    decays.
+
+    The tail past step :math:`t` contributes at most a factor of :math:`\gamma^t` of its own scale
+    to the discounted return -- for ``gamma=0.99``, that's already down to ~0.66% by ``t=500`` and
+    ~0.09% by ``t=700``. Simulating all the way to ``nominal_horizon`` (900-1000 steps for the
+    positions this codebase studies) to capture a shrinking fraction of a percent of the answer is
+    wasted compute; this instead finds the smallest ``t <= nominal_horizon`` such that BOTH
+    streams' residual weight is already below ``bootstrap_threshold``, so the rollout can stop
+    there and bootstrap the tail with the critic's own (already-computed every step) value
+    estimate at that point -- exactly the same 0-if-terminated/critic-otherwise convention already
+    used for a rollout's *natural* end (see the callers' ``is_terminated`` handling), just reached
+    early on purpose instead of by the env's own time limit.
+
+    Uses ``max(discount_r, discount_c)`` (whichever decays slower) so the returned horizon is
+    conservative for both streams at once, not just whichever happens to be smaller.
+
+    This trades a small, bounded, quantifiable bias for wall-clock: the substituted quantity is
+    the critic's own value estimate -- exactly what these functions exist to independently
+    validate -- so a nonzero ``bootstrap_threshold`` means the resulting "true" MC value is no
+    longer bias-free ground truth, just approximately so, to within `bootstrap_threshold` of the
+    terminal value's own scale. ``bootstrap_threshold=None`` (the default everywhere this is
+    called) preserves the exact prior behavior -- full ``nominal_horizon``, zero approximation.
+
+    Args:
+        nominal_horizon: The horizon that would be used with no truncation -- ``max_episode_steps``
+            for every caller (both :func:`estimate_true_value_same_state_mc`'s ``s0`` probes and
+            :func:`estimate_value_from_snapshots`'s restored intermediate-state probes, since the
+            latter are now scored with the same full fresh-start budget as ``s0``, not a
+            position-dependent "steps remaining" value).
+        discount_r: Reward discount factor.
+        discount_c: Cost discount factor.
+        bootstrap_threshold: Target residual discount weight (e.g. ``0.01`` = stop once both
+            streams' remaining contribution is below 1% of the bootstrapped value's own scale).
+            ``None`` or ``<= 0`` disables truncation entirely (returns ``nominal_horizon``
+            unchanged).
+
+    Returns:
+        The horizon to actually roll out to, in ``[1, nominal_horizon]``.
+    """
+    if not bootstrap_threshold or bootstrap_threshold <= 0:
+        return nominal_horizon
+    gamma_max = max(discount_r, discount_c)
+    if gamma_max <= 0:
+        return nominal_horizon
+    if gamma_max >= 1:
+        # Undiscounted (or discount > 1, degenerate) -- the tail never shrinks, so there is no
+        # valid truncation point; fall back to the untruncated horizon rather than silently
+        # returning something arbitrary.
+        return nominal_horizon
+    # gamma_max ** t <= threshold  <=>  t >= log(threshold) / log(gamma_max) (log(gamma_max) < 0)
+    import math  # noqa: PLC0415 -- only needed on this (opt-in, off by default) code path
+
+    needed = math.ceil(math.log(bootstrap_threshold) / math.log(gamma_max))
+    return max(1, min(nominal_horizon, needed))
+
+
 def estimate_true_value_same_state_mc(
     agent,
     env,
@@ -411,6 +474,7 @@ def estimate_true_value_same_state_mc(
     sync_normalizer_from=None,
     max_episode_steps=None,
     return_raw=False,
+    bootstrap_threshold=None,
 ):
     r"""Compare the critic's V(s0) against a genuine same-layout Monte-Carlo estimate.
 
@@ -475,6 +539,13 @@ def estimate_true_value_same_state_mc(
             computed from (predictions, MC-mean returns, per-repeat variances) -- e.g. for
             pickling alongside the aggregates for later offline analysis, or for scatter plots
             (each probe is one point). Defaults to False (the original, stats-dict-only return).
+        bootstrap_threshold (float or None): If set, roll each probe out only until both streams'
+            discounted tail contribution drops below this fraction (see
+            :func:`_effective_rollout_horizon`), bootstrapping the remainder with the critic's own
+            value there instead of continuing to simulate. Trades a small, bounded bias (the
+            substituted quantity is exactly what this function exists to validate) for wall-clock
+            -- e.g. ``0.01`` with ``gamma=0.99`` cuts ``max_episode_steps=1000`` down to ~460
+            steps. ``None`` (default) preserves the exact original full-horizon behavior.
 
     Returns:
         A dict of aggregate statistics over the ``len(probe_seeds)`` probes: for each of
@@ -500,6 +571,10 @@ def estimate_true_value_same_state_mc(
         )
         max_episode_steps = env.max_episode_steps
     assert max_episode_steps and max_episode_steps > 0
+    # See _effective_rollout_horizon's docstring -- horizon <= max_episode_steps always;
+    # strictly less only when bootstrap_threshold is set, in which case the tail past `horizon`
+    # is bootstrapped with the critic's own value instead of simulated.
+    horizon = _effective_rollout_horizon(max_episode_steps, discount_r, discount_c, bootstrap_threshold)
 
     # Which advantage estimator/lambda each stream's target should mirror -- the same config
     # training itself reads (cost null-falls-back to reward's, same convention as
@@ -542,13 +617,14 @@ def estimate_true_value_same_state_mc(
 
         # Per-step sequences, needed (in addition to the running discounted sum below, which is
         # all the *true* MC estimate needs) to compute the training-style target after the
-        # rollout -- see _rollout_target. Row max_episode_steps is the bootstrap slot, filled in
-        # after the loop.
-        r_seq = np.zeros((max_episode_steps + 1, n_envs), dtype=np.float64)
-        c_seq = np.zeros((max_episode_steps + 1, n_envs), dtype=np.float64)
-        v_r_seq = np.zeros((max_episode_steps + 1, n_envs), dtype=np.float64)
-        v_c_seq = np.zeros((max_episode_steps + 1, n_envs), dtype=np.float64)
-        logp_seq = np.zeros((max_episode_steps, n_envs), dtype=np.float64)
+        # rollout -- see _rollout_target. Row `horizon` is the bootstrap slot, filled in after the
+        # loop -- either the env's own final obs (horizon == max_episode_steps, no truncation) or
+        # the early-stop point (horizon < max_episode_steps, bootstrap_threshold truncation).
+        r_seq = np.zeros((horizon + 1, n_envs), dtype=np.float64)
+        c_seq = np.zeros((horizon + 1, n_envs), dtype=np.float64)
+        v_r_seq = np.zeros((horizon + 1, n_envs), dtype=np.float64)
+        v_c_seq = np.zeros((horizon + 1, n_envs), dtype=np.float64)
+        logp_seq = np.zeros((horizon, n_envs), dtype=np.float64)
         v_r_seq[0] = pred_r_batch
         v_c_seq[0] = pred_c_batch
 
@@ -556,7 +632,7 @@ def estimate_true_value_same_state_mc(
         g_c = np.zeros(n_envs, dtype=np.float64)
         disc_r, disc_c = 1.0, 1.0
         terminated = truncated = None
-        for t in range(max_episode_steps):
+        for t in range(horizon):
             obs, r, c, terminated, truncated, _ = env.step(act)
             r_np = r.reshape(-1).detach().cpu().numpy()
             c_np = c.reshape(-1).detach().cpu().numpy()
@@ -566,20 +642,34 @@ def estimate_true_value_same_state_mc(
             g_c += disc_c * c_np
             disc_r *= discount_r
             disc_c *= discount_c
-            if t < max_episode_steps - 1:
+            if t < horizon - 1:
                 act, value_r, value_c, log_prob = agent.step(obs)
                 v_r_seq[t + 1] = value_r.reshape(-1).detach().cpu().numpy()
                 v_c_seq[t + 1] = value_c.reshape(-1).detach().cpu().numpy()
                 logp_seq[t] = log_prob.reshape(-1).detach().cpu().numpy()
-        done_at_end = terminated.reshape(-1).bool() | truncated.reshape(-1).bool()
-        if not bool(done_at_end.all()):
-            raise RuntimeError(
-                'estimate_true_value_same_state_mc: not every probe reached done at '
-                f'max_episode_steps={max_episode_steps} (got done={done_at_end.tolist()}). This '
-                'function assumes homogeneous, fixed-length episodes across the vectorized '
-                "batch (see docstring) -- this environment doesn't satisfy that and needs a "
-                'per-slot done mask added instead.',
-            )
+
+        if horizon == max_episode_steps:
+            # No truncation this call -- every probe must have reached the env's own time limit,
+            # exactly as before bootstrap_threshold existed. Still enforced here (not just when
+            # bootstrap_threshold is set) so an environment that terminates early keeps failing
+            # loudly instead of silently producing wrong returns -- see the docstring.
+            done_at_end = terminated.reshape(-1).bool() | truncated.reshape(-1).bool()
+            if not bool(done_at_end.all()):
+                raise RuntimeError(
+                    'estimate_true_value_same_state_mc: not every probe reached done at '
+                    f'max_episode_steps={max_episode_steps} (got done={done_at_end.tolist()}). '
+                    'This function assumes homogeneous, fixed-length episodes across the '
+                    "vectorized batch (see docstring) -- this environment doesn't satisfy that "
+                    'and needs a per-slot done mask added instead.',
+                )
+            is_terminated = terminated.reshape(-1).bool().detach().cpu().numpy()
+        else:
+            # Deliberately stopped short of the env's own time limit (bootstrap_threshold
+            # truncation) -- every slot is by construction still mid-episode (Safety-Gymnasium's
+            # Goal/Push/etc. tasks never terminate early, see docstring), so bootstrap
+            # unconditionally with the critic's value rather than checking terminated/truncated
+            # flags that don't mean "done" here.
+            is_terminated = np.zeros(n_envs, dtype=bool)
 
         # Bootstrap value at the final observation -- 0 for a true terminal, the critic's own
         # prediction there otherwise -- mirroring OnPolicyAdapter.rollout's last_value_r/c
@@ -587,11 +677,20 @@ def estimate_true_value_same_state_mc(
         # uniformly (cheap: one more batched forward pass) rather than branching per-env; the
         # terminated slots' values are simply zeroed out afterward.
         _, boot_value_r, boot_value_c, _ = agent.step(obs)
-        is_terminated = terminated.reshape(-1).bool().detach().cpu().numpy()
         boot_r = np.where(is_terminated, 0.0, boot_value_r.reshape(-1).detach().cpu().numpy())
         boot_c = np.where(is_terminated, 0.0, boot_value_c.reshape(-1).detach().cpu().numpy())
-        v_r_seq[max_episode_steps] = boot_r
-        v_c_seq[max_episode_steps] = boot_c
+        v_r_seq[horizon] = boot_r
+        v_c_seq[horizon] = boot_c
+        if horizon < max_episode_steps:
+            # Truncated early: g_r/g_c only summed *simulated* reward/cost through `horizon`
+            # steps, so the *true*-MC-return accumulator (unlike v_r_seq/v_c_seq, which always
+            # carries a bootstrap slot regardless of truncation) needs the discounted bootstrap
+            # tail added in explicitly here, or the "true" value would be missing that mass
+            # entirely rather than merely approximating it -- disc_r/disc_c already equal
+            # discount_r**horizon / discount_c**horizon at this point (multiplied once per loop
+            # iteration above).
+            g_r += disc_r * boot_r
+            g_c += disc_c * boot_c
 
         for local_i, task_idx in enumerate(wave_task_idxs):
             pred_r_of[task_idx] = float(pred_r_batch[local_i])
@@ -599,8 +698,8 @@ def estimate_true_value_same_state_mc(
             ret_r_of[task_idx] = float(g_r[local_i])
             ret_c_of[task_idx] = float(g_c[local_i])
 
-            r_this = torch.from_numpy(r_seq[:max_episode_steps, local_i]).float()
-            c_this = torch.from_numpy(c_seq[:max_episode_steps, local_i]).float()
+            r_this = torch.from_numpy(r_seq[:horizon, local_i]).float()
+            c_this = torch.from_numpy(c_seq[:horizon, local_i]).float()
             v_r_this = torch.from_numpy(v_r_seq[:, local_i]).float()
             v_c_this = torch.from_numpy(v_c_seq[:, local_i]).float()
             logp_this = torch.from_numpy(logp_seq[:, local_i]).float()
@@ -726,10 +825,11 @@ def estimate_value_from_snapshots(
     discount_r,
     discount_c,
     snapshots,
-    remaining_horizon,
+    horizon,
     mc_repeats=5,
     epoch=None,
     return_raw=False,
+    bootstrap_threshold=None,
 ):
     r"""Like :func:`estimate_true_value_same_state_mc`, but for arbitrary on-policy *intermediate*
     states captured via :mod:`omnisafe.utils.state_snapshot`, instead of states reachable by
@@ -738,11 +838,21 @@ def estimate_value_from_snapshots(
     to work: is it accurate at states the *current* policy actually visits mid-episode?
 
     Structurally almost identical to :func:`estimate_true_value_same_state_mc` -- same
-    wave-batched rollout, same per-probe ``mc_repeats`` averaging, same aggregate stats -- with two
-    differences: probes are restored from pre-captured snapshots
-    (:func:`omnisafe.utils.state_snapshot.restore_and_get_obs`) instead of reset from seeds, and
-    the rollout horizon is ``remaining_horizon`` (however many steps were left in the episode when
-    the snapshot was captured), not the full episode length.
+    wave-batched rollout, same per-probe ``mc_repeats`` averaging, same aggregate stats -- with one
+    real difference: probes are restored from pre-captured snapshots
+    (:func:`omnisafe.utils.state_snapshot.restore_and_get_obs`) instead of reset from seeds.
+
+    The restored state is treated as a fresh *start* state, exactly like s0 -- it gets the full
+    ``horizon`` budget ahead of it (``reset_elapsed_steps=True`` on the restore call), not the
+    physically-remaining steps of the one particular episode instance it happened to be captured
+    from. This is deliberate: the point of the intermediate-state study is to sample a diverse set
+    of *states* the policy might visit at any point in an episode, then ask the same question the
+    s0 study asks of s0 -- "what's this state's value as a start state" -- not "what's this state's
+    value given only the wall-clock time left in the specific episode it was captured from". An
+    earlier version of this function used ``remaining_horizon = max_episode_steps -
+    step_index_captured_at`` instead, which answered a different (and for a state visited late in
+    an episode, much less useful -- e.g. only 100 steps of budget for a step-900 snapshot) question
+    than the one this study is actually meant to answer.
 
     Args:
         agent: The actor-critic; must expose ``step(obs) -> (action, value_r, value_c, log_prob)``.
@@ -754,17 +864,20 @@ def estimate_value_from_snapshots(
             site for where that sync happens.
         discount_r (float): Reward discount factor.
         discount_c (float): Cost discount factor.
-        snapshots (list of dict): Pre-captured states (one entry per probe), all from the *same*
-            within-episode step index, so they share a single ``remaining_horizon``.
-        remaining_horizon (int): Steps left in the episode from this snapshot's step index (i.e.
-            ``max_episode_steps - step_index_captured_at``). Every snapshot passed in one call
-            must share this same horizon -- a captured-at-step-300 and a captured-at-step-700
-            probe can't be scored in the same call, since they'd finish at different times.
+        snapshots (list of dict): Pre-captured states (one entry per probe). Unlike before, these
+            no longer need to share a single within-episode step index -- since every snapshot now
+            gets the same fresh ``horizon`` budget regardless of where it was captured, probes
+            captured at different original step indices can be scored together in one call.
+        horizon (int): Steps to roll every probe out for, treating it as a fresh start state --
+            typically ``max_episode_steps`` (the same full budget s0 gets), not a
+            position-dependent "steps remaining" value.
         mc_repeats (int): Independent rollouts averaged per probe state.
         epoch (int or None): Current epoch, for logging only.
         return_raw (bool): See :func:`estimate_true_value_same_state_mc` -- same meaning, same
             per-probe ``raw`` dict shape (just no ``probe_seeds`` key, since these probes came
             from pre-captured snapshots rather than reset seeds).
+        bootstrap_threshold (float or None): See :func:`estimate_true_value_same_state_mc` --
+            same meaning, applied against ``horizon``.
 
     Returns:
         Same shape/semantics as :func:`estimate_true_value_same_state_mc`'s return dict, just
@@ -778,7 +891,12 @@ def estimate_value_from_snapshots(
 
     device = torch.device(cfgs.train_cfgs.device)
     n_envs = env.num_envs
-    assert remaining_horizon and remaining_horizon > 0
+    assert horizon and horizon > 0
+    nominal_horizon = horizon
+    # See _effective_rollout_horizon's docstring (and estimate_true_value_same_state_mc's use of
+    # it) -- horizon <= nominal_horizon always; strictly less only when bootstrap_threshold is
+    # set.
+    horizon = _effective_rollout_horizon(nominal_horizon, discount_r, discount_c, bootstrap_threshold)
 
     adv_estimator_r = getattr(cfgs.algo_cfgs, 'adv_estimation_method', 'gae')
     adv_estimator_c = getattr(cfgs.algo_cfgs, 'cost_adv_estimation_method', None) or adv_estimator_r
@@ -808,18 +926,22 @@ def estimate_value_from_snapshots(
             # valid restore -- the padding slots' results are simply never read back out below.
             wave_snaps += [wave_snaps[0]] * (n_envs - wave_size)
 
-        obs = restore_and_get_obs(env, wave_snaps, device)
+        # reset_elapsed_steps=True: treat the restored state as a fresh start state with a full
+        # horizon budget ahead, not one bound by the physically-remaining steps of the episode it
+        # was captured from -- see this function's docstring.
+        obs = restore_and_get_obs(env, wave_snaps, device, reset_elapsed_steps=True)
         act, value_r, value_c, log_prob = agent.step(obs)
         pred_r_batch = value_r.reshape(-1).detach().cpu().numpy()
         pred_c_batch = value_c.reshape(-1).detach().cpu().numpy()
 
         # Per-step sequences, needed to compute the training-style target after the rollout --
-        # see estimate_true_value_same_state_mc's matching comment.
-        r_seq = np.zeros((remaining_horizon + 1, n_envs), dtype=np.float64)
-        c_seq = np.zeros((remaining_horizon + 1, n_envs), dtype=np.float64)
-        v_r_seq = np.zeros((remaining_horizon + 1, n_envs), dtype=np.float64)
-        v_c_seq = np.zeros((remaining_horizon + 1, n_envs), dtype=np.float64)
-        logp_seq = np.zeros((remaining_horizon, n_envs), dtype=np.float64)
+        # see estimate_true_value_same_state_mc's matching comment. Sized to the *effective*
+        # `horizon`, not `nominal_horizon` -- see that function's matching comment on why.
+        r_seq = np.zeros((horizon + 1, n_envs), dtype=np.float64)
+        c_seq = np.zeros((horizon + 1, n_envs), dtype=np.float64)
+        v_r_seq = np.zeros((horizon + 1, n_envs), dtype=np.float64)
+        v_c_seq = np.zeros((horizon + 1, n_envs), dtype=np.float64)
+        logp_seq = np.zeros((horizon, n_envs), dtype=np.float64)
         v_r_seq[0] = pred_r_batch
         v_c_seq[0] = pred_c_batch
 
@@ -827,7 +949,7 @@ def estimate_value_from_snapshots(
         g_c = np.zeros(n_envs, dtype=np.float64)
         disc_r, disc_c = 1.0, 1.0
         terminated = truncated = None
-        for t in range(remaining_horizon):
+        for t in range(horizon):
             obs, r, c, terminated, truncated, _ = env.step(act)
             r_np = r.reshape(-1).detach().cpu().numpy()
             c_np = c.reshape(-1).detach().cpu().numpy()
@@ -837,26 +959,42 @@ def estimate_value_from_snapshots(
             g_c += disc_c * c_np
             disc_r *= discount_r
             disc_c *= discount_c
-            if t < remaining_horizon - 1:
+            if t < horizon - 1:
                 act, value_r, value_c, log_prob = agent.step(obs)
                 v_r_seq[t + 1] = value_r.reshape(-1).detach().cpu().numpy()
                 v_c_seq[t + 1] = value_c.reshape(-1).detach().cpu().numpy()
                 logp_seq[t] = log_prob.reshape(-1).detach().cpu().numpy()
-        done_at_end = terminated.reshape(-1).bool() | truncated.reshape(-1).bool()
-        if not bool(done_at_end.all()):
-            raise RuntimeError(
-                'estimate_value_from_snapshots: not every probe reached done after '
-                f'remaining_horizon={remaining_horizon} steps (got done={done_at_end.tolist()}). '
-                'remaining_horizon must be exactly max_episode_steps minus the step index these '
-                'snapshots were captured at.',
-            )
+
+        if horizon == nominal_horizon:
+            # No truncation this call -- see estimate_true_value_same_state_mc's matching branch.
+            # Since the restore reset the env's own elapsed-steps counter to 0
+            # (reset_elapsed_steps=True above), the wrapped TimeLimit will fire "done" here iff
+            # `horizon` actually equals that env's own configured max_episode_steps -- if a caller
+            # passes something shorter (deliberately partial, not via bootstrap_threshold), this
+            # check would correctly fail rather than silently under-counting.
+            done_at_end = terminated.reshape(-1).bool() | truncated.reshape(-1).bool()
+            if not bool(done_at_end.all()):
+                raise RuntimeError(
+                    'estimate_value_from_snapshots: not every probe reached done after '
+                    f'horizon={nominal_horizon} steps (got done={done_at_end.tolist()}). '
+                    'horizon must equal the env\'s own max_episode_steps for every probe to '
+                    'reach the time limit exactly here (reset_elapsed_steps=True means the '
+                    'restored state always starts counting from 0).',
+                )
+            is_terminated = terminated.reshape(-1).bool().detach().cpu().numpy()
+        else:
+            is_terminated = np.zeros(n_envs, dtype=bool)
 
         _, boot_value_r, boot_value_c, _ = agent.step(obs)
-        is_terminated = terminated.reshape(-1).bool().detach().cpu().numpy()
         boot_r = np.where(is_terminated, 0.0, boot_value_r.reshape(-1).detach().cpu().numpy())
         boot_c = np.where(is_terminated, 0.0, boot_value_c.reshape(-1).detach().cpu().numpy())
-        v_r_seq[remaining_horizon] = boot_r
-        v_c_seq[remaining_horizon] = boot_c
+        v_r_seq[horizon] = boot_r
+        v_c_seq[horizon] = boot_c
+        if horizon < nominal_horizon:
+            # See estimate_true_value_same_state_mc's matching comment -- the true-return
+            # accumulator needs the discounted bootstrap tail added in explicitly on truncation.
+            g_r += disc_r * boot_r
+            g_c += disc_c * boot_c
 
         for local_i, task_idx in enumerate(wave_task_idxs):
             pred_r_of[task_idx] = float(pred_r_batch[local_i])
@@ -864,8 +1002,8 @@ def estimate_value_from_snapshots(
             ret_r_of[task_idx] = float(g_r[local_i])
             ret_c_of[task_idx] = float(g_c[local_i])
 
-            r_this = torch.from_numpy(r_seq[:remaining_horizon, local_i]).float()
-            c_this = torch.from_numpy(c_seq[:remaining_horizon, local_i]).float()
+            r_this = torch.from_numpy(r_seq[:horizon, local_i]).float()
+            c_this = torch.from_numpy(c_seq[:horizon, local_i]).float()
             v_r_this = torch.from_numpy(v_r_seq[:, local_i]).float()
             v_c_this = torch.from_numpy(v_c_seq[:, local_i]).float()
             logp_this = torch.from_numpy(logp_seq[:, local_i]).float()

@@ -923,7 +923,12 @@ class PolicyGradient(BaseAlgo):
                             self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma,
                         ),
                         snapshots=collected[pos],
-                        remaining_horizon=max_eps - pos,
+                        # Full fresh-start budget, same as s0 -- not max_eps - pos (the
+                        # physically-remaining steps of the one episode instance this snapshot was
+                        # captured from). See estimate_value_from_snapshots's docstring for why:
+                        # the study wants "value of this state as a start state", not "value given
+                        # the wall-clock left in the episode it happened to be captured from".
+                        horizon=max_eps,
                         mc_repeats=repeats,
                         epoch=epoch,
                         return_raw=True,
