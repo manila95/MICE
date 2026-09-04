@@ -49,6 +49,10 @@ class CriticBuilder:
             (ignored by ``q``). Defaults to ``False``.
         use_spectral_norm (bool, optional): Whether to spectral-normalize the ``v`` critic's
             hidden layers (ignored by ``q``). Defaults to ``False``.
+        ensemble_method (str, optional): ``'v'`` critic only -- see :class:`VCritic`. Ignored by
+            ``'q'``. Defaults to ``'none'``.
+        stream (str, optional): ``'v'`` critic only -- see :class:`VCritic`. Defaults to ``'r'``.
+        beta_init (float, optional): ``'v'`` critic only -- see :class:`VCritic`. Defaults to 0.0.
     """
 
     # pylint: disable-next=too-many-arguments
@@ -64,6 +68,9 @@ class CriticBuilder:
         dropout: float = 0.0,
         use_layer_norm: bool = False,
         use_spectral_norm: bool = False,
+        ensemble_method: str = 'none',
+        stream: str = 'r',
+        beta_init: float = 0.0,
     ) -> None:
         """Initialize an instance of :class:`CriticBuilder`."""
         self._obs_space: OmnisafeSpace = obs_space
@@ -73,11 +80,15 @@ class CriticBuilder:
         self._hidden_sizes: list[int] = hidden_sizes
         self._num_critics: int = num_critics
         self._use_obs_encoder: bool = use_obs_encoder
-        # v-critic-only regularization options (see build_mlp_network); QCritic doesn't take
-        # these, so build_critic('q') below never passes them on.
+        # v-critic-only regularization / ensemble-bias-correction options (see VCritic /
+        # build_mlp_network); QCritic doesn't take these, so build_critic('q') below never
+        # passes them on.
         self._dropout: float = dropout
         self._use_layer_norm: bool = use_layer_norm
         self._use_spectral_norm: bool = use_spectral_norm
+        self._ensemble_method: str = ensemble_method
+        self._stream: str = stream
+        self._beta_init: float = beta_init
 
     def build_critic(
         self,
@@ -118,6 +129,9 @@ class CriticBuilder:
                 dropout=self._dropout,
                 use_layer_norm=self._use_layer_norm,
                 use_spectral_norm=self._use_spectral_norm,
+                ensemble_method=self._ensemble_method,
+                stream=self._stream,
+                beta_init=self._beta_init,
             )
 
         raise NotImplementedError(
