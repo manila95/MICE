@@ -112,14 +112,18 @@ class ConstraintActorCritic(ActorCritic):
                 cost_val = model_cfgs.critic.get(f'{name}_cost', None)
                 return model_cfgs.critic.get(name, default) if cost_val is None else cost_val
 
-            # Same critic-ensemble bias-correction knobs as ActorCritic.reward_critic -- see its
-            # matching comment. stream='c' here is what actually gives the cost critic the
-            # opposite (conservative, not pessimistic) aggregation direction.
-            ensemble_method = str(model_cfgs.critic.get('ensemble_method', 'none'))
+            # Critic-ensemble bias-correction knobs, each falling back to the shared (reward-
+            # side) value when null -- same null-fallback convention as dropout_cost /
+            # use_layer_norm_cost above, so the cost critic can run an ensemble method (e.g.
+            # 'cdq') while the reward critic stays a plain single critic ('none'), or vice
+            # versa, rather than being forced to share one method across both streams. stream='c'
+            # is what actually gives the cost critic the opposite (conservative, not pessimistic)
+            # aggregation direction once it does run an ensemble method.
+            ensemble_method = str(_cost_or_shared('ensemble_method', 'none'))
             ensemble_size = (
-                int(model_cfgs.critic.get('ensemble_size', 2)) if ensemble_method != 'none' else 1
+                int(_cost_or_shared('ensemble_size', 2)) if ensemble_method != 'none' else 1
             )
-            beta_init = float(model_cfgs.critic.get('beta_init', 0.0) or 0.0)
+            beta_init = float(_cost_or_shared('beta_init', 0.0) or 0.0)
             self.cost_critic: Critic = CriticBuilder(
                 obs_space=obs_space,
                 act_space=act_space,

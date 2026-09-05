@@ -240,14 +240,16 @@ defaults:
       weight_decay: 0.0
       weight_decay_cost: ~
       # --- critic-ensemble bias correction (CDQ/GPL/TOP -- see omnisafe.utils.critic_ensemble).
-      # Off by default ('none' = single critic, byte-for-byte the previous behavior). Shared
-      # between reward and cost, not independently configurable per stream: the whole point of
-      # all three techniques is that the aggregation *direction* flips between them (pessimistic
-      # for reward -- the policy chases high estimates, so overestimation is what gets exploited;
+      # Off by default ('none' = single critic, byte-for-byte the previous behavior). This is
+      # the reward-side (and shared-default) value; ensemble_method_cost below can override it
+      # independently for the cost critic (e.g. reward stays 'none' while cost runs 'cdq') --
+      # see that key's comment for the null-fallback convention. Whichever method a stream ends
+      # up running, its aggregation *direction* is fixed by that stream (pessimistic for reward
+      # -- the policy chases high estimates, so overestimation is what gets exploited;
       # conservative for cost -- the policy chases LOW estimates via the Lagrange penalty/trust
       # region, so UNDERestimation is what gets exploited, and is the more dangerous direction
-      # since it makes an unsafe action look constraint-satisfying). Setting this per-stream
-      # independently would risk getting that sign backwards.
+      # since it makes an unsafe action look constraint-satisfying) -- that sign is not a
+      # separate config choice, it's implied by which stream (r vs c) is being aggregated.
       #   'none' (default): single critic.
       #   'cdq'  : Clipped Double Q-learning (Fujimoto et al. 2018) -- min of the ensemble for
       #            reward, max for cost. A fixed rule, no adaptive state.
@@ -264,13 +266,27 @@ defaults:
       # equations -- see critic_ensemble.py's module docstring before comparing against reported
       # paper numbers.
       ensemble_method: none
+      # cost-critic override for ensemble_method; null falls back to ensemble_method above --
+      # same null-fallback convention as dropout_cost / use_layer_norm_cost / weight_decay_cost.
+      # Set this (independently of ensemble_method) to give the cost critic an ensemble method
+      # the reward critic doesn't have, or a different one -- e.g. ensemble_method: none plus
+      # ensemble_method_cost: cdq runs a single reward critic alongside a CDQ-corrected cost
+      # critic.
+      ensemble_method_cost: ~
       # number of independently-trained critics per stream (ignored under 'none'). 2 is the
       # standard choice (matches CDQ's "twin" critics); gpl/top can use more.
       ensemble_size: 2
+      # cost-critic override for ensemble_size; null falls back to ensemble_size above. Only
+      # matters when ensemble_method_cost (or, absent that, ensemble_method) is not 'none' for
+      # the cost stream -- e.g. reward stays a single critic (ensemble_size irrelevant there
+      # under 'none') while cost gets its own ensemble width.
+      ensemble_size_cost: ~
       # initial pessimism/conservatism coefficient (gpl/top only; cdq has none, it's a fixed
       # min/max). 0.0 = start at the plain ensemble mean, no correction, and let the adaptation
       # rule discover how much is warranted.
       beta_init: 0.0
+      # cost-critic override for beta_init; null falls back to beta_init above.
+      beta_init_cost: ~
       # GPL step size for the hill-climbing beta update, and the coefficient's upper bound.
       gpl_beta_lr: 0.05
       gpl_beta_max: 3.0

@@ -648,13 +648,16 @@ class PolicyGradient(BaseAlgo):
 
         # Critic-ensemble bias correction (CDQ/GPL/TOP -- see omnisafe.utils.critic_ensemble and
         # _update_critic_ensemble_beta). Only 'gpl'/'top' have an adaptive beta worth logging;
-        # 'cdq' is a fixed min/max with nothing to track, 'none' has no ensemble at all.
-        ensemble_method = str(self._cfgs.model_cfgs.critic.get('ensemble_method', 'none'))
-        if ensemble_method in ('gpl', 'top'):
+        # 'cdq' is a fixed min/max with nothing to track, 'none' has no ensemble at all. Checked
+        # per stream (not one shared method) so e.g. reward='none'/cost='gpl' registers only the
+        # cost-side keys.
+        if self._ensemble_method_for('r') in ('gpl', 'top'):
             self._logger.register_key('Ensemble/beta_r')
-            self._logger.register_key('Ensemble/beta_c')
-            if ensemble_method == 'top':
+            if self._ensemble_method_for('r') == 'top':
                 self._logger.register_key('Ensemble/arm_r')
+        if self._ensemble_method_for('c') in ('gpl', 'top'):
+            self._logger.register_key('Ensemble/beta_c')
+            if self._ensemble_method_for('c') == 'top':
                 self._logger.register_key('Ensemble/arm_c')
 
         if self._sr_td_ridge:
@@ -1831,16 +1834,82 @@ class PolicyGradient(BaseAlgo):
                     ylabel='Predicted V_c',
                 )
 
-    def _update_critic_ensemble_beta(self) -> None:
-        """Adapt (``'gpl'``) or select (``'top'``) this epoch's pessimism/conservatism beta.
+    def _ensemble_cfg_for(self, name: str, stream: str, default: Any) -> Any:
+        """Resolve a critic-ensemble config value for one stream, applying the ``_cost``
+        null-fallback convention for ``stream == 'c'`` (same pattern as
+        :class:`~omnisafe.models.actor_critic.constraint_actor_critic.ConstraintActorCritic`'s
+        ``_cost_or_shared`` -- kept as a separate small helper here since this class only ever
+        needs it for the ensemble-beta knobs, not the full regularization set).
+        """
+        critic_cfgs = self._cfgs.model_cfgs.critic
+        base = critic_cfgs.get(name, default)
+        if stream == 'r':
+            return base
+        cost_val = critic_cfgs.get(f'{name}_cost', None)
+        return base if cost_val is None else cost_val
 
-        A no-op under ``'none'``/``'cdq'`` (no adaptive state to update). Must run after
-        :meth:`_env.rollout` (needs that rollout's ``Metrics/EpRet``/``Metrics/EpCost`` as the
-        outcome signal) and before :meth:`_update` (writes the new beta into
-        ``reward_critic``/``cost_critic``'s ``beta`` buffer so this epoch's critic training uses
-        it) -- see :mod:`omnisafe.utils.critic_ensemble` for why an outcome-driven signal, and
-        why the one-epoch lag (this call's outcome reflects the rollout collected under *last*
-        epoch's beta, not this one) is inherent to this kind of online adaptation, not a bug.
+    def _ensemble_method_for(self, stream: str) -> str:
+        """Effective ``ensemble_method`` for one stream ('r' or 'c'), after the cost-stream
+        null-fallback -- see :meth:`_ensemble_cfg_for`."""
+        return str(self._ensemble_cfg_for('ensemble_method', stream, 'none'))
+
+    def _get_or_build_beta_adapter(self, stream: str, method: str) -> GPLBetaAdapter | TOPBanditAdapter:
+        """Lazily build (and cache on ``self._ensemble_beta_adapter_{r,c}``) this stream's
+        adapter. Streams are built independently -- a run with reward='gpl'/cost='top' (or any
+        other mismatched pair) builds one adapter of each type, not two of the same type."""
+        attr = f'_ensemble_beta_adapter_{stream}'
+        adapter = getattr(self, attr)
+        if adapter is not None:
+            return adapter
+        critic_cfgs = self._cfgs.model_cfgs.critic
+        if method == 'gpl':
+            adapter = GPLBetaAdapter(
+                beta_init=float(self._ensemble_cfg_for('beta_init', stream, 0.0) or 0.0),
+                lr=float(critic_cfgs.get('gpl_beta_lr', 0.05)),
+                beta_max=float(critic_cfgs.get('gpl_beta_max', 3.0)),
+            )
+        else:  # 'top'
+            beta_grid = list(critic_cfgs.get('top_beta_grid', [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]))
+            total_epochs = int(getattr(self._cfgs.train_cfgs, 'epochs', 300))
+            # Reward and cost get different bandit seeds (offset by 1) so their arm-selection
+            # draws aren't perfectly correlated, same as before this per-stream refactor.
+            seed = self._seed if stream == 'r' else (self._seed + 1 if isinstance(self._seed, int) else None)
+            adapter = TOPBanditAdapter(
+                seed=seed,
+                beta_grid=beta_grid,
+                bandit_lr=float(critic_cfgs.get('top_bandit_lr', 0.1)),
+                temperature=float(critic_cfgs.get('top_temperature', 2.0)),
+                temperature_min=float(critic_cfgs.get('top_temperature_min', 0.2)),
+                decay_steps=int(critic_cfgs.get('top_decay_steps', 0) or total_epochs),
+            )
+        setattr(self, attr, adapter)
+        return adapter
+
+    def _step_stream_beta(self, stream: str, method: str, outcome: float) -> tuple[float, float | None]:
+        """Adapt/select this epoch's beta for one stream; returns ``(beta, arm)`` with
+        ``arm`` only meaningful (non-``None``) under ``'top'``."""
+        adapter = self._get_or_build_beta_adapter(stream, method)
+        if method == 'gpl':
+            return adapter.step(outcome), None
+        # 'top': credit the arm selected *last* epoch with the outcome it produced, then pick
+        # this epoch's arm -- select() before update() would credit the wrong (about-to-be-
+        # picked) arm with an outcome it had nothing to do with.
+        adapter.update(outcome)
+        return adapter.select(), float(adapter.last_arm)
+
+    def _update_critic_ensemble_beta(self) -> None:
+        """Adapt (``'gpl'``) or select (``'top'``) this epoch's pessimism/conservatism beta,
+        independently for each stream.
+
+        A no-op for a stream under ``'none'``/``'cdq'`` (no adaptive state to update) -- so a
+        run with e.g. reward='none' and cost='gpl' only builds/steps the cost-side adapter, and
+        never touches ``reward_critic.beta``. Must run after :meth:`_env.rollout` (needs that
+        rollout's ``Metrics/EpRet``/``Metrics/EpCost`` as the outcome signal) and before
+        :meth:`_update` (writes the new beta into ``reward_critic``/``cost_critic``'s ``beta``
+        buffer so this epoch's critic training uses it) -- see
+        :mod:`omnisafe.utils.critic_ensemble` for why an outcome-driven signal, and why the
+        one-epoch lag (this call's outcome reflects the rollout collected under *last* epoch's
+        beta, not this one) is inherent to this kind of online adaptation, not a bug.
 
         Reward's outcome is the epoch's mean episode return (higher is better, matching what the
         policy gradient itself already optimizes for). Cost's is the negative of the epoch's mean
@@ -1849,60 +1918,26 @@ class PolicyGradient(BaseAlgo):
         always credited as better, matching the safety-conservative framing this whole mechanism
         exists for.
         """
-        method = str(self._cfgs.model_cfgs.critic.get('ensemble_method', 'none'))
-        if method not in ('gpl', 'top'):
+        method_r = self._ensemble_method_for('r')
+        method_c = self._ensemble_method_for('c')
+        if method_r not in ('gpl', 'top') and method_c not in ('gpl', 'top'):
             return
-        critic_cfgs = self._cfgs.model_cfgs.critic
         outcome_r = self._logger.get_stats('Metrics/EpRet')[0]
         outcome_c = -self._logger.get_stats('Metrics/EpCost')[0]
 
-        if method == 'gpl':
-            if self._ensemble_beta_adapter_r is None:
-                self._ensemble_beta_adapter_r = GPLBetaAdapter(
-                    beta_init=float(critic_cfgs.get('beta_init', 0.0) or 0.0),
-                    lr=float(critic_cfgs.get('gpl_beta_lr', 0.05)),
-                    beta_max=float(critic_cfgs.get('gpl_beta_max', 3.0)),
-                )
-                self._ensemble_beta_adapter_c = GPLBetaAdapter(
-                    beta_init=float(critic_cfgs.get('beta_init', 0.0) or 0.0),
-                    lr=float(critic_cfgs.get('gpl_beta_lr', 0.05)),
-                    beta_max=float(critic_cfgs.get('gpl_beta_max', 3.0)),
-                )
-            beta_r = self._ensemble_beta_adapter_r.step(outcome_r)
-            beta_c = self._ensemble_beta_adapter_c.step(outcome_c)
-        else:  # 'top'
-            if self._ensemble_beta_adapter_r is None:
-                beta_grid = list(critic_cfgs.get('top_beta_grid', [-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0]))
-                total_epochs = int(getattr(self._cfgs.train_cfgs, 'epochs', 300))
-                common = {
-                    'beta_grid': beta_grid,
-                    'bandit_lr': float(critic_cfgs.get('top_bandit_lr', 0.1)),
-                    'temperature': float(critic_cfgs.get('top_temperature', 2.0)),
-                    'temperature_min': float(critic_cfgs.get('top_temperature_min', 0.2)),
-                    'decay_steps': int(critic_cfgs.get('top_decay_steps', 0) or total_epochs),
-                }
-                self._ensemble_beta_adapter_r = TOPBanditAdapter(seed=self._seed, **common)
-                self._ensemble_beta_adapter_c = TOPBanditAdapter(
-                    seed=(self._seed + 1 if isinstance(self._seed, int) else None),
-                    **common,
-                )
-            # Credit the arm selected last epoch with the outcome it produced, *then* pick this
-            # epoch's arm -- select() before update() would credit the wrong (about-to-be-picked)
-            # arm with an outcome it had nothing to do with.
-            self._ensemble_beta_adapter_r.update(outcome_r)
-            self._ensemble_beta_adapter_c.update(outcome_c)
-            beta_r = self._ensemble_beta_adapter_r.select()
-            beta_c = self._ensemble_beta_adapter_c.select()
-            self._logger.store(
-                {
-                    'Ensemble/arm_r': float(self._ensemble_beta_adapter_r.last_arm),
-                    'Ensemble/arm_c': float(self._ensemble_beta_adapter_c.last_arm),
-                },
-            )
+        if method_r in ('gpl', 'top'):
+            beta_r, arm_r = self._step_stream_beta('r', method_r, outcome_r)
+            self._actor_critic.reward_critic.beta.fill_(beta_r)
+            self._logger.store({'Ensemble/beta_r': beta_r})
+            if arm_r is not None:
+                self._logger.store({'Ensemble/arm_r': arm_r})
 
-        self._actor_critic.reward_critic.beta.fill_(beta_r)
-        self._actor_critic.cost_critic.beta.fill_(beta_c)
-        self._logger.store({'Ensemble/beta_r': beta_r, 'Ensemble/beta_c': beta_c})
+        if method_c in ('gpl', 'top'):
+            beta_c, arm_c = self._step_stream_beta('c', method_c, outcome_c)
+            self._actor_critic.cost_critic.beta.fill_(beta_c)
+            self._logger.store({'Ensemble/beta_c': beta_c})
+            if arm_c is not None:
+                self._logger.store({'Ensemble/arm_c': arm_c})
 
     def _update_reward_critic(self, obs: torch.Tensor, target_value_r: torch.Tensor) -> None:
         r"""Update value network under a double for loop.

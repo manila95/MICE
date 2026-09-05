@@ -78,12 +78,14 @@ class ActorCritic(nn.Module):
         )
         # Critic-ensemble bias correction (CDQ/GPL/TOP -- see omnisafe.utils.critic_ensemble):
         # 'none' (default) is a single critic (ensemble_size ignored), byte-for-byte the previous
-        # behavior. Shared between reward and cost (not independently configurable per stream)
-        # since the whole point is the aggregation *direction* flips between them (pessimistic
-        # for reward, conservative for cost) -- see critic_ensemble's module docstring. Lives
-        # under model_cfgs.critic (not algo_cfgs) purely because ActorCritic/ConstraintActorCritic
-        # only ever receive model_cfgs -- it's still logically a training-dynamics knob like
-        # critic_norm_coef, not an architecture choice like hidden_sizes.
+        # behavior. This is the reward-side (and shared-default) setting; ConstraintActorCritic's
+        # cost_critic reads its own ensemble_method_cost/ensemble_size_cost/beta_init_cost, each
+        # null-falling-back to this same value -- so the two streams can run different methods
+        # (e.g. reward stays a plain single critic while cost runs 'cdq'), not just different
+        # aggregation *directions* under a shared method. Lives under model_cfgs.critic (not
+        # algo_cfgs) purely because ActorCritic/ConstraintActorCritic only ever receive
+        # model_cfgs -- it's still logically a training-dynamics knob like critic_norm_coef, not
+        # an architecture choice like hidden_sizes.
         ensemble_method = str(model_cfgs.critic.get('ensemble_method', 'none'))
         ensemble_size = int(model_cfgs.critic.get('ensemble_size', 2)) if ensemble_method != 'none' else 1
         beta_init = float(model_cfgs.critic.get('beta_init', 0.0) or 0.0)
