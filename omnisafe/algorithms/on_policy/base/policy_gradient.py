@@ -50,6 +50,7 @@ from omnisafe.utils.state_snapshot import (
 )
 from omnisafe.utils.value_eval import (
     estimate_true_value,
+    compute_gradient_alignment,
     estimate_true_value_same_state_mc,
     estimate_value_from_snapshots,
     pool_correlation_stats,
@@ -644,6 +645,12 @@ class PolicyGradient(BaseAlgo):
                 self._logger.register_key(f'PooledMC/Correlation_pred_target_{stream}')
                 self._logger.register_key(f'PooledMC/EstimationError_target_true_{stream}')
                 self._logger.register_key(f'PooledMC/MeanTarget_{stream}')
+                # Cosine similarity between the score-function policy gradient built from the
+                # critic's predicted values vs. the same estimator built from MC-true values --
+                # see value_eval.compute_gradient_alignment's docstring (Ilyas et al. 2018,
+                # arXiv:1811.02553, eq. 2-3's baseline-subtraction formula, paired across
+                # baseline choice).
+                self._logger.register_key(f'PooledMC/GradientAlignment_{stream}')
             self._logger.register_key('PooledMC/NumProbes')
 
         # Critic-ensemble bias correction (CDQ/GPL/TOP -- see omnisafe.utils.critic_ensemble and
@@ -980,6 +987,15 @@ class PolicyGradient(BaseAlgo):
                 )
                 pooled_stats, pooled_raw = pool_correlation_stats(pooled_sources, prefix='PooledMC/')
                 self._logger.store(pooled_stats)
+                # Gradient-alignment diagnostic (see compute_gradient_alignment's docstring) --
+                # uses the exact same pooled (s, a, return, pred, mc_mean) samples the
+                # correlation numbers above were just computed from, so it answers a directly
+                # comparable question at zero extra rollout cost: not just "does the critic's
+                # prediction correlate with the truth" but "does the critic's error actually
+                # distort the direction of the resulting policy gradient".
+                for stream in ('r', 'c'):
+                    alignment = compute_gradient_alignment(self._actor_critic.actor, pooled_raw, stream)
+                    self._logger.store({f'PooledMC/GradientAlignment_{stream}': alignment})
                 eval_data_bundle['pooled'] = {'stats': pooled_stats, 'raw': pooled_raw}
             # Persist this epoch's eval data (raw + aggregates -- see eval_data_dump.py's
             # docstring for why this needs to exist separately from the online loggers) and save

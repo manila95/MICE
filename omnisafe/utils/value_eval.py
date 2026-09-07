@@ -592,6 +592,16 @@ def estimate_true_value_same_state_mc(
     n_tasks = len(tasks)
     pred_r_of: list[float | None] = [None] * n_tasks
     pred_c_of: list[float | None] = [None] * n_tasks
+    # s0/a0 for each task -- the probe's starting observation and the action the current
+    # stochastic policy actually sampled there, captured once per repeat (not just per probe,
+    # unlike pred_r_of/pred_c_of: a0 genuinely varies repeat-to-repeat since the policy is
+    # stochastic, and more independent (s0, a0, return) samples means a lower-variance gradient
+    # estimate downstream -- see compute_gradient_alignment). Needed to reconstruct
+    # grad_theta log pi(a0|s0) later; storing the tensors themselves (not just floats) since a
+    # score-function gradient needs autograd through the actor, not a rebuilt Normal/Categorical
+    # from summary statistics.
+    obs_of: list[torch.Tensor | None] = [None] * n_tasks
+    act_of: list[torch.Tensor | None] = [None] * n_tasks
     ret_r_of: list[float] = [0.0] * n_tasks
     ret_c_of: list[float] = [0.0] * n_tasks
     target_r_of: list[float] = [0.0] * n_tasks
@@ -614,6 +624,10 @@ def estimate_true_value_same_state_mc(
         # per rollout -- cheap regardless (one batched NN forward pass vs. hundreds of env steps).
         pred_r_batch = value_r.reshape(-1).detach().cpu().numpy()
         pred_c_batch = value_c.reshape(-1).detach().cpu().numpy()
+        # s0/a0 capture for compute_gradient_alignment -- must happen here, before the per-step
+        # loop below overwrites obs/act with later timesteps.
+        obs_s0_cpu = obs.detach().cpu().clone()
+        act_a0_cpu = act.detach().cpu().clone()
 
         # Per-step sequences, needed (in addition to the running discounted sum below, which is
         # all the *true* MC estimate needs) to compute the training-style target after the
@@ -695,6 +709,8 @@ def estimate_true_value_same_state_mc(
         for local_i, task_idx in enumerate(wave_task_idxs):
             pred_r_of[task_idx] = float(pred_r_batch[local_i])
             pred_c_of[task_idx] = float(pred_c_batch[local_i])
+            obs_of[task_idx] = obs_s0_cpu[local_i].clone()
+            act_of[task_idx] = act_a0_cpu[local_i].clone()
             ret_r_of[task_idx] = float(g_r[local_i])
             ret_c_of[task_idx] = float(g_c[local_i])
 
@@ -731,12 +747,21 @@ def estimate_true_value_same_state_mc(
     returns_c_list: list[list[float]] = []
     target_repeats_r_list: list[list[float]] = []
     target_repeats_c_list: list[list[float]] = []
+    # s0/a0 per repeat (mc_repeats-length list of tensors per probe) -- unlike pred_list, which
+    # only reads idxs[0] since V(s0) doesn't depend on the repeat, every repeat's own (s0, a0)
+    # pair is kept here: a0 is a fresh stochastic-policy sample each repeat, so each one is an
+    # independent (s0, a0, return) triple usable by compute_gradient_alignment -- discarding all
+    # but the first would throw away most of the available gradient-estimation samples.
+    obs_list: list[list[torch.Tensor]] = []
+    act_list: list[list[torch.Tensor]] = []
     idx = 0
     for _seed in probe_seeds:
         idxs = range(idx, idx + mc_repeats)
         idx += mc_repeats
         pred_r_list.append(pred_r_of[idxs[0]])
         pred_c_list.append(pred_c_of[idxs[0]])
+        obs_list.append([obs_of[i] for i in idxs])
+        act_list.append([act_of[i] for i in idxs])
         returns_r = [ret_r_of[i] for i in idxs]
         returns_c = [ret_c_of[i] for i in idxs]
         mc_mean_r_list.append(float(np.mean(returns_r)))
@@ -802,6 +827,12 @@ def estimate_true_value_same_state_mc(
         return stats
     raw = {
         'probe_seeds': list(probe_seeds),
+        # Shared between the r/c streams (same rollout, same s0/a0) -- see
+        # compute_gradient_alignment. probe_seeds-length list of mc_repeats-length lists of
+        # tensors (obs_dim / act_dim respectively), not stacked into a single tensor, since
+        # different algorithms/envs can have different obs/act shapes and this keeps the pickle
+        # simple to inspect probe-by-probe.
+        'obs': obs_list, 'action': act_list,
         'r': {
             'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list,
             'target': target_r_list,
@@ -910,6 +941,9 @@ def estimate_value_from_snapshots(
     n_tasks = len(tasks)
     pred_r_of: list[float | None] = [None] * n_tasks
     pred_c_of: list[float | None] = [None] * n_tasks
+    # s0/a0 capture -- see estimate_true_value_same_state_mc's matching comment.
+    obs_of: list[torch.Tensor | None] = [None] * n_tasks
+    act_of: list[torch.Tensor | None] = [None] * n_tasks
     ret_r_of: list[float] = [0.0] * n_tasks
     ret_c_of: list[float] = [0.0] * n_tasks
     target_r_of: list[float] = [0.0] * n_tasks
@@ -933,6 +967,8 @@ def estimate_value_from_snapshots(
         act, value_r, value_c, log_prob = agent.step(obs)
         pred_r_batch = value_r.reshape(-1).detach().cpu().numpy()
         pred_c_batch = value_c.reshape(-1).detach().cpu().numpy()
+        obs_s0_cpu = obs.detach().cpu().clone()
+        act_a0_cpu = act.detach().cpu().clone()
 
         # Per-step sequences, needed to compute the training-style target after the rollout --
         # see estimate_true_value_same_state_mc's matching comment. Sized to the *effective*
@@ -999,6 +1035,8 @@ def estimate_value_from_snapshots(
         for local_i, task_idx in enumerate(wave_task_idxs):
             pred_r_of[task_idx] = float(pred_r_batch[local_i])
             pred_c_of[task_idx] = float(pred_c_batch[local_i])
+            obs_of[task_idx] = obs_s0_cpu[local_i].clone()
+            act_of[task_idx] = act_a0_cpu[local_i].clone()
             ret_r_of[task_idx] = float(g_r[local_i])
             ret_c_of[task_idx] = float(g_c[local_i])
 
@@ -1029,12 +1067,16 @@ def estimate_value_from_snapshots(
     returns_c_list: list[list[float]] = []
     target_repeats_r_list: list[list[float]] = []
     target_repeats_c_list: list[list[float]] = []
+    obs_list: list[list[torch.Tensor]] = []
+    act_list: list[list[torch.Tensor]] = []
     idx = 0
     for _snap in snapshots:
         idxs = range(idx, idx + mc_repeats)
         idx += mc_repeats
         pred_r_list.append(pred_r_of[idxs[0]])
         pred_c_list.append(pred_c_of[idxs[0]])
+        obs_list.append([obs_of[i] for i in idxs])
+        act_list.append([act_of[i] for i in idxs])
         returns_r = [ret_r_of[i] for i in idxs]
         returns_c = [ret_c_of[i] for i in idxs]
         mc_mean_r_list.append(float(np.mean(returns_r)))
@@ -1088,6 +1130,8 @@ def estimate_value_from_snapshots(
     if not return_raw:
         return stats
     raw = {
+        # See estimate_true_value_same_state_mc's matching comment.
+        'obs': obs_list, 'action': act_list,
         'r': {
             'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list,
             'target': target_r_list,
@@ -1141,6 +1185,18 @@ def pool_correlation_stats(raw_list: list[dict], prefix: str = '') -> tuple[dict
     stats: dict = {}
     raw: dict = {}
     num_probes = None
+    # obs/action are shared between streams (same rollout), pooled once here rather than inside
+    # the per-stream loop below -- see estimate_true_value_same_state_mc's matching comment for
+    # why these are kept (compute_gradient_alignment needs them). Only pooled when every source
+    # has them (older raw dicts, or ones built before this field existed, simply omit it).
+    if all('obs' in src and 'action' in src for src in raw_list):
+        obs_pooled: list = []
+        act_pooled: list = []
+        for src in raw_list:
+            obs_pooled.extend(src['obs'])
+            act_pooled.extend(src['action'])
+        raw['obs'] = obs_pooled
+        raw['action'] = act_pooled
     for stream in ('r', 'c'):
         pred_list: list[float] = []
         mc_mean_list: list[float] = []
@@ -1176,3 +1232,116 @@ def pool_correlation_stats(raw_list: list[dict], prefix: str = '') -> tuple[dict
         num_probes = len(pred_list)
     stats[f'{prefix}NumProbes'] = float(num_probes or 0)
     return stats, raw
+
+
+def compute_gradient_alignment(actor, raw: dict, stream: str, device: torch.device | None = None) -> float:
+    r"""Cosine similarity between the score-function policy-gradient estimator built from the
+    critic's *predicted* values vs. the same estimator built from *MC-true* values, holding the
+    realized ``(s, a, return)`` samples fixed.
+
+    Adapted from Ilyas et al. 2018, "A Closer Look at Deep Policy Gradients" (arXiv:1811.02553),
+    eq. 2-3's baseline-subtraction form of the policy gradient:
+
+    .. math::
+        \hat{g}_\theta = \mathbb{E}_\tau\left[\sum_{(s_t,a_t)} \nabla_\theta \log
+        \pi_\theta(a_t|s_t) \cdot (R_t - b(s_t))\right]
+
+    where :math:`b(s_t)` is any state-only baseline -- their Figure 4 compares gradient quality
+    across baseline choices (the trained critic vs. a well-fit "true" value function vs. a
+    trivial zero baseline) via each baseline's independent-resampling *variance*. This function
+    instead pairs the comparison: the exact same realized ``(s, a, R)`` triples are reused for
+    both baselines (:math:`b = V_{\text{pred}}(s)` and :math:`b = V_{\text{true}}(s)`), so the
+    two resulting gradient vectors differ *only* in baseline choice, not also in which samples
+    were drawn -- removing resampling noise as a confound, which is what a "how much does critic
+    error distort the gradient direction" question actually needs (their own variance comparison
+    answers a related but different question: how *noisy* is each baseline's gradient estimate,
+    independent of any other baseline).
+
+    Each probe-repeat's own realized return :math:`R_t` (already collected by
+    :func:`estimate_true_value_same_state_mc`/:func:`estimate_value_from_snapshots` as
+    ``raw[stream]['returns']``) stands in for :math:`Q_\pi(s_t, a_t)` in eq. 2 -- a valid
+    (if higher-variance than a bootstrapped alternative) unbiased estimator, and the only one
+    available without re-deriving a multi-step advantage from per-step true values, which this
+    codebase's probe-based (not full-trajectory) MC study doesn't have -- see this function's
+    call site for that tradeoff discussion.
+
+    Args:
+        actor: The current policy network -- must expose ``__call__(obs) -> Distribution`` and
+            ``log_prob(act) -> Tensor`` (this codebase's standard :class:`~omnisafe.models.
+            actor.gaussian_actor.GaussianActor` interface; ``forward`` caches the distribution
+            ``log_prob`` reads, exactly the pattern used by the real policy loss in
+            ``PolicyGradient._loss_pi``).
+        raw: A ``raw`` dict from :func:`estimate_true_value_same_state_mc` /
+            :func:`estimate_value_from_snapshots` / :func:`pool_correlation_stats` with
+            ``return_raw=True`` -- needs the top-level ``'obs'``/``'action'`` fields (probe-length
+            lists of ``mc_repeats``-length lists of tensors) and ``raw[stream]['pred']``/
+            ``'mc_mean'``/``'returns'``.
+        stream: ``'r'`` or ``'c'`` -- which stream's advantage weights to use. The score vectors
+            :math:`\nabla_\theta \log\pi_\theta(a_t|s_t)` themselves don't depend on the stream
+            (same rollout, same actions); only the baseline/weighting differs.
+        device: Device to run the actor forward/backward on. Defaults to the actor's own
+            parameter device.
+
+    Returns:
+        Scalar cosine similarity in ``[-1, 1]`` between the predicted-baseline and true-baseline
+        gradient estimators (1 = critic error doesn't distort gradient direction at all; 0 = the
+        two are unrelated; negative = critic error actively points the gradient the wrong way).
+        ``NaN`` if either gradient vector has zero norm (degenerate probe set, e.g. every
+        probe's realized return exactly equals its baseline) or ``raw`` lacks ``'obs'``/``'action'``
+        (an older bundle predating this field).
+    """
+    assert stream in ('r', 'c'), f"stream must be 'r' or 'c', got {stream!r}"
+    if 'obs' not in raw or 'action' not in raw:
+        return float('nan')
+
+    if device is None:
+        device = next(actor.parameters()).device
+
+    obs_list, act_list = raw['obs'], raw['action']
+    pred_list = raw[stream]['pred']
+    mc_mean_list = raw[stream]['mc_mean']
+    returns_list = raw[stream]['returns']
+
+    all_obs, all_act, all_adv_pred, all_adv_true = [], [], [], []
+    for i, obs_repeats in enumerate(obs_list):
+        pred_i, true_i = pred_list[i], mc_mean_list[i]
+        for j, obs_ij in enumerate(obs_repeats):
+            all_obs.append(obs_ij)
+            all_act.append(act_list[i][j])
+            ret_ij = returns_list[i][j]
+            all_adv_pred.append(ret_ij - pred_i)
+            all_adv_true.append(ret_ij - true_i)
+
+    if not all_obs:
+        return float('nan')
+
+    obs_t = torch.stack(all_obs).to(device)
+    act_t = torch.stack(all_act).to(device)
+    adv_pred_t = torch.tensor(all_adv_pred, device=device, dtype=torch.float32)
+    adv_true_t = torch.tensor(all_adv_true, device=device, dtype=torch.float32)
+
+    # One forward pass, shared by both gradients below -- the two estimators must differ *only*
+    # in advantage weighting, not also in a re-evaluated (and thus slightly different, since
+    # dropout/etc. could make repeated forward passes non-identical) distribution/log-prob.
+    actor(obs_t)
+    logp = actor.log_prob(act_t)
+
+    params = [p for p in actor.parameters() if p.requires_grad]
+
+    def _weighted_grad(weights: torch.Tensor, retain: bool) -> torch.Tensor:
+        # Advantage weights are treated as constants (.detach()) -- this is the standard
+        # score-function/REINFORCE estimator (eq. 2), where only log pi is differentiated, not
+        # the advantage itself.
+        loss = -(logp * weights.detach()).mean()
+        grads = torch.autograd.grad(loss, params, retain_graph=retain, allow_unused=True)
+        return torch.cat([
+            g.reshape(-1) if g is not None else torch.zeros(p.numel(), device=device)
+            for g, p in zip(grads, params)
+        ])
+
+    g_pred = _weighted_grad(adv_pred_t, retain=True)
+    g_true = _weighted_grad(adv_true_t, retain=False)
+
+    if g_pred.norm() == 0 or g_true.norm() == 0:
+        return float('nan')
+    return torch.nn.functional.cosine_similarity(g_pred.unsqueeze(0), g_true.unsqueeze(0)).item()
