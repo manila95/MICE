@@ -834,189 +834,7 @@ class PolicyGradient(BaseAlgo):
             # docstring. No-op under critic_ensemble_method 'none'/'cdq'.
             self._update_critic_ensemble_beta()
 
-            eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
-            early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
-            effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
-            is_eval_epoch = epoch % effective_eval_freq == 0
-            eval_episodes = getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100)
-            # Collected across whichever of the eval blocks below actually run this epoch, then
-            # persisted as one pickle (raw per-probe arrays + aggregate stats -- the online
-            # loggers, progress.csv/wandb/tensorboard, only ever see the aggregates) plus a
-            # scatter-plot quick-look and a model checkpoint, all on this same eval cadence -- see
-            # the save block after these three studies.
-            eval_data_bundle: dict | None = {'epoch': epoch} if is_eval_epoch else None
-            if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and is_eval_epoch:
-                (
-                    s0_c_error, s0_true_c_m, s0_est_c_m, s0_corr_c,
-                    s0_r_error, s0_true_r_m, s0_est_r_m, s0_corr_r,
-                    all_c_error, all_true_c_m, all_est_c_m, all_corr_c,
-                    all_r_error, all_true_r_m, all_est_r_m, all_corr_r,
-                ) = estimate_true_value(
-                    agent=self._actor_critic,
-                    env=self._env._env,
-                    cfgs=self._cfgs,
-                    discount_r=self._cfgs.algo_cfgs.gamma,
-                    discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma),
-                    eval_episodes=eval_episodes,
-                    epoch=epoch,
-                )
-                # Stored unconditionally (see _init_log's registration comment) -- previously
-                # these numbers only reached wandb, so any use_wandb=False run (every run in the
-                # SR calibration study) never had them in progress.csv at all.
-                self._logger.store({
-                    'Eval_s0/Correlation_c': s0_corr_c.item(),
-                    'Eval_s0/Correlation_r': s0_corr_r.item(),
-                    'Eval_s0/EstimationError_c': s0_c_error.item(),
-                    'Eval_s0/EstimationError_r': s0_r_error.item(),
-                    'Eval_s0/true_value_c': s0_true_c_m.item(),
-                    'Eval_s0/true_value_r': s0_true_r_m.item(),
-                    'Eval_s0/estimate_value_c': s0_est_c_m.item(),
-                    'Eval_s0/estimate_value_r': s0_est_r_m.item(),
-                    'Eval_all/Correlation_c': all_corr_c.item(),
-                    'Eval_all/Correlation_r': all_corr_r.item(),
-                    'Eval_all/EstimationError_c': all_c_error.item(),
-                    'Eval_all/EstimationError_r': all_r_error.item(),
-                    'Eval_all/true_value_c': all_true_c_m.item(),
-                    'Eval_all/true_value_r': all_true_r_m.item(),
-                    'Eval_all/estimate_value_c': all_est_c_m.item(),
-                    'Eval_all/estimate_value_r': all_est_r_m.item(),
-                })
-                # No per-state raw arrays available from estimate_true_value (it only ever
-                # returns aggregates) -- the aggregates themselves are cheap to keep though.
-                eval_data_bundle['eval_s0'] = {
-                    'Correlation_c': s0_corr_c.item(), 'Correlation_r': s0_corr_r.item(),
-                    'EstimationError_c': s0_c_error.item(), 'EstimationError_r': s0_r_error.item(),
-                    'true_value_c': s0_true_c_m.item(), 'true_value_r': s0_true_r_m.item(),
-                    'estimate_value_c': s0_est_c_m.item(), 'estimate_value_r': s0_est_r_m.item(),
-                }
-                eval_data_bundle['eval_all'] = {
-                    'Correlation_c': all_corr_c.item(), 'Correlation_r': all_corr_r.item(),
-                    'EstimationError_c': all_c_error.item(), 'EstimationError_r': all_r_error.item(),
-                    'true_value_c': all_true_c_m.item(), 'true_value_r': all_true_r_m.item(),
-                    'estimate_value_c': all_est_c_m.item(), 'estimate_value_r': all_est_r_m.item(),
-                }
-            # Same-layout Monte-Carlo value study (opt-in, default off -- see
-            # estimate_true_value_same_state_mc's docstring). Shares effective_eval_freq with the
-            # estimate_true_value call above so both diagnostics are read from the same epochs.
-            if getattr(self._cfgs.algo_cfgs, 'mc_value_study', False) and is_eval_epoch:
-                if self._mc_probe_seeds is None:
-                    n_probes = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_probes', 100))
-                    seed_offset = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_seed_offset', 100_000))
-                    # Fixed for the whole run, so every eval epoch probes the same states.
-                    self._mc_probe_seeds = list(range(seed_offset, seed_offset + n_probes))
-                mc_env = self._get_mc_value_study_env()  # also sets _mc_eval_max_episode_steps
-                mc_stats, mc_raw = estimate_true_value_same_state_mc(
-                    agent=self._actor_critic,
-                    env=mc_env,
-                    cfgs=self._cfgs,
-                    discount_r=self._cfgs.algo_cfgs.gamma,
-                    discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma),
-                    probe_seeds=self._mc_probe_seeds,
-                    mc_repeats=int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_repeats', 5)),
-                    epoch=epoch,
-                    sync_normalizer_from=self._env._env,
-                    max_episode_steps=self._mc_eval_max_episode_steps,
-                    return_raw=True,
-                    bootstrap_threshold=getattr(self._cfgs.algo_cfgs, 'mc_eval_bootstrap_threshold', None),
-                )
-                self._logger.store(mc_stats)
-                eval_data_bundle['mc_study'] = {'stats': mc_stats, 'raw': mc_raw}
-            # On-policy intermediate-state value study (opt-in, default off -- see
-            # estimate_value_from_snapshots's docstring). Asks the question the s0 study above
-            # can't: is the critic accurate at states the CURRENT policy actually visits
-            # mid-episode, not just at episode starts. A fresh batch of on-policy states is
-            # collected every eval epoch (not a fixed pool re-probed like the s0 study's
-            # _mc_probe_seeds) -- by epoch 400 the policy visits very different states than at
-            # epoch 20, so re-using an old batch would be scoring accuracy on states the current
-            # policy may never actually visit.
-            if getattr(self._cfgs.algo_cfgs, 'intermediate_state_study', False) and is_eval_epoch:
-                positions = list(
-                    getattr(
-                        self._cfgs.algo_cfgs,
-                        'intermediate_state_study_positions',
-                        [100, 300, 500, 700, 900],
-                    ),
-                )
-                n_probes = int(getattr(self._cfgs.algo_cfgs, 'intermediate_state_study_probes', 20))
-                repeats = int(getattr(self._cfgs.algo_cfgs, 'intermediate_state_study_repeats', 5))
-                interm_env = self._get_intermediate_state_env()
-                sync_obs_normalizer(interm_env, self._env._env)
-                base_seed = 700_000 + epoch * n_probes
-                collected = collect_on_policy_snapshots(
-                    self._actor_critic, interm_env, positions, base_seed=base_seed,
-                )
-                max_eps = self._mc_intermediate_max_episode_steps
-                eval_data_bundle['intermediate_study'] = {}
-                for pos in positions:
-                    pos_stats, pos_raw = estimate_value_from_snapshots(
-                        agent=self._actor_critic,
-                        env=interm_env,
-                        cfgs=self._cfgs,
-                        discount_r=self._cfgs.algo_cfgs.gamma,
-                        discount_c=getattr(
-                            self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma,
-                        ),
-                        snapshots=collected[pos],
-                        # Full fresh-start budget, same as s0 -- not max_eps - pos (the
-                        # physically-remaining steps of the one episode instance this snapshot was
-                        # captured from). See estimate_value_from_snapshots's docstring for why:
-                        # the study wants "value of this state as a start state", not "value given
-                        # the wall-clock left in the episode it happened to be captured from".
-                        horizon=max_eps,
-                        mc_repeats=repeats,
-                        epoch=epoch,
-                        return_raw=True,
-                        bootstrap_threshold=getattr(self._cfgs.algo_cfgs, 'mc_eval_bootstrap_threshold', None),
-                    )
-                    self._logger.store(
-                        {f'IntermediateMC/pos{pos}/{k}': v for k, v in pos_stats.items()},
-                    )
-                    eval_data_bundle['intermediate_study'][pos] = {
-                        'stats': pos_stats, 'raw': pos_raw,
-                    }
-                # Pooled diversity correlation over every state actually evaluated on this
-                # epoch -- s0 (if mc_value_study also ran) plus every intermediate position,
-                # pooled into one set before computing a single correlation. See
-                # value_eval.pool_correlation_stats's docstring for why this is not the same
-                # as averaging the per-category correlations above.
-                pooled_sources = []
-                if 'mc_study' in eval_data_bundle:
-                    pooled_sources.append(eval_data_bundle['mc_study']['raw'])
-                pooled_sources.extend(
-                    pos_data['raw'] for pos_data in eval_data_bundle['intermediate_study'].values()
-                )
-                pooled_stats, pooled_raw = pool_correlation_stats(pooled_sources, prefix='PooledMC/')
-                self._logger.store(pooled_stats)
-                # Gradient-alignment diagnostic (see compute_gradient_alignment's docstring) --
-                # uses the exact same pooled (s, a, return, pred, mc_mean) samples the
-                # correlation numbers above were just computed from, so it answers a directly
-                # comparable question at zero extra rollout cost: not just "does the critic's
-                # prediction correlate with the truth" but "does the critic's error actually
-                # distort the direction of the resulting policy gradient".
-                for stream in ('r', 'c'):
-                    alignment = compute_gradient_alignment(self._actor_critic.actor, pooled_raw, stream)
-                    self._logger.store({f'PooledMC/GradientAlignment_{stream}': alignment})
-                eval_data_bundle['pooled'] = {'stats': pooled_stats, 'raw': pooled_raw}
-            # Persist this epoch's eval data (raw + aggregates -- see eval_data_dump.py's
-            # docstring for why this needs to exist separately from the online loggers) and save
-            # a checkpoint, both on the exact same cadence as the eval blocks above. Note this
-            # runs before this epoch's own dump_tabular() (below), so self._logger's own epoch
-            # counter still equals `epoch` here -- torch_save() names the file accordingly,
-            # consistent with eval_data_bundle's filename.
-            if is_eval_epoch:
-                eval_data_path = save_eval_data(self._logger.log_dir, epoch, eval_data_bundle)
-                log_eval_data_to_wandb(eval_data_path, epoch)
-                scatter_series = []
-                if 'mc_study' in eval_data_bundle:
-                    scatter_series.append(('s0', eval_data_bundle['mc_study']['raw']))
-                for pos, pos_data in eval_data_bundle.get('intermediate_study', {}).items():
-                    scatter_series.append((f'pos{pos}', pos_data['raw']))
-                if 'pooled' in eval_data_bundle:
-                    scatter_series.append(('pooled', eval_data_bundle['pooled']['raw']))
-                if scatter_series:
-                    scatter_path = save_scatter_grid(self._logger.log_dir, epoch, scatter_series)
-                    log_scatter_to_wandb(scatter_path, epoch)
-                self._logger.torch_save()
+            self._run_eval_studies(epoch)
             self._logger.store({'Time/Rollout': time.time() - rollout_time})
 
             update_time = time.time()
@@ -1026,22 +844,7 @@ class PolicyGradient(BaseAlgo):
             self._logger.store({'Metrics/TotalCost': total_cost})
             self._logger.store({'Time/Update': time.time() - update_time})
 
-            # Persist + push the raw arrays behind every log_scatter_image call this epoch made
-            # (Value/Train, Value/Val critic diagnostics; SR diagnostics under td_ridge; any
-            # MICE-specific scatters) -- these run inside self._update(), above, so this has to
-            # happen after it returns, unlike the MC-value-study eval_data_bundle (built and
-            # persisted earlier this same epoch, before self._update()). Empty on any epoch that
-            # logged no scatters (most non-eval epochs), so this is a no-op there.
-            scatter_raw = self._logger.pop_scatter_raw_data()
-            if scatter_raw:
-                scatter_data_path = save_eval_data(
-                    self._logger.log_dir, epoch, scatter_raw, subdir='scatter_data',
-                )
-                log_eval_data_to_wandb(
-                    scatter_data_path, epoch,
-                    name_prefix='scatter-data', artifact_type='scatter_data',
-                    description=f'Raw x/y/c arrays behind every log_scatter_image plot, epoch {epoch}.',
-                )
+            self._persist_scatter_raw_data(epoch)
 
             if self._cfgs.model_cfgs.exploration_noise_anneal:
                 self._actor_critic.annealing(epoch)
@@ -1079,6 +882,227 @@ class PolicyGradient(BaseAlgo):
         self._env.close()
 
         return ep_ret, ep_cost, ep_len
+
+    def _run_eval_studies(self, epoch: int) -> None:
+        """Run this epoch's value-function evaluation studies, if any are due.
+
+        Extracted out of :meth:`learn` so algorithms with their own ``learn()`` loop (MICE, in
+        particular -- it overrides :meth:`learn` outright to drive its own rollout/adapter) can
+        opt into the exact same eval/study/logging machinery by calling this one method at the
+        equivalent point in their own loop (after that epoch's rollout, before ``_update()``),
+        rather than duplicating ~180 lines of eval logic or silently going without it. Covers,
+        in order: :func:`~omnisafe.utils.value_eval.estimate_true_value` (``test_estimate``),
+        the same-layout MC value study (``mc_value_study``), the on-policy intermediate-state
+        study (``intermediate_state_study``) plus its pooled correlation and gradient-alignment
+        diagnostics, and finally persisting this epoch's raw eval data / scatter grid / model
+        checkpoint. All gates are read from ``algo_cfgs`` via ``getattr(..., default)``, so an
+        algorithm/config that doesn't set them simply skips that block, same as before.
+        """
+        eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
+        early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
+        effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
+        is_eval_epoch = epoch % effective_eval_freq == 0
+        eval_episodes = getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100)
+        # Collected across whichever of the eval blocks below actually run this epoch, then
+        # persisted as one pickle (raw per-probe arrays + aggregate stats -- the online
+        # loggers, progress.csv/wandb/tensorboard, only ever see the aggregates) plus a
+        # scatter-plot quick-look and a model checkpoint, all on this same eval cadence -- see
+        # the save block after these three studies.
+        eval_data_bundle: dict | None = {'epoch': epoch} if is_eval_epoch else None
+        if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and is_eval_epoch:
+            (
+                s0_c_error, s0_true_c_m, s0_est_c_m, s0_corr_c,
+                s0_r_error, s0_true_r_m, s0_est_r_m, s0_corr_r,
+                all_c_error, all_true_c_m, all_est_c_m, all_corr_c,
+                all_r_error, all_true_r_m, all_est_r_m, all_corr_r,
+            ) = estimate_true_value(
+                agent=self._actor_critic,
+                env=self._env._env,
+                cfgs=self._cfgs,
+                discount_r=self._cfgs.algo_cfgs.gamma,
+                discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma),
+                eval_episodes=eval_episodes,
+                epoch=epoch,
+            )
+            # Stored unconditionally (see _init_log's registration comment) -- previously
+            # these numbers only reached wandb, so any use_wandb=False run (every run in the
+            # SR calibration study) never had them in progress.csv at all.
+            self._logger.store({
+                'Eval_s0/Correlation_c': s0_corr_c.item(),
+                'Eval_s0/Correlation_r': s0_corr_r.item(),
+                'Eval_s0/EstimationError_c': s0_c_error.item(),
+                'Eval_s0/EstimationError_r': s0_r_error.item(),
+                'Eval_s0/true_value_c': s0_true_c_m.item(),
+                'Eval_s0/true_value_r': s0_true_r_m.item(),
+                'Eval_s0/estimate_value_c': s0_est_c_m.item(),
+                'Eval_s0/estimate_value_r': s0_est_r_m.item(),
+                'Eval_all/Correlation_c': all_corr_c.item(),
+                'Eval_all/Correlation_r': all_corr_r.item(),
+                'Eval_all/EstimationError_c': all_c_error.item(),
+                'Eval_all/EstimationError_r': all_r_error.item(),
+                'Eval_all/true_value_c': all_true_c_m.item(),
+                'Eval_all/true_value_r': all_true_r_m.item(),
+                'Eval_all/estimate_value_c': all_est_c_m.item(),
+                'Eval_all/estimate_value_r': all_est_r_m.item(),
+            })
+            # No per-state raw arrays available from estimate_true_value (it only ever
+            # returns aggregates) -- the aggregates themselves are cheap to keep though.
+            eval_data_bundle['eval_s0'] = {
+                'Correlation_c': s0_corr_c.item(), 'Correlation_r': s0_corr_r.item(),
+                'EstimationError_c': s0_c_error.item(), 'EstimationError_r': s0_r_error.item(),
+                'true_value_c': s0_true_c_m.item(), 'true_value_r': s0_true_r_m.item(),
+                'estimate_value_c': s0_est_c_m.item(), 'estimate_value_r': s0_est_r_m.item(),
+            }
+            eval_data_bundle['eval_all'] = {
+                'Correlation_c': all_corr_c.item(), 'Correlation_r': all_corr_r.item(),
+                'EstimationError_c': all_c_error.item(), 'EstimationError_r': all_r_error.item(),
+                'true_value_c': all_true_c_m.item(), 'true_value_r': all_true_r_m.item(),
+                'estimate_value_c': all_est_c_m.item(), 'estimate_value_r': all_est_r_m.item(),
+            }
+        # Same-layout Monte-Carlo value study (opt-in, default off -- see
+        # estimate_true_value_same_state_mc's docstring). Shares effective_eval_freq with the
+        # estimate_true_value call above so both diagnostics are read from the same epochs.
+        if getattr(self._cfgs.algo_cfgs, 'mc_value_study', False) and is_eval_epoch:
+            if self._mc_probe_seeds is None:
+                n_probes = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_probes', 100))
+                seed_offset = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_seed_offset', 100_000))
+                # Fixed for the whole run, so every eval epoch probes the same states.
+                self._mc_probe_seeds = list(range(seed_offset, seed_offset + n_probes))
+            mc_env = self._get_mc_value_study_env()  # also sets _mc_eval_max_episode_steps
+            mc_stats, mc_raw = estimate_true_value_same_state_mc(
+                agent=self._actor_critic,
+                env=mc_env,
+                cfgs=self._cfgs,
+                discount_r=self._cfgs.algo_cfgs.gamma,
+                discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma),
+                probe_seeds=self._mc_probe_seeds,
+                mc_repeats=int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_repeats', 5)),
+                epoch=epoch,
+                sync_normalizer_from=self._env._env,
+                max_episode_steps=self._mc_eval_max_episode_steps,
+                return_raw=True,
+                bootstrap_threshold=getattr(self._cfgs.algo_cfgs, 'mc_eval_bootstrap_threshold', None),
+            )
+            self._logger.store(mc_stats)
+            eval_data_bundle['mc_study'] = {'stats': mc_stats, 'raw': mc_raw}
+        # On-policy intermediate-state value study (opt-in, default off -- see
+        # estimate_value_from_snapshots's docstring). Asks the question the s0 study above
+        # can't: is the critic accurate at states the CURRENT policy actually visits
+        # mid-episode, not just at episode starts. A fresh batch of on-policy states is
+        # collected every eval epoch (not a fixed pool re-probed like the s0 study's
+        # _mc_probe_seeds) -- by epoch 400 the policy visits very different states than at
+        # epoch 20, so re-using an old batch would be scoring accuracy on states the current
+        # policy may never actually visit.
+        if getattr(self._cfgs.algo_cfgs, 'intermediate_state_study', False) and is_eval_epoch:
+            positions = list(
+                getattr(
+                    self._cfgs.algo_cfgs,
+                    'intermediate_state_study_positions',
+                    [100, 300, 500, 700, 900],
+                ),
+            )
+            n_probes = int(getattr(self._cfgs.algo_cfgs, 'intermediate_state_study_probes', 20))
+            repeats = int(getattr(self._cfgs.algo_cfgs, 'intermediate_state_study_repeats', 5))
+            interm_env = self._get_intermediate_state_env()
+            sync_obs_normalizer(interm_env, self._env._env)
+            base_seed = 700_000 + epoch * n_probes
+            collected = collect_on_policy_snapshots(
+                self._actor_critic, interm_env, positions, base_seed=base_seed,
+            )
+            max_eps = self._mc_intermediate_max_episode_steps
+            eval_data_bundle['intermediate_study'] = {}
+            for pos in positions:
+                pos_stats, pos_raw = estimate_value_from_snapshots(
+                    agent=self._actor_critic,
+                    env=interm_env,
+                    cfgs=self._cfgs,
+                    discount_r=self._cfgs.algo_cfgs.gamma,
+                    discount_c=getattr(
+                        self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma,
+                    ),
+                    snapshots=collected[pos],
+                    # Full fresh-start budget, same as s0 -- not max_eps - pos (the
+                    # physically-remaining steps of the one episode instance this snapshot was
+                    # captured from). See estimate_value_from_snapshots's docstring for why:
+                    # the study wants "value of this state as a start state", not "value given
+                    # the wall-clock left in the episode it happened to be captured from".
+                    horizon=max_eps,
+                    mc_repeats=repeats,
+                    epoch=epoch,
+                    return_raw=True,
+                    bootstrap_threshold=getattr(self._cfgs.algo_cfgs, 'mc_eval_bootstrap_threshold', None),
+                )
+                self._logger.store(
+                    {f'IntermediateMC/pos{pos}/{k}': v for k, v in pos_stats.items()},
+                )
+                eval_data_bundle['intermediate_study'][pos] = {
+                    'stats': pos_stats, 'raw': pos_raw,
+                }
+            # Pooled diversity correlation over every state actually evaluated on this
+            # epoch -- s0 (if mc_value_study also ran) plus every intermediate position,
+            # pooled into one set before computing a single correlation. See
+            # value_eval.pool_correlation_stats's docstring for why this is not the same
+            # as averaging the per-category correlations above.
+            pooled_sources = []
+            if 'mc_study' in eval_data_bundle:
+                pooled_sources.append(eval_data_bundle['mc_study']['raw'])
+            pooled_sources.extend(
+                pos_data['raw'] for pos_data in eval_data_bundle['intermediate_study'].values()
+            )
+            pooled_stats, pooled_raw = pool_correlation_stats(pooled_sources, prefix='PooledMC/')
+            self._logger.store(pooled_stats)
+            # Gradient-alignment diagnostic (see compute_gradient_alignment's docstring) --
+            # uses the exact same pooled (s, a, return, pred, mc_mean) samples the
+            # correlation numbers above were just computed from, so it answers a directly
+            # comparable question at zero extra rollout cost: not just "does the critic's
+            # prediction correlate with the truth" but "does the critic's error actually
+            # distort the direction of the resulting policy gradient".
+            for stream in ('r', 'c'):
+                alignment = compute_gradient_alignment(self._actor_critic.actor, pooled_raw, stream)
+                self._logger.store({f'PooledMC/GradientAlignment_{stream}': alignment})
+            eval_data_bundle['pooled'] = {'stats': pooled_stats, 'raw': pooled_raw}
+        # Persist this epoch's eval data (raw + aggregates -- see eval_data_dump.py's
+        # docstring for why this needs to exist separately from the online loggers) and save
+        # a checkpoint, both on the exact same cadence as the eval blocks above. Note this
+        # runs before this epoch's own dump_tabular() (in learn()), so self._logger's own epoch
+        # counter still equals `epoch` here -- torch_save() names the file accordingly,
+        # consistent with eval_data_bundle's filename.
+        if is_eval_epoch:
+            eval_data_path = save_eval_data(self._logger.log_dir, epoch, eval_data_bundle)
+            log_eval_data_to_wandb(eval_data_path, epoch)
+            scatter_series = []
+            if 'mc_study' in eval_data_bundle:
+                scatter_series.append(('s0', eval_data_bundle['mc_study']['raw']))
+            for pos, pos_data in eval_data_bundle.get('intermediate_study', {}).items():
+                scatter_series.append((f'pos{pos}', pos_data['raw']))
+            if 'pooled' in eval_data_bundle:
+                scatter_series.append(('pooled', eval_data_bundle['pooled']['raw']))
+            if scatter_series:
+                scatter_path = save_scatter_grid(self._logger.log_dir, epoch, scatter_series)
+                log_scatter_to_wandb(scatter_path, epoch)
+            self._logger.torch_save()
+
+    def _persist_scatter_raw_data(self, epoch: int) -> None:
+        """Persist + push the raw arrays behind every ``log_scatter_image`` call this epoch made.
+
+        (Value/Train, Value/Val critic diagnostics; SR diagnostics under td_ridge; any
+        MICE-specific scatters.) These run inside ``_update()``, so this must be called after it
+        returns -- unlike :meth:`_run_eval_studies`'s ``eval_data_bundle`` (built and persisted
+        earlier the same epoch, before ``_update()``). Empty on any epoch that logged no scatters
+        (most non-eval epochs), so this is a no-op there. Extracted alongside
+        :meth:`_run_eval_studies` so algorithms with their own ``learn()`` loop (MICE) can call it
+        too.
+        """
+        scatter_raw = self._logger.pop_scatter_raw_data()
+        if scatter_raw:
+            scatter_data_path = save_eval_data(
+                self._logger.log_dir, epoch, scatter_raw, subdir='scatter_data',
+            )
+            log_eval_data_to_wandb(
+                scatter_data_path, epoch,
+                name_prefix='scatter-data', artifact_type='scatter_data',
+                description=f'Raw x/y/c arrays behind every log_scatter_image plot, epoch {epoch}.',
+            )
 
     def _update(self) -> None:
         """Update actor, critic.

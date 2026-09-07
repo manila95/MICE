@@ -21,7 +21,6 @@ from omnisafe.utils.tools import (
 from omnisafe.algorithms.on_policy.mice.mice_rollout import MICEAdapter
 from omnisafe.algorithms.on_policy.mice.mice_buffer import FlashBulbMemory, MICEVectorBuffer
 import omnisafe.algorithms.on_policy.mice.utils as utl
-from omnisafe.utils.value_eval import estimate_true_value
 
 
 @registry.register
@@ -102,20 +101,12 @@ class MICE(CPO):
                 )
             )
 
-            eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
-            early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
-            effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
-            eval_episodes = getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100)
-            if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and epoch % effective_eval_freq == 0:
-                estimate_true_value(
-                    agent=self._actor_critic,
-                    env=self._env._env,
-                    cfgs=self._cfgs,
-                    discount_r=self._cfgs.algo_cfgs.gamma,
-                    discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma),
-                    eval_episodes=eval_episodes,
-                    epoch=epoch,
-                )
+            # Shared with CPO/PolicyGradient -- runs estimate_true_value (test_estimate),
+            # mc_value_study, intermediate_state_study + pooled correlation/gradient-alignment,
+            # and persists this epoch's eval data/scatter grid/checkpoint on the same cadence.
+            # See PolicyGradient._run_eval_studies's docstring for why this lives there and not
+            # duplicated here.
+            self._run_eval_studies(epoch)
             self._logger.store({'Time/Rollout': time.time() - rollout_time})
 
             update_time = time.time()
@@ -123,6 +114,7 @@ class MICE(CPO):
             self._update()
             total_cost += self._env._epoch_cost_sum
             self._logger.store({'Metrics/TotalCost': total_cost})
+            self._persist_scatter_raw_data(epoch)
             # self._logger.log_histogram('plots/beta_', self._epoch_beta_, step=epoch + 1)
             self._logger.log_histogram_image('plots/beta_', self._epoch_beta_, step=epoch + 1)
             self._logger.log_scatter_image(
