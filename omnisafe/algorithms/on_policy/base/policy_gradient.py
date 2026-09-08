@@ -1081,6 +1081,29 @@ class PolicyGradient(BaseAlgo):
                 scatter_path = save_scatter_grid(self._logger.log_dir, epoch, scatter_series)
                 log_scatter_to_wandb(scatter_path, epoch)
             self._logger.torch_save()
+            # Push this epoch's checkpoint to wandb too -- previously local-only (see
+            # Logger.torch_save's docstring), meaning any retroactive analysis pulling a run's
+            # eval_data pickles (e.g. to recompute compute_gradient_alignment offline, since that
+            # needs the actor's *weights* at this exact epoch, not just the (obs, action, returns,
+            # pred, mc_mean) the pickle already carries) had no way to reconstruct the actor and
+            # was permanently stuck with whatever got logged live. _what_to_save on this
+            # (on-policy) path is already just {'pi': actor, 'obs_normalizer': ...} -- i.e.
+            # already the lightweight, actor-only snapshot this needs, not a heavier full-model-
+            # plus-optimizer checkpoint -- so this reuses that exact file rather than writing a
+            # second, redundant copy. Naming/cadence mirrors eval_data_path exactly (same epoch,
+            # same is_eval_epoch gate) so the two artifacts are always available as a pair.
+            checkpoint_path = os.path.join(self._logger.log_dir, 'torch_save', f'epoch-{epoch}.pt')
+            if os.path.exists(checkpoint_path):
+                log_eval_data_to_wandb(
+                    checkpoint_path, epoch,
+                    name_prefix='actor-snapshot', artifact_type='actor_snapshot',
+                    description=(
+                        f'Actor (+ obs_normalizer) state dict at epoch {epoch}, keyed by '
+                        f"_what_to_save ('pi', optionally 'obs_normalizer'). Pairs with this "
+                        f'same epoch\'s eval-data artifact to retroactively recompute '
+                        f'compute_gradient_alignment offline.'
+                    ),
+                )
 
     def _persist_scatter_raw_data(self, epoch: int) -> None:
         """Persist + push the raw arrays behind every ``log_scatter_image`` call this epoch made.
