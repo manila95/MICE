@@ -61,6 +61,7 @@ class MICE(CPO):
             cost_gamma=getattr(self._cfgs.algo_cfgs, 'cost_gamma', None),
             cost_advantage_estimator=getattr(self._cfgs.algo_cfgs, 'cost_adv_estimation_method', None),
             constant_cost_source=getattr(self._cfgs.algo_cfgs, 'constant_cost_source', 'fixed'),
+            cost_limit=self._cfgs.algo_cfgs.cost_limit,
         )
 
         self._RPNet = utl.RandomProjection(self._env.observation_space.shape[0], self._cfgs.model_cfgs.emb_dim).to(
@@ -77,7 +78,7 @@ class MICE(CPO):
         self._logger.register_key('Train/log_beta')
         if (
             self._cfgs.algo_cfgs.constant_cost is not None
-            or getattr(self._cfgs.algo_cfgs, 'constant_cost_source', 'fixed') == 'ep_cost'
+            or getattr(self._cfgs.algo_cfgs, 'constant_cost_source', 'fixed') in ('ep_cost', 'excess_cost')
         ):
             self._logger.register_key('Train/effective_constant_cost')
         self._logger.register_key('Value/Adv_c')
@@ -153,9 +154,9 @@ class MICE(CPO):
             )
             self._logger.store({'Train/log_beta': np.log(max(self._epoch_beta, 1e-10))})
             constant_cost_source = getattr(self._cfgs.algo_cfgs, 'constant_cost_source', 'fixed')
-            if self._cfgs.algo_cfgs.constant_cost is not None or constant_cost_source == 'ep_cost':
+            if self._cfgs.algo_cfgs.constant_cost is not None or constant_cost_source in ('ep_cost', 'excess_cost'):
                 current_ep_cost = None
-                if constant_cost_source == 'ep_cost':
+                if constant_cost_source in ('ep_cost', 'excess_cost'):
                     val = self._logger.get_stats('Metrics/EpCost')[0]
                     current_ep_cost = val if val == val else None  # val==val is False iff NaN
                 self._logger.store({

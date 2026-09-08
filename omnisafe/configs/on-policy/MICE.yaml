@@ -98,10 +98,10 @@ defaults:
     # if test the cost estimate error
     test_estimate: True
     # constant intrinsic cost added to every transition (None to use KNN-based intrinsic cost).
-    # Only read when constant_cost_source is 'fixed' -- ignored entirely under 'ep_cost'.
+    # Only read when constant_cost_source is 'fixed' -- ignored entirely under 'ep_cost'/'excess_cost'.
     constant_cost: ~
     # decay schedule for constant_cost: None (no decay), 'exponential', or 'step'. Only read
-    # when constant_cost_source is 'fixed' -- 'ep_cost' mode never decays (see below).
+    # when constant_cost_source is 'fixed' -- 'ep_cost'/'excess_cost' never decay (see below).
     cost_decay_type: ~
     # exponential: effective_cost = constant_cost * cost_decay_rate^epoch
     # half-life ~46 epochs → ~1% of initial value by epoch 300
@@ -110,26 +110,34 @@ defaults:
     # factor=0.4, interval=50 → 6 drops → ~0.4% of initial value by epoch 300
     cost_decay_step_interval: 50
     cost_decay_factor: 0.4
-    # How the "constant" intrinsic cost is determined once constant_cost (or 'ep_cost' mode
-    # below) is active, instead of the default KNN-based novelty signal:
-    #   'fixed'   -- constant_cost (optionally annealed by cost_decay_type above). Must set
-    #                constant_cost to a float for this mode to actually trigger.
-    #   'ep_cost' -- self-tracking: every path uses the live running mean of Metrics/EpCost (the
-    #                same rolling-window stat CPO's own trust-region step reads), refreshed as
-    #                episodes complete. No decay schedule applies -- it already moves with
-    #                training. constant_cost/cost_decay_type are ignored in this mode. Before any
-    #                episode anywhere in the run has completed (empty logger window), falls back
-    #                to 0.0 (no intrinsic penalty yet) rather than erroring.
+    # How the "constant" intrinsic cost is determined once constant_cost (or one of the two
+    # self-tracking modes below) is active, instead of the default KNN-based novelty signal:
+    #   'fixed'       -- constant_cost (optionally annealed by cost_decay_type above). Must set
+    #                    constant_cost to a float for this mode to actually trigger.
+    #   'ep_cost'     -- self-tracking: every path uses the live running mean of Metrics/EpCost
+    #                    (the same rolling-window stat CPO's own trust-region step reads),
+    #                    refreshed as episodes complete. Never goes to zero even once the
+    #                    constraint is satisfied -- it tracks EpCost itself, not the violation.
+    #   'excess_cost' -- same live-tracking idea, but clamped to max(Metrics/EpCost - cost_limit,
+    #                    0.0): how far over budget the policy currently is, not its raw cost.
+    #                    Self-extinguishing -- goes to exactly 0 once EpCost <= cost_limit, rather
+    #                    than continuing to apply a deflation the policy no longer needs. Always
+    #                    >= 0 by construction. Reads algo_cfgs.cost_limit (same value CPO's own
+    #                    trust-region check uses).
+    # Both 'ep_cost' and 'excess_cost' ignore constant_cost/cost_decay_type entirely -- no decay
+    # schedule applies since the value already moves with training. Before any episode anywhere
+    # in the run has completed (empty logger window), both fall back to 0.0 (no intrinsic
+    # penalty yet) rather than erroring.
     constant_cost_source: fixed
     # if True, intrinsic_costs are zeroed out of deltas_n. Under the default KNN-adaptive
     # mechanism (constant_cost unset) this only affects the deltas_n diagnostic scatter plots and
     # the beta-adaptation-rate signal -- the real adv_c/target_value_c (built from a separately-
-    # computed `deltas` that always includes beta*intrinsic_costs) is unaffected. Under
-    # constant_cost ('fixed' or 'ep_cost') there is no separate `deltas` -- deltas_n IS what
-    # feeds adv_c/target_value_c directly, so here this flag actually strips the constant
-    # intrinsic cost out of the cost critic's target and the cost-advantage policy-gradient term
-    # too, not just the diagnostics. The intrinsic cost still reaches the CPO trust-region
-    # feasibility check via ep_discount_ci regardless of this flag either way.
+    # computed `deltas` that always includes beta*intrinsic_costs) is unaffected. Under any
+    # constant_cost mode ('fixed'/'ep_cost'/'excess_cost') there is no separate `deltas` --
+    # deltas_n IS what feeds adv_c/target_value_c directly, so here this flag actually strips the
+    # constant intrinsic cost out of the cost critic's target and the cost-advantage
+    # policy-gradient term too, not just the diagnostics. The intrinsic cost still reaches the
+    # CPO trust-region feasibility check via ep_discount_ci regardless of this flag either way.
     no_intrinsic_in_deltas: False
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5

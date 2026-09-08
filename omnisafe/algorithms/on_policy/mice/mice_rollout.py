@@ -71,19 +71,20 @@ class MICEAdapter(OnPolicyAdapter):
                     
             intrinsic_cost = torch.zeros_like(cost)
 
-            # 'ep_cost' mode determines the effective constant cost per-path down in
-            # MICEBuffer.finish_path (from the live Metrics/EpCost value, see below) rather than
-            # here, so this rollout-time value is a placeholder that gets overwritten before it's
-            # ever used -- computed as a plain zero fill purely to skip the (comparatively
+            # 'ep_cost'/'excess_cost' modes determine the effective constant cost per-path down
+            # in MICEBuffer.finish_path (from the live Metrics/EpCost value, see below) rather
+            # than here, so this rollout-time value is a placeholder that gets overwritten before
+            # it's ever used -- computed as a plain zero fill purely to skip the (comparatively
             # expensive) KNN distance computation below, matching the existing 'fixed'
             # constant_cost branch's same skip-KNN rationale.
             constant_cost_source = getattr(self._cfgs.algo_cfgs, 'constant_cost_source', 'fixed')
             using_constant_cost = (
-                self._cfgs.algo_cfgs.constant_cost is not None or constant_cost_source == 'ep_cost'
+                self._cfgs.algo_cfgs.constant_cost is not None
+                or constant_cost_source in ('ep_cost', 'excess_cost')
             )
             # replace the existing KNN block with this:
 
-            if using_constant_cost and constant_cost_source == 'ep_cost':
+            if using_constant_cost and constant_cost_source in ('ep_cost', 'excess_cost'):
                 pass  # intrinsic_cost stays zero; MICEBuffer.finish_path fills in the real value.
             elif self._cfgs.algo_cfgs.constant_cost is not None:
                 ci_val = torch.tensor(
@@ -174,7 +175,7 @@ class MICEAdapter(OnPolicyAdapter):
                         self._ep_discount_ci[idx] = 0.0
 
                     current_ep_cost = None
-                    if getattr(self._cfgs.algo_cfgs, 'constant_cost_source', 'fixed') == 'ep_cost':
+                    if getattr(self._cfgs.algo_cfgs, 'constant_cost_source', 'fixed') in ('ep_cost', 'excess_cost'):
                         # Live running mean of Metrics/EpCost (see _log_metrics above -- for a
                         # done/time_out path it's just been updated with this very episode's own
                         # cost, for a forced epoch_end truncation it's whatever's already in the

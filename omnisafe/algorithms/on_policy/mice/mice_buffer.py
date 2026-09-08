@@ -46,6 +46,7 @@ class MICEBuffer(OnPolicyBuffer):
         cost_gamma: Optional[float] = None,
         cost_advantage_estimator: Optional[str] = None,
         constant_cost_source: str = 'fixed',
+        cost_limit: Optional[float] = None,
     ):
         super().__init__(
             obs_space,
@@ -76,11 +77,13 @@ class MICEBuffer(OnPolicyBuffer):
         self.cost_decay_step_interval = cost_decay_step_interval
         self.cost_decay_factor = cost_decay_factor
         self.no_intrinsic_in_deltas = no_intrinsic_in_deltas
-        if constant_cost_source not in ('fixed', 'ep_cost'):
+        if constant_cost_source not in ('fixed', 'ep_cost', 'excess_cost'):
             raise ValueError(
-                f"Unknown constant_cost_source: {constant_cost_source!r}. Choose 'fixed' or 'ep_cost'."
+                f"Unknown constant_cost_source: {constant_cost_source!r}. "
+                "Choose 'fixed', 'ep_cost', or 'excess_cost'."
             )
         self.constant_cost_source = constant_cost_source
+        self.cost_limit = cost_limit
 
     def _get_effective_constant_cost(
         self, epoch: int, current_ep_cost: Optional[float] = None,
@@ -95,6 +98,15 @@ class MICEBuffer(OnPolicyBuffer):
         # falling back to the KNN-adaptive branch for the first few calls of a run.
         if self.constant_cost_source == 'ep_cost':
             return current_ep_cost if current_ep_cost is not None else 0.0
+        # 'excess_cost' mode: same live-tracking idea, but clamped to how far EpCost currently
+        # is *over* cost_limit rather than the raw EpCost value. Self-extinguishing: once the
+        # policy satisfies the constraint (EpCost <= cost_limit), this goes to exactly 0 rather
+        # than continuing to apply a deflation the policy no longer needs. Always >= 0 by
+        # construction (max with 0.0), same as 'ep_cost'/'fixed' with a non-negative constant_cost.
+        if self.constant_cost_source == 'excess_cost':
+            if current_ep_cost is None:
+                return 0.0
+            return max(current_ep_cost - (self.cost_limit or 0.0), 0.0)
         if self.constant_cost is None:
             return None
         if self.cost_decay_type is None:
@@ -297,6 +309,7 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
         cost_gamma: Optional[float] = None,
         cost_advantage_estimator: Optional[str] = None,
         constant_cost_source: str = 'fixed',
+        cost_limit: Optional[float] = None,
     ):
         self._num_buffers = num_envs
         self._standardized_adv_r = standardized_adv_r
@@ -323,6 +336,7 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
                 cost_gamma=cost_gamma,
                 cost_advantage_estimator=cost_advantage_estimator,
                 constant_cost_source=constant_cost_source,
+                cost_limit=cost_limit,
             )
             for _ in range(num_envs)
         ]
