@@ -117,19 +117,21 @@ defaults:
     value_eval_episodes: 100
     # same-layout Monte-Carlo value study (see omnisafe.utils.value_eval.
     # estimate_true_value_same_state_mc), run via PolicyGradient._run_eval_studies (shared with
-    # CPO/TRPOPID -- see mice.py's learn()). Off by default here (unlike CPO.yaml, where it's on)
-    # so existing MICE runs/sweeps don't silently pick up extra eval-epoch cost; opt in per-run.
-    mc_value_study: False
+    # CPO/TRPOPID -- see mice.py's learn()). On by default, matching CPO.yaml -- adds meaningful
+    # eval-epoch cost (mc_value_study_probes * mc_value_study_repeats extra full episodes);
+    # disable per-run if that cost isn't wanted.
+    mc_value_study: True
     mc_value_study_probes: 17
     mc_value_study_repeats: 10
     mc_value_study_seed_offset: 100000
     mc_value_study_vector_envs: 5
     mc_eval_bootstrap_threshold: 0.01
     # on-policy intermediate-state value study (see omnisafe.utils.value_eval.
-    # estimate_value_from_snapshots) -- same opt-in-by-default-off rationale as mc_value_study
-    # above. Also gates PooledMC/Correlation_r/_c and PooledMC/GradientAlignment_r/_c, which pool
-    # this study's states with mc_value_study's s0 probes (see pool_correlation_stats's docstring).
-    intermediate_state_study: False
+    # estimate_value_from_snapshots) -- on by default, matching CPO.yaml, same rationale as
+    # mc_value_study above. Also gates PooledMC/Correlation_r/_c and
+    # PooledMC/GradientAlignment_r/_c, which pool this study's states with mc_value_study's s0
+    # probes (see pool_correlation_stats's docstring).
+    intermediate_state_study: True
     intermediate_state_study_positions: [100, 300, 500, 700, 900]
     intermediate_state_study_probes: 17
     intermediate_state_study_repeats: 10
