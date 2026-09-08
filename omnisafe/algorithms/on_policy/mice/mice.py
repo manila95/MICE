@@ -60,6 +60,7 @@ class MICE(CPO):
             no_intrinsic_in_deltas=self._cfgs.algo_cfgs.no_intrinsic_in_deltas,
             cost_gamma=getattr(self._cfgs.algo_cfgs, 'cost_gamma', None),
             cost_advantage_estimator=getattr(self._cfgs.algo_cfgs, 'cost_adv_estimation_method', None),
+            constant_cost_source=getattr(self._cfgs.algo_cfgs, 'constant_cost_source', 'fixed'),
         )
 
         self._RPNet = utl.RandomProjection(self._env.observation_space.shape[0], self._cfgs.model_cfgs.emb_dim).to(
@@ -74,7 +75,10 @@ class MICE(CPO):
         self._logger.register_key('Train/discount_ci')
         self._logger.register_key('Train/intrinsic_factor')
         self._logger.register_key('Train/log_beta')
-        if self._cfgs.algo_cfgs.constant_cost is not None:
+        if (
+            self._cfgs.algo_cfgs.constant_cost is not None
+            or getattr(self._cfgs.algo_cfgs, 'constant_cost_source', 'fixed') == 'ep_cost'
+        ):
             self._logger.register_key('Train/effective_constant_cost')
         self._logger.register_key('Value/Adv_c')
 
@@ -148,8 +152,17 @@ class MICE(CPO):
                 c_label='timestep',
             )
             self._logger.store({'Train/log_beta': np.log(max(self._epoch_beta, 1e-10))})
-            if self._cfgs.algo_cfgs.constant_cost is not None:
-                self._logger.store({'Train/effective_constant_cost': self._buf.get_effective_constant_cost(epoch)})
+            constant_cost_source = getattr(self._cfgs.algo_cfgs, 'constant_cost_source', 'fixed')
+            if self._cfgs.algo_cfgs.constant_cost is not None or constant_cost_source == 'ep_cost':
+                current_ep_cost = None
+                if constant_cost_source == 'ep_cost':
+                    val = self._logger.get_stats('Metrics/EpCost')[0]
+                    current_ep_cost = val if val == val else None  # val==val is False iff NaN
+                self._logger.store({
+                    'Train/effective_constant_cost': self._buf.get_effective_constant_cost(
+                        epoch, current_ep_cost,
+                    ),
+                })
             self._logger.store({'Time/Update': time.time() - update_time})
 
             if self._cfgs.model_cfgs.exploration_noise_anneal:

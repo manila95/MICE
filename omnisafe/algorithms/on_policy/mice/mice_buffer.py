@@ -45,6 +45,7 @@ class MICEBuffer(OnPolicyBuffer):
         no_intrinsic_in_deltas: bool = False,
         cost_gamma: Optional[float] = None,
         cost_advantage_estimator: Optional[str] = None,
+        constant_cost_source: str = 'fixed',
     ):
         super().__init__(
             obs_space,
@@ -75,8 +76,25 @@ class MICEBuffer(OnPolicyBuffer):
         self.cost_decay_step_interval = cost_decay_step_interval
         self.cost_decay_factor = cost_decay_factor
         self.no_intrinsic_in_deltas = no_intrinsic_in_deltas
+        if constant_cost_source not in ('fixed', 'ep_cost'):
+            raise ValueError(
+                f"Unknown constant_cost_source: {constant_cost_source!r}. Choose 'fixed' or 'ep_cost'."
+            )
+        self.constant_cost_source = constant_cost_source
 
-    def _get_effective_constant_cost(self, epoch: int) -> Optional[float]:
+    def _get_effective_constant_cost(
+        self, epoch: int, current_ep_cost: Optional[float] = None,
+    ) -> Optional[float]:
+        # 'ep_cost' mode: the "constant" this epoch is just the running Metrics/EpCost mean
+        # (see MICEAdapter.rollout, which reads it fresh off the logger right before each
+        # finish_path call) -- self-tracking, so no decay schedule applies; constant_cost's
+        # literal value/cost_decay_type are ignored entirely in this mode. current_ep_cost is
+        # None only before any episode has ever completed (empty logger window), in which case
+        # there's no cost signal yet -- fall back to 0.0 (no intrinsic penalty) rather than None,
+        # so this still routes through the constant-cost branch below instead of unpredictably
+        # falling back to the KNN-adaptive branch for the first few calls of a run.
+        if self.constant_cost_source == 'ep_cost':
+            return current_ep_cost if current_ep_cost is not None else 0.0
         if self.constant_cost is None:
             return None
         if self.cost_decay_type is None:
@@ -139,6 +157,7 @@ class MICEBuffer(OnPolicyBuffer):
         last_value_c: torch.Tensor = torch.zeros(1),
         lr: float = 0.001,
         epoch: int = 0,
+        current_ep_cost: Optional[float] = None,
     ) -> None:
         """Finish the current path and calculate the advantages of state-action pairs."""
         path_slice = slice(self.path_start_idx, self.ptr)
@@ -166,7 +185,8 @@ class MICEBuffer(OnPolicyBuffer):
         intrinsic_costs = self.data['intrinsic_costs'][path_slice]
 
         adv_c, target_value_c, ep_discount_ci = self._calculate_balancing_intrinsic_adv_and_value_targets(
-            values_c, costs, lam=self._lam_c, intrinsic_costs=intrinsic_costs, lr=lr, epoch=epoch
+            values_c, costs, lam=self._lam_c, intrinsic_costs=intrinsic_costs, lr=lr, epoch=epoch,
+            current_ep_cost=current_ep_cost,
         )
         self.data['ep_discount_ci'][path_slice] = ep_discount_ci
 
@@ -179,9 +199,10 @@ class MICEBuffer(OnPolicyBuffer):
         self.path_start_idx = self.ptr
 
     def _calculate_balancing_intrinsic_adv_and_value_targets(
-        self, values_c, costs, lam, intrinsic_costs, lr, epoch: int = 0
+        self, values_c, costs, lam, intrinsic_costs, lr, epoch: int = 0,
+        current_ep_cost: Optional[float] = None,
     ):
-        effective_constant_cost = self._get_effective_constant_cost(epoch)
+        effective_constant_cost = self._get_effective_constant_cost(epoch, current_ep_cost)
 
         if self._advantage_estimator == 'gae':
             if effective_constant_cost is not None:
@@ -275,6 +296,7 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
         no_intrinsic_in_deltas: bool = False,
         cost_gamma: Optional[float] = None,
         cost_advantage_estimator: Optional[str] = None,
+        constant_cost_source: str = 'fixed',
     ):
         self._num_buffers = num_envs
         self._standardized_adv_r = standardized_adv_r
@@ -300,12 +322,15 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
                 no_intrinsic_in_deltas=no_intrinsic_in_deltas,
                 cost_gamma=cost_gamma,
                 cost_advantage_estimator=cost_advantage_estimator,
+                constant_cost_source=constant_cost_source,
             )
             for _ in range(num_envs)
         ]
 
-    def get_effective_constant_cost(self, epoch: int) -> Optional[float]:
-        return self.buffers[0]._get_effective_constant_cost(epoch)
+    def get_effective_constant_cost(
+        self, epoch: int, current_ep_cost: Optional[float] = None,
+    ) -> Optional[float]:
+        return self.buffers[0]._get_effective_constant_cost(epoch, current_ep_cost)
 
     def finish_path(
         self,
@@ -314,8 +339,9 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
         idx: int = 0,
         lr: float = 0.001,
         epoch: int = 0,
+        current_ep_cost: Optional[float] = None,
     ) -> None:
         """Finish the path."""
-        self.buffers[idx].finish_path(last_value_r, last_value_c, lr, epoch)
+        self.buffers[idx].finish_path(last_value_r, last_value_c, lr, epoch, current_ep_cost)
 
 
