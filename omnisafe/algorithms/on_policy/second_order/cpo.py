@@ -52,6 +52,8 @@ class CPO(TRPO):
         self._logger.register_key('Misc/Lambda_star')
         self._logger.register_key('Misc/Nu_star')
         self._logger.register_key('Misc/OptimCase')
+        if getattr(self._cfgs.algo_cfgs, 'cost_adv_shrinkage', 1.0) != 1.0:
+            self._logger.register_key('Train/CostAdvShrinkage')
 
     # pylint: disable-next=too-many-arguments,too-many-locals
     def _cpo_search_step(
@@ -363,6 +365,24 @@ class CPO(TRPO):
             adv_r (torch.Tensor): The reward advantage tensor.
             adv_c (torch.Tensor): The cost advantage tensor.
         """
+        # Ablation: uniformly shrink the cost advantage before it touches anything -- the cost
+        # loss/gradient (b_grads, hence p/q/r/s/A/B and the closed-form step direction) AND the
+        # line search's re-evaluated loss_cost (since _cpo_search_step receives this same,
+        # already-shrunk adv_c) all see the shrunk value consistently, exactly as if a critic with
+        # smaller/regularized cost predictions had produced adv_c in the first place -- rather
+        # than only shrinking b_grads post-backward, which would leave the line search's cost
+        # non-worsening check (loss_cost_diff > max(-violation_c, 0)) evaluating the unshrunk
+        # signal, an inconsistency real critic regularization wouldn't have. Tests whether SR's
+        # cost gradient being ~half CPO's magnitude (Misc/cost_gradient_norm, see this session's
+        # SR-vs-CPO gradient-norm comparison) is *sufficient on its own* to reproduce SR's lower
+        # realized cost, holding target_kl and everything else about CPO fixed -- deliberately not
+        # touching target_kl, which bounds the *whole* step (reward direction included) rather
+        # than the cost-specific one this is isolating.
+        cost_adv_shrinkage = getattr(self._cfgs.algo_cfgs, 'cost_adv_shrinkage', 1.0)
+        if cost_adv_shrinkage != 1.0:
+            adv_c = adv_c * cost_adv_shrinkage
+            self._logger.store({'Train/CostAdvShrinkage': cost_adv_shrinkage})
+
         self._fvp_obs = obs[:: self._cfgs.algo_cfgs.fvp_sample_freq]
         theta_old = get_flat_params_from(self._actor_critic.actor)
         self._actor_critic.actor.zero_grad()

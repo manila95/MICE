@@ -98,6 +98,17 @@ defaults:
     fvp_obs: None
     # Tolerance of constraint violation
     cost_limit: 25
+    # Ablation: uniformly multiply the cost advantage (adv_c) by this factor before it touches
+    # anything in _update_actor -- the cost gradient (b_grads), the closed-form step direction,
+    # AND the line search's cost non-worsening check all consistently see the shrunk signal, as
+    # if a critic with smaller/regularized cost predictions had produced adv_c in the first
+    # place. 1.0 (default) is a no-op, identical to unmodified CPO. Exists to test whether a
+    # cost-critic's cost-gradient magnitude being smaller than another's (independent of
+    # direction/alignment quality) is, on its own, sufficient to explain a lower realized cost --
+    # see cpo.py's _update_actor docstring comment at the shrinkage site for the full rationale.
+    # Deliberately NOT the same lever as target_kl, which bounds the whole step (reward direction
+    # included), not just the cost-specific contribution this isolates.
+    cost_adv_shrinkage: 1.0
     # The sub-sampling rate of the observation
     fvp_sample_freq: 1
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
