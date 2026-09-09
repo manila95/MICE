@@ -100,6 +100,24 @@ defaults:
     cost_limit: 25
     # The sub-sampling rate of the observation
     fvp_sample_freq: 1
+    # How the "how far over budget is this policy" signal (violation_c, feeding
+    # _determine_case/_step_direction/the line search) is computed each update:
+    #   'episodic' (default) -- the empirical mean episodic cost actually measured this epoch's
+    #                rollout (Metrics/EpCost, real and UNDISCOUNTED) minus cost_limit. Lagging
+    #                (only knows about episodes that already finished) but ground-truth.
+    #   'critic'   -- the cost critic's own belief instead: V_c(s0) averaged over this epoch's
+    #                episode-start states, compared against cost_limit rescaled by
+    #                cost_limit_discount_horizon below (V_c predicts a DISCOUNTED sum;
+    #                cost_limit is calibrated against the UNDISCOUNTED one). No lag -- available
+    #                the same epoch, doesn't need to wait for episodes to finish -- but only as
+    #                good as the critic actually is (see this session's critic-quality
+    #                diagnostics: PooledMC/Correlation_c, GradientAlignment_c, etc.).
+    cost_limit_source: episodic
+    # Only read when cost_limit_source is 'critic'. Set to the environment's actual
+    # max_episode_steps (SafetyPointGoal1-v0: 1000) -- see CPO._compute_ep_costs's docstring for
+    # the discounted/undiscounted rescaling this drives. Ignored (no correction) if
+    # cost_gamma >= 1.0.
+    cost_limit_discount_horizon: 1000
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5
     value_eval_freq: 25

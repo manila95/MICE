@@ -52,6 +52,65 @@ class CPO(TRPO):
         self._logger.register_key('Misc/Lambda_star')
         self._logger.register_key('Misc/Nu_star')
         self._logger.register_key('Misc/OptimCase')
+        if getattr(self._cfgs.algo_cfgs, 'cost_limit_source', 'episodic') == 'critic':
+            self._logger.register_key('Train/CriticCostEstimate')
+            self._logger.register_key('Train/EffectiveCostLimit')
+
+    def _compute_ep_costs(self, obs: torch.Tensor) -> torch.Tensor:
+        """How far over budget this update thinks the policy is -- ``violation_c`` in
+        :meth:`_determine_case`/:meth:`_step_direction`/:meth:`_cpo_search_step`.
+
+        Two sources, selected by ``algo_cfgs.cost_limit_source``:
+
+        - ``'episodic'`` (default): the original behavior -- the empirical mean episodic cost
+          actually measured this epoch's rollout (``Metrics/EpCost``, a real, UNDISCOUNTED
+          per-episode sum) minus ``cost_limit``. Lagging (only knows about episodes that have
+          already finished) but ground-truth.
+        - ``'critic'``: the cost critic's own belief, instead of waiting for episodes to finish
+          and averaging what actually happened. Uses ``V_c(s_0)`` -- the cost critic evaluated at
+          this epoch's episode-start observations (via ``self._buf.get_episode_slices()``,
+          averaged over however many episodes started this epoch) -- as a same-epoch, no-lag
+          estimate of "how much discounted cost does the critic currently expect this policy to
+          incur per episode". This is exactly the quantity :math:`J_C(\\pi) = E_{s_0}[V_c^\\pi(s_0)]`
+          that CPO's own constraint (Achiam et al. 2017, eq. 5) is actually stated in terms of --
+          ``cost_limit`` in this codebase is instead calibrated against the empirical,
+          UNDISCOUNTED per-episode sum, so comparing ``V_c(s_0)`` against it directly would
+          compare two different scales (discounting always shrinks a positive-cost sum). See
+          ``cost_limit_discount_horizon`` for the rescaling this applies before comparing.
+
+        Args:
+            obs: This update's full (un-split) observation batch -- must share indexing with
+                ``self._buf.get_episode_slices()``, i.e. this only gives a correct answer when
+                ``algo_cfgs.n_val_episodes == 0`` (the default), since a nonzero val split
+                reorders/subsets the buffer's rows relative to the slices' original indices.
+        """
+        source = getattr(self._cfgs.algo_cfgs, 'cost_limit_source', 'episodic')
+        if source == 'episodic':
+            return self._logger.get_stats('Metrics/EpCost')[0] - self._cfgs.algo_cfgs.cost_limit
+        if source != 'critic':
+            raise ValueError(f"Unknown cost_limit_source: {source!r}. Choose 'episodic' or 'critic'.")
+
+        episode_slices = self._buf.get_episode_slices()
+        start_idxs = torch.tensor([s for s, _ in episode_slices], device=obs.device, dtype=torch.long)
+        with torch.no_grad():
+            v_c_s0 = self._actor_critic.cost_critic(obs[start_idxs])[0]
+        mean_v_c_s0 = distributed.dist_avg(v_c_s0.mean()).item()
+
+        cost_gamma = getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma)
+        horizon = getattr(self._cfgs.algo_cfgs, 'cost_limit_discount_horizon', 1000)
+        if cost_gamma >= 1.0:
+            discount_correction = 1.0
+        else:
+            # Ratio of a discounted to an undiscounted sum of a constant per-step cost rate over
+            # `horizon` steps: discounted -> c_bar*(1-gamma^T)/(1-gamma), undiscounted -> c_bar*T.
+            discount_correction = (1 - cost_gamma**horizon) / (horizon * (1 - cost_gamma))
+        effective_cost_limit = self._cfgs.algo_cfgs.cost_limit * discount_correction
+
+        self._logger.store({
+            'Train/CriticCostEstimate': mean_v_c_s0,
+            'Train/EffectiveCostLimit': effective_cost_limit,
+        })
+        return mean_v_c_s0 - effective_cost_limit
 
     # pylint: disable-next=too-many-arguments,too-many-locals
     def _cpo_search_step(
@@ -388,7 +447,7 @@ class CPO(TRPO):
         distributed.avg_grads(self._actor_critic.actor)
 
         b_grads = get_flat_gradients_from(self._actor_critic.actor)
-        ep_costs = self._logger.get_stats('Metrics/EpCost')[0] - self._cfgs.algo_cfgs.cost_limit
+        ep_costs = self._compute_ep_costs(obs)
 
         p = conjugate_gradients(self._fvp, b_grads, self._cfgs.algo_cfgs.cg_iters)
         q = xHx
