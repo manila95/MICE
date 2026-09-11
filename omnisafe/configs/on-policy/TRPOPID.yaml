@@ -70,6 +70,32 @@ defaults:
     huber_delta: 1.0
     # Huber delta for the cost critic only; null = reuse huber_delta.
     huber_delta_cost: ~
+    # Blend a calibration loss in with the task loss (critic_loss above): pushes predictions to be
+    # calibrated in the reliability sense (bucket by predicted value; the average prediction in a
+    # bucket should match the average target there) rather than only minimizing average squared
+    # error, which a critic can do while still being systematically biased in part of its range.
+    # See omnisafe/utils/critic_calibration.py and PolicyGradient._combined_critic_loss.
+    use_calibration_loss: False
+    # calibration for the cost critic only; null = reuse use_calibration_loss. Same null-fallback
+    # convention as critic_norm_coef_cost above -- e.g. leave use_calibration_loss False and set
+    # this True to calibrate only the cost critic (the intended use: a biased-high cost critic
+    # undermines the PID-Lagrangian safety constraint even when its plain MSE looks fine).
+    use_calibration_loss_cost: ~
+    # 'binned' (default): regression-ECE-style, catches miscalibration that varies across the
+    # prediction range. 'moment': cheap batch-level bias+slope check, no minimum batch size.
+    calibration_loss_type: binned
+    # calibration loss type for the cost critic only; null = reuse calibration_loss_type.
+    calibration_loss_type_cost: ~
+    # lambda: total critic loss = (1 - lambda) * task_loss + lambda * calibration_loss.
+    # lambda=0 recovers the plain task loss exactly; lambda=1 trains on calibration alone.
+    calibration_coef: 0.5
+    # calibration lambda for the cost critic only; null = reuse calibration_coef.
+    calibration_coef_cost: ~
+    # number of equal-population bins (calibration_loss_type: binned only); clamped down to
+    # batch_size // 2 per minibatch.
+    calibration_bins: 10
+    # calibration bin count for the cost critic only; null = reuse calibration_bins.
+    calibration_bins_cost: ~
     # reward discount factor
     gamma: 0.99
     # cost discount factor

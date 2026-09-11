@@ -37,6 +37,7 @@ from omnisafe.envs.core import make as make_env
 from omnisafe.envs.wrapper import ActionScale, AutoReset, ObsNormalize, TimeLimit, Unsqueeze
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
 from omnisafe.utils import clearning, contrastive, distributed, laplacian, sr_diagnostics
+from omnisafe.utils.critic_calibration import binned_calibration_loss, moment_calibration_loss
 from omnisafe.utils.critic_ensemble import GPLBetaAdapter, TOPBanditAdapter
 from omnisafe.utils.eval_data_dump import (
     log_eval_data_to_wandb,
@@ -560,6 +561,11 @@ class PolicyGradient(BaseAlgo):
 
         # log information about critic
         self._logger.register_key('Loss/Loss_reward_critic', delta=True)
+        if self._stream_cfg('use_calibration_loss', 'r', False):
+            # Only the calibration *component* -- Loss/Loss_reward_critic above already reflects
+            # the full (1-lambda)*task + lambda*calibration blend actually optimized. See
+            # _calibration_loss's docstring for what "calibration" means here.
+            self._logger.register_key('Loss/Loss_reward_critic_calib', delta=True)
         self._logger.register_key('Value/reward')
         _n_val = getattr(self._cfgs.algo_cfgs, 'n_val_episodes', 0)
         _splits = ('Train', 'Val') if _n_val > 0 else ('Train',)
@@ -572,6 +578,8 @@ class PolicyGradient(BaseAlgo):
         if self._cfgs.algo_cfgs.use_cost:
             # log information about cost critic
             self._logger.register_key('Loss/Loss_cost_critic', delta=True)
+            if self._stream_cfg('use_calibration_loss', 'c', False):
+                self._logger.register_key('Loss/Loss_cost_critic_calib', delta=True)
             self._logger.register_key('Value/cost')
             for split in _splits:
                 for stage in ('BeforeUpdate', 'AfterUpdate'):
@@ -2013,7 +2021,10 @@ class PolicyGradient(BaseAlgo):
 
             L = \frac{1}{N} \sum_{i=1}^N (\hat{V} - V)^2
 
-        where :math:`\hat{V}` is the predicted cost and :math:`V` is the target cost.
+        where :math:`\hat{V}` is the predicted cost and :math:`V` is the target cost. If
+        ``algo_cfgs.use_calibration_loss`` is set, this is further blended with a calibration
+        objective (:meth:`_combined_critic_loss`) that penalizes systematic over/under-prediction
+        across the range of predicted values, rather than only the average squared error.
 
         #. Compute the loss function.
         #. Add the ``critic norm`` to the loss function if ``use_critic_norm`` is ``True``.
@@ -2041,10 +2052,11 @@ class PolicyGradient(BaseAlgo):
         # bypassing the other; under ensemble_method='none' (default) this is exactly the old
         # single-member loss.
         loss = torch.stack(
-            [
-                self._critic_loss(v, target_value_r, stream='r')
-                for v in self._actor_critic.reward_critic.raw_values(obs)
-            ],
+            self._combined_critic_loss(
+                self._actor_critic.reward_critic.raw_values(obs),
+                target_value_r,
+                stream='r',
+            ),
         ).mean()
 
         if self._cfgs.algo_cfgs.use_critic_norm:
@@ -2081,7 +2093,14 @@ class PolicyGradient(BaseAlgo):
 
             L = \frac{1}{N} \sum_{i=1}^N (\hat{V} - V)^2
 
-        where :math:`\hat{V}` is the predicted cost and :math:`V` is the target cost.
+        where :math:`\hat{V}` is the predicted cost and :math:`V` is the target cost. If
+        ``algo_cfgs.use_calibration_loss`` / ``use_calibration_loss_cost`` is set for this stream,
+        this is further blended with a calibration objective (:meth:`_combined_critic_loss`) that
+        penalizes systematic over/under-prediction across the range of predicted cost, rather than
+        only the average squared error -- e.g. a cost critic that is well-calibrated on average
+        but overestimates specifically in the high-cost states that matter most to a
+        Lagrangian/CPO safety constraint would still score badly here even though its plain MSE
+        may look fine.
 
         #. Compute the loss function.
         #. Add the ``critic norm`` to the loss function if ``use_critic_norm`` is ``True``.
@@ -2100,10 +2119,11 @@ class PolicyGradient(BaseAlgo):
         # raw prediction, each trained independently) not the aggregated conservative read, with
         # each member's loss still going through _critic_loss for the MSE/Huber choice.
         loss = torch.stack(
-            [
-                self._critic_loss(v, target_value_c, stream='c')
-                for v in self._actor_critic.cost_critic.raw_values(obs)
-            ],
+            self._combined_critic_loss(
+                self._actor_critic.cost_critic.raw_values(obs),
+                target_value_c,
+                stream='c',
+            ),
         ).mean()
 
         if self._cfgs.algo_cfgs.use_critic_norm:
@@ -2175,6 +2195,114 @@ class PolicyGradient(BaseAlgo):
                     delta = delta_cost
             return nn.functional.huber_loss(pred, target, delta=float(delta))
         raise ValueError(f"algo_cfgs.critic_loss must be 'mse' or 'huber', got {loss_type!r}")
+
+    def _stream_cfg(self, base_key: str, stream: str, default: Any) -> Any:
+        """Resolve an ``algo_cfgs`` knob under the repo's null-fallback-to-reward convention.
+
+        For ``stream == 'c'``, ``f'{base_key}_cost'`` is read first; if that key is absent or
+        explicitly ``None``/``~``, it falls back to the reward-side ``base_key`` (itself falling
+        back to ``default`` if that's absent too). For ``stream == 'r'``, only ``base_key`` (or
+        ``default``) applies. This is exactly the pattern already used inline for
+        ``critic_loss``/``critic_loss_cost``, ``critic_norm_coef``/``critic_norm_coef_cost``, and
+        ``huber_delta``/``huber_delta_cost`` -- factored out here so the calibration-loss knobs
+        below don't have to re-duplicate it four more times.
+
+        Args:
+            base_key: The reward-side (and, for stream 'c', fallback) config key name.
+            stream: ``'r'`` or ``'c'``.
+            default: Value to use if neither ``base_key`` nor (for cost) ``f'{base_key}_cost'`` is
+                set.
+
+        Returns:
+            The resolved value.
+        """
+        assert stream in ('r', 'c')
+        value = self._cfgs.algo_cfgs.get(base_key, default)
+        if stream == 'c':
+            value_cost = self._cfgs.algo_cfgs.get(f'{base_key}_cost', None)
+            if value_cost is not None:
+                value = value_cost
+        return value
+
+    def _calibration_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        stream: str,
+    ) -> torch.Tensor:
+        r"""Compute the calibration-loss term for one critic member's prediction.
+
+        Selects between :func:`~omnisafe.utils.critic_calibration.binned_calibration_loss`
+        (default) and :func:`~omnisafe.utils.critic_calibration.moment_calibration_loss` via
+        ``algo_cfgs.calibration_loss_type`` (``algo_cfgs.calibration_loss_type_cost`` overrides
+        for ``stream == 'c'``, same null-fallback convention as :meth:`_critic_loss`). See those
+        functions' docstrings, and this module's :meth:`_combined_critic_loss`, for what problem
+        this solves and how it's blended with the task loss.
+
+        Args:
+            pred: The critic's prediction for this minibatch.
+            target: The regression target for this minibatch.
+            stream: ``'r'`` (reward) or ``'c'`` (cost) -- selects which config knobs apply.
+
+        Returns:
+            The scalar calibration loss.
+        """
+        assert stream in ('r', 'c')
+        loss_type = self._stream_cfg('calibration_loss_type', stream, 'binned')
+        if loss_type == 'moment':
+            return moment_calibration_loss(pred, target)
+        if loss_type == 'binned':
+            n_bins = int(self._stream_cfg('calibration_bins', stream, 10))
+            return binned_calibration_loss(pred, target, n_bins=n_bins)
+        raise ValueError(
+            f"algo_cfgs.calibration_loss_type must be 'binned' or 'moment', got {loss_type!r}",
+        )
+
+    def _combined_critic_loss(
+        self,
+        raw_preds: list[torch.Tensor],
+        target: torch.Tensor,
+        stream: str,
+    ) -> list[torch.Tensor]:
+        r"""Per-member loss used to train a critic: task loss, optionally blended with calibration.
+
+        Under ``algo_cfgs.use_calibration_loss`` (``use_calibration_loss_cost`` overrides for
+        ``stream == 'c'``, same null-fallback convention as everywhere else in this file -- so
+        e.g. ``use_calibration_loss: False`` + ``use_calibration_loss_cost: True`` turns this on
+        for the cost critic only, leaving the reward critic on the plain task loss), each member's
+        loss becomes a convex blend of the existing task objective (:meth:`_critic_loss`: MSE or
+        Huber) and the calibration objective (:meth:`_calibration_loss`):
+
+        .. math::
+
+            L = (1 - \lambda) \cdot L_{\text{task}} + \lambda \cdot L_{\text{calibration}}
+
+        where :math:`\lambda` is ``algo_cfgs.calibration_coef`` (``calibration_coef_cost``
+        overrides for cost). :math:`\lambda = 0` recovers the task loss exactly;
+        :math:`\lambda = 1` trains on calibration alone. This mirrors, rather than replaces, the
+        task loss -- it's an additional term shaping *where* the residual error goes (evening it
+        out across the prediction range) rather than a different way of scoring the same residual.
+
+        When calibration is off (the default), this returns exactly the old per-member
+        ``_critic_loss`` list -- a no-op for every existing config.
+
+        Args:
+            raw_preds: Each ensemble member's own raw prediction (``critic.raw_values(obs)``).
+            target: The regression target shared by every member.
+            stream: ``'r'`` or ``'c'``.
+
+        Returns:
+            One scalar loss tensor per member, in the same order as ``raw_preds``.
+        """
+        task_losses = [self._critic_loss(v, target, stream=stream) for v in raw_preds]
+        if not self._stream_cfg('use_calibration_loss', stream, False):
+            return task_losses
+
+        calib_losses = [self._calibration_loss(v, target, stream=stream) for v in raw_preds]
+        lam = float(self._stream_cfg('calibration_coef', stream, 0.5))
+        key = 'Loss/Loss_reward_critic_calib' if stream == 'r' else 'Loss/Loss_cost_critic_calib'
+        self._logger.store({key: torch.stack(calib_losses).mean().item()})
+        return [(1.0 - lam) * t + lam * c for t, c in zip(task_losses, calib_losses)]
 
     def _ridge_update_successor_weights(self, train_data: dict[str, torch.Tensor]) -> None:
         """Refresh the ``td_ridge`` successor-representation read-out weights.
