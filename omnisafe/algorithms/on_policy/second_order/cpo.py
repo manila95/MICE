@@ -54,6 +54,8 @@ class CPO(TRPO):
         self._logger.register_key('Misc/OptimCase')
         if getattr(self._cfgs.algo_cfgs, 'cost_adv_shrinkage', 1.0) != 1.0:
             self._logger.register_key('Train/CostAdvShrinkage')
+        if getattr(self._cfgs.algo_cfgs, 'use_cost_bias', False):
+            self._logger.register_key('Misc/EpCostBias')
 
     # pylint: disable-next=too-many-arguments,too-many-locals
     def _cpo_search_step(
@@ -409,6 +411,20 @@ class CPO(TRPO):
 
         b_grads = get_flat_gradients_from(self._actor_critic.actor)
         ep_costs = self._logger.get_stats('Metrics/EpCost')[0] - self._cfgs.algo_cfgs.cost_limit
+
+        # Constant cost bias (algo_cfgs.cost_bias / cost_bias_decay_type -- see
+        # PolicyGradient.learn()'s cost-bias block for where/how it's decayed and handed to the
+        # buffer each epoch), added onto EpCost before optim-case selection below -- mirrors
+        # MICE's ep_discount_ci bias on self.ep_costs exactly (mice.py's _update_actor), just
+        # generalized so plain CPO can opt into the same ablation without MICE's KNN/intrinsic
+        # machinery. self._buf.mean_ep_cost_bias() is the discounted per-episode total (not a flat
+        # per-step add-on -- see that method's docstring), pooled across this epoch's finished
+        # paths; 0.0 whenever algo_cfgs.cost_bias is unset, so this is an exact no-op by default
+        # regardless of use_cost_bias.
+        if getattr(self._cfgs.algo_cfgs, 'use_cost_bias', False):
+            ep_cost_bias = self._buf.mean_ep_cost_bias()
+            ep_costs = ep_costs + ep_cost_bias
+            self._logger.store({'Misc/EpCostBias': ep_cost_bias})
 
         p = conjugate_gradients(self._fvp, b_grads, self._cfgs.algo_cfgs.cg_iters)
         q = xHx

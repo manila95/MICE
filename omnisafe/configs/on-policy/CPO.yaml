@@ -109,6 +109,32 @@ defaults:
     # Deliberately NOT the same lever as target_kl, which bounds the whole step (reward direction
     # included), not just the cost-specific contribution this isolates.
     cost_adv_shrinkage: 1.0
+    # Ablation: a constant per-step cost bias, generalizing MICE's algo_cfgs.constant_cost /
+    # cost_decay_type (mice_buffer.py) to plain CPO -- see PolicyGradient.learn()'s cost-bias
+    # block for the decay schedule and CPO._update_actor for how it's consumed. 0.0 (default) is
+    # a no-op regardless of either flag below.
+    cost_bias: 0.0
+    # Add the (discounted per-episode total of the) bias above onto EpCost before CPO's own
+    # optim-case selection -- mirrors MICE's ep_discount_ci addition to self.ep_costs exactly
+    # (mice.py's _update_actor). Independent of use_cost_bias_in_target below: this one changes
+    # only the trust-region step's feasibility/case decision, not what the cost critic is trained
+    # against.
+    use_cost_bias: False
+    # ALSO fold the same (undiscounted, per-step) bias into the cost critic's own regression
+    # target/advantage (target_value_c/adv_c) -- see OnPolicyBuffer.finish_path. Independent of
+    # use_cost_bias above: can be turned on alone (bias the critic's target, leave CPO's
+    # optim-case selection untouched) or together with it (bias both, closer to MICE's default
+    # constant_cost + no_intrinsic_in_deltas: False behavior, minus the KNN/beta machinery).
+    use_cost_bias_in_target: False
+    # decay schedule for cost_bias: null (no decay, the default), 'exponential', or 'step' -- same
+    # two schedules and same semantics as MICE's cost_decay_type (see decayed_constant in
+    # omnisafe/utils/tools.py, shared by both).
+    cost_bias_decay_type: ~
+    # exponential: effective_bias = cost_bias * cost_bias_decay_rate^epoch
+    cost_bias_decay_rate: 0.985
+    # step: effective_bias = cost_bias * cost_bias_decay_factor^(epoch // cost_bias_decay_step_interval)
+    cost_bias_decay_step_interval: 50
+    cost_bias_decay_factor: 0.4
     # The sub-sampling rate of the observation
     fvp_sample_freq: 1
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)

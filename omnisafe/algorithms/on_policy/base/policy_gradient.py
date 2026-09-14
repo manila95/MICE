@@ -48,6 +48,7 @@ from omnisafe.utils.state_snapshot import (
     collect_on_policy_snapshots,
     enable_state_snapshots,
 )
+from omnisafe.utils.tools import decayed_constant
 from omnisafe.utils.value_eval import (
     estimate_true_value,
     compute_gradient_alignment,
@@ -424,6 +425,7 @@ class PolicyGradient(BaseAlgo):
             sr_dim=self._cfgs.model_cfgs.sr_cfgs.sr_dim if self._sr_td_ridge else None,
             lam_sr=self._cfgs.model_cfgs.sr_cfgs.get('lam_sr', 0.95) if self._sr_td_ridge else 0.95,
             gamma_sr=self._cfgs.model_cfgs.sr_cfgs.get('gamma_sr', None) if self._sr_td_ridge else None,
+            use_cost_bias_in_target=getattr(self._cfgs.algo_cfgs, 'use_cost_bias_in_target', False),
         )
 
         # Persistent cross-epoch buffer for the read-out regression. The rollout buffer above is
@@ -820,6 +822,44 @@ class PolicyGradient(BaseAlgo):
 
         for epoch in range(self._cfgs.train_cfgs.epochs):
             epoch_time = time.time()
+            # Moved ahead of rollout (this used to be set just before _update(), below) so it's
+            # correct for the cost-bias block right after it too -- finish_path (called during
+            # rollout, via the buffer) needs the CURRENT epoch's decayed cost_bias, not last
+            # epoch's. Every other _current_epoch reader in this class only runs from inside
+            # _update()/_run_eval_studies (after rollout either way), so this reorder changes
+            # nothing for them.
+            self._current_epoch = epoch
+
+            # Constant cost bias (algo_cfgs.cost_bias, optionally annealed by
+            # cost_bias_decay_type) -- generalizes MICE's algo_cfgs.constant_cost/cost_decay_type
+            # (mice_buffer.py) to the base buffer so any on-policy algorithm can opt in, not just
+            # MICE. Computed once per epoch, before rollout, so every path finished this epoch
+            # sees the same already-decayed value (see decayed_constant's docstring for the two
+            # schedules). Two independent consumers, each its own flag:
+            #   - algo_cfgs.use_cost_bias_in_target (read inside OnPolicyBuffer.finish_path):
+            #     folds the bias into the cost critic's own regression target/advantage.
+            #   - algo_cfgs.use_cost_bias (read by CPO._update_actor only): adds the discounted
+            #     per-episode total (VectorOnPolicyBuffer.mean_ep_cost_bias()) onto EpCost before
+            #     CPO's optim-case selection -- mirrors MICE's ep_discount_ci bias exactly (see
+            #     that method's docstring).
+            # 0.0 (the default cost_bias) makes both a no-op regardless of either flag, and
+            # set_cost_bias_for_epoch is always called (even then) since it's also what resets
+            # mean_ep_cost_bias()'s per-epoch accumulator -- cheap, and simpler than conditioning
+            # the call itself on whether the feature is in use.
+            cost_bias_base = float(getattr(self._cfgs.algo_cfgs, 'cost_bias', 0.0) or 0.0)
+            cost_bias = (
+                decayed_constant(
+                    cost_bias_base,
+                    epoch,
+                    getattr(self._cfgs.algo_cfgs, 'cost_bias_decay_type', None),
+                    getattr(self._cfgs.algo_cfgs, 'cost_bias_decay_rate', 0.985),
+                    int(getattr(self._cfgs.algo_cfgs, 'cost_bias_decay_step_interval', 50)),
+                    getattr(self._cfgs.algo_cfgs, 'cost_bias_decay_factor', 0.4),
+                )
+                if cost_bias_base != 0.0
+                else 0.0
+            )
+            self._buf.set_cost_bias_for_epoch(cost_bias)
 
             rollout_time = time.time()
             self._env.rollout(
@@ -838,7 +878,6 @@ class PolicyGradient(BaseAlgo):
             self._logger.store({'Time/Rollout': time.time() - rollout_time})
 
             update_time = time.time()
-            self._current_epoch = epoch
             self._update()
             total_cost += self._env._epoch_cost_sum
             self._logger.store({'Metrics/TotalCost': total_cost})

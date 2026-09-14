@@ -70,6 +70,7 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
         sr_dim: int | None = None,
         lam_sr: float = 0.95,
         gamma_sr: float | None = None,
+        use_cost_bias_in_target: bool = False,
     ) -> None:
         """Initialize an instance of :class:`VectorOnPolicyBuffer`."""
         self._num_buffers: int = num_envs
@@ -94,6 +95,7 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
                 sr_dim=sr_dim,
                 lam_sr=lam_sr,
                 gamma_sr=gamma_sr,
+                use_cost_bias_in_target=use_cost_bias_in_target,
             )
             for _ in range(num_envs)
         ]
@@ -120,6 +122,28 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
         In vector-on-policy buffer, we get the data from each buffer and then concatenate them.
         """
         self.buffers[idx].finish_path(last_value_r, last_value_c, last_psi)
+
+    def set_cost_bias_for_epoch(self, cost_bias: float) -> None:
+        """Fan out this epoch's (already epoch-decayed) constant cost bias to every sub-buffer.
+
+        See :meth:`OnPolicyBuffer.set_cost_bias_for_epoch` -- call once per epoch, before rollout.
+        """
+        for buffer in self.buffers:
+            buffer.set_cost_bias_for_epoch(cost_bias)
+
+    def mean_ep_cost_bias(self) -> float:
+        """Mean discounted per-path cost bias, pooled across every sub-buffer's finished paths.
+
+        Sum-of-sums over count-of-counts (not a plain mean of each sub-buffer's own mean), so
+        sub-buffers that happened to finish more/longer paths this epoch are weighted accordingly
+        rather than each vectorized env contributing equally regardless of how many episodes it
+        completed. See :meth:`OnPolicyBuffer.mean_ep_cost_bias` for what the underlying quantity is.
+        """
+        total_sum = sum(buf._ep_cost_bias_sum for buf in self.buffers)  # pylint: disable=protected-access
+        total_count = sum(buf._ep_cost_bias_count for buf in self.buffers)  # pylint: disable=protected-access
+        if total_count == 0:
+            return 0.0
+        return total_sum / total_count
 
     def get_episode_slices(self) -> list[tuple[int, int]]:
         """Return (start, end) index pairs for every episode in the concatenated buffer.

@@ -32,6 +32,49 @@ from rich.console import Console
 from omnisafe.typing import DEVICE_CPU
 
 
+def decayed_constant(
+    base: float,
+    epoch: int,
+    decay_type: str | None,
+    decay_rate: float,
+    decay_step_interval: int,
+    decay_factor: float,
+) -> float:
+    r"""Anneal a constant value across training epochs.
+
+    Shared by every "constant bias that can decay" knob in this codebase -- originally written
+    once inline for :mod:`omnisafe.algorithms.on_policy.mice.mice_buffer`'s
+    ``constant_cost``/``cost_decay_type``, factored out here so
+    :meth:`~omnisafe.algorithms.on_policy.base.policy_gradient.PolicyGradient.learn`'s
+    ``algo_cfgs.cost_bias``/``cost_bias_decay_type`` (see that method's cost-bias block, and
+    :class:`~omnisafe.algorithms.on_policy.second_order.cpo.CPO`'s consumption of it) can reuse the
+    exact same two schedules instead of re-deriving them.
+
+    Args:
+        base: The undecayed value (epoch 0).
+        epoch: Current training epoch.
+        decay_type: ``None`` (no decay -- returns ``base`` unchanged), ``'exponential'``
+            (``base * decay_rate ** epoch``), or ``'step'``
+            (``base * decay_factor ** (epoch // decay_step_interval)``).
+        decay_rate: Per-epoch multiplicative decay (``'exponential'`` only).
+        decay_step_interval: Epochs between each ``decay_factor`` drop (``'step'`` only).
+        decay_factor: Per-interval multiplicative decay (``'step'`` only).
+
+    Returns:
+        The decayed value for this epoch.
+
+    Raises:
+        ValueError: If ``decay_type`` is set but not one of ``'exponential'``/``'step'``.
+    """
+    if decay_type is None:
+        return base
+    if decay_type == 'exponential':
+        return base * (decay_rate**epoch)
+    if decay_type == 'step':
+        return base * (decay_factor ** (epoch // decay_step_interval))
+    raise ValueError(f"decay_type must be None, 'exponential', or 'step', got {decay_type!r}")
+
+
 def get_flat_params_from(model: torch.nn.Module) -> torch.Tensor:
     """This function is used to get the flattened parameters from the model.
 

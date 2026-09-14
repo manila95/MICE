@@ -107,6 +107,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         sr_dim: int | None = None,
         lam_sr: float = 0.95,
         gamma_sr: float | None = None,
+        use_cost_bias_in_target: bool = False,
     ) -> None:
         """Initialize an instance of :class:`OnPolicyBuffer`."""
         super().__init__(obs_space, act_space, size, device)
@@ -142,6 +143,17 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         assert self._penalty_coefficient >= 0, 'penalty_coefficient must be non-negative!'
         assert self._advantage_estimator in _valid
         assert self._cost_advantage_estimator in _valid
+
+        # Constant cost bias (algo_cfgs.cost_bias / cost_bias_decay_type -- see
+        # PolicyGradient.learn()'s cost-bias block, and CPO._update_actor's mean_ep_cost_bias()
+        # consumer): 0.0 (default) makes use_cost_bias_in_target a no-op regardless of the flag.
+        # `cost_bias` itself is set once per epoch, from outside, by set_cost_bias_for_epoch --
+        # never read as a constructor default because it needs to track the current epoch's decay,
+        # computed by the caller (this class has no epoch of its own to decay against).
+        self._use_cost_bias_in_target: bool = use_cost_bias_in_target
+        self.cost_bias: float = 0.0
+        self._ep_cost_bias_sum: float = 0.0
+        self._ep_cost_bias_count: int = 0
 
         # successor-representation (``td_ridge`` mode) extra fields: a d-dimensional feature
         # stream ``phi``/``psi`` trained with the same estimator machinery as the scalar
@@ -185,6 +197,47 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         for key, value in data.items():
             self.data[key][self.ptr] = value
         self.ptr += 1
+
+    def set_cost_bias_for_epoch(self, cost_bias: float) -> None:
+        """Set this epoch's (already epoch-decayed) constant cost bias.
+
+        Call once per epoch, before rollout -- see ``PolicyGradient.learn()``'s cost-bias block,
+        which computes the decayed value via :func:`omnisafe.utils.tools.decayed_constant` and
+        passes it here. Resets the accumulator :meth:`mean_ep_cost_bias` reads, so it always
+        reflects only the paths finished *since* the most recent call to this method (i.e. this
+        epoch's rollout) -- not stale carry-over from the epoch before. Safe to call with the same
+        value as last epoch (undecayed / ``cost_bias_decay_type: None``): still resets the count.
+
+        Args:
+            cost_bias: This epoch's constant per-step cost bias. ``0.0`` (the default before this
+                is ever called) makes both consumers -- :meth:`finish_path`'s
+                ``use_cost_bias_in_target`` addition and :meth:`mean_ep_cost_bias` -- a no-op.
+        """
+        self.cost_bias = cost_bias
+        self._ep_cost_bias_sum = 0.0
+        self._ep_cost_bias_count = 0
+
+    def mean_ep_cost_bias(self) -> float:
+        r"""Mean, across this epoch's finished paths so far, of each path's discounted total bias.
+
+        Mirrors :mod:`omnisafe.algorithms.on_policy.mice.mice_buffer`'s ``ep_discount_ci``: a
+        constant per-step bias :math:`b` held over an episode of length :math:`T` contributes
+        :math:`b \cdot \sum_{k=0}^{T-1} \gamma_c^k` to that episode's *discounted* total -- not
+        simply :math:`b \cdot T` -- since it is meant to represent the same kind of quantity
+        ``Metrics/EpCost`` (an undiscounted per-episode sum, but comparably built from a per-step
+        signal) is compared against in :class:`~omnisafe.algorithms.on_policy.second_order.cpo.CPO`'s
+        optim-case selection. This is intentionally undiscounted-*episode*-length-aware but
+        discounted-*within*-episode, exactly like MICE's version, so a short/truncated path
+        contributes proportionally less than a full-length one rather than the same flat amount.
+
+        Returns:
+            0.0 if :attr:`cost_bias` is ``0.0`` (default) or no path has finished yet this epoch
+            (since the last :meth:`set_cost_bias_for_epoch` call); otherwise the sum-of-discounted-
+            per-path-totals divided by the number of paths.
+        """
+        if self._ep_cost_bias_count == 0:
+            return 0.0
+        return self._ep_cost_bias_sum / self._ep_cost_bias_count
 
     def finish_path(
         self,
@@ -241,9 +294,19 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             rewards,
             lam=self._lam,
         )
+        # Constant cost bias, optionally folded into the cost critic's own target (separate from,
+        # and independent of, CPO's own use of the same bias for its EpCost/optim-case selection --
+        # see mean_ep_cost_bias's docstring for that side). Applied only to the real per-step costs
+        # (costs[:-1]), never the appended bootstrap value -- mirrors MICE's
+        # `costs[:-1] + intrinsic_costs` convention (mice_buffer.py).
+        if self._use_cost_bias_in_target and self.cost_bias != 0.0:
+            costs_for_target = costs.clone()
+            costs_for_target[:-1] += self.cost_bias
+        else:
+            costs_for_target = costs
         adv_c, target_value_c = self._calculate_adv_and_value_targets(
             values_c,
-            costs,
+            costs_for_target,
             lam=self._lam_c,
             gamma=self._cost_gamma,
             advantage_estimator=self._cost_advantage_estimator,
@@ -253,6 +316,21 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self.data['target_value_r'][path_slice] = target_value_r
         self.data['adv_c'][path_slice] = adv_c
         self.data['target_value_c'][path_slice] = target_value_c
+
+        # Track this path's discounted cost-bias total regardless of use_cost_bias_in_target --
+        # CPO's optim-case bias (mean_ep_cost_bias) is a separate consumer of the same
+        # self.cost_bias value and must see every finished path, not just when the target-bias
+        # option above is also on. A cost_bias of 0.0 (the default) makes this exactly 0 too, so
+        # it's a no-op unless something has actually called set_cost_bias_for_epoch with a nonzero
+        # value.
+        if self.cost_bias != 0.0:
+            path_len = self.ptr - self.path_start_idx
+            if self._cost_gamma < 1.0:
+                discounted_total = self.cost_bias * (1 - self._cost_gamma**path_len) / (1 - self._cost_gamma)
+            else:
+                discounted_total = self.cost_bias * path_len
+            self._ep_cost_bias_sum += discounted_total
+            self._ep_cost_bias_count += 1
 
         if self._sr_dim is not None:
             if last_psi is None:
