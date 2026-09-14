@@ -137,8 +137,20 @@ defaults:
     # deltas_n IS what feeds adv_c/target_value_c directly, so here this flag actually strips the
     # constant intrinsic cost out of the cost critic's target and the cost-advantage
     # policy-gradient term too, not just the diagnostics. The intrinsic cost still reaches the
-    # CPO trust-region feasibility check via ep_discount_ci regardless of this flag either way.
+    # CPO trust-region feasibility check via ep_discount_ci regardless of this flag either way --
+    # see no_intrinsic_in_ep_costs below for the separate switch that controls that.
     no_intrinsic_in_deltas: False
+    # if True, skip adding ep_discount_ci (the discounted per-episode total of the intrinsic
+    # cost/constant_cost) onto self.ep_costs before CPO's optim-case selection in _update_actor.
+    # A completely separate code path from no_intrinsic_in_deltas above -- that flag only touches
+    # deltas_n/adv_c/target_value_c, never ep_discount_ci, so even with no_intrinsic_in_deltas:
+    # True the intrinsic cost was still silently biasing which OptimCase branch gets taken; this
+    # is the switch that actually turns that off. Train/discount_ci is still logged either way,
+    # just not added to self.ep_costs when this is True. False (default) reproduces the exact
+    # prior behavior (always added, unconditionally). See algo_cfgs.use_cost_bias in CPO.yaml for
+    # the generalized, MICE-independent version of this same lever (there it's opt-IN rather than
+    # opt-out, since plain CPO has no such bias by default).
+    no_intrinsic_in_ep_costs: False
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5
     value_eval_freq: 50

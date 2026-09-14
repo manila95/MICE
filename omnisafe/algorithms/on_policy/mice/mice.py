@@ -302,11 +302,23 @@ class MICE(CPO):
 
         ep_discount_ci = balancing_ep_dicount_ci.mean().item()
 
-        self._logger.store({'Train/discount_ci': ep_discount_ci, 
+        self._logger.store({'Train/discount_ci': ep_discount_ci,
                             'Train/intrinsic_factor': self._cfgs.algo_cfgs.intrinsic_factor,
                             })
-        self.ep_costs += ep_discount_ci
-        
+        # ep_discount_ci is unconditional here regardless of algo_cfgs.no_intrinsic_in_deltas --
+        # that flag only zeroes intrinsic cost out of deltas_n (hence adv_c/target_value_c, see
+        # mice_buffer.py's _calculate_balancing_intrinsic_adv_and_value_targets), a completely
+        # separate code path from this one. So even with no_intrinsic_in_deltas: True, a nonzero
+        # constant_cost/KNN novelty signal was still silently biasing self.ep_costs -- and
+        # therefore CPO's optim-case selection below -- with no way to turn it off. This flag is
+        # that missing switch, named to match no_intrinsic_in_deltas's own convention: default
+        # False reproduces the exact prior behavior (always added); True skips the addition here
+        # while leaving Train/discount_ci logged either way, for diagnostic visibility regardless
+        # of whether it's actually being used. See CPO's algo_cfgs.use_cost_bias (cpo.py) for the
+        # generalized, MICE-independent version of this same lever.
+        if not getattr(self._cfgs.algo_cfgs, 'no_intrinsic_in_ep_costs', False):
+            self.ep_costs += ep_discount_ci
+
 
         p = conjugate_gradients(self._fvp, b_grads, self._cfgs.algo_cfgs.cg_iters)  # H^-1*b
         q = xHx
