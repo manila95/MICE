@@ -100,7 +100,6 @@ defaults:
     fvp_obs: None
     # The sub-sampling rate of the observation
     fvp_sample_freq: 1
-  # logger configurations
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5
     value_eval_freq: 25
@@ -125,10 +124,11 @@ defaults:
     # number of fixed probe states (env reset seeds), held constant for the whole run
     mc_value_study_probes: 17
     # independent same-layout rollouts averaged per probe state -- 10 (not the original 5): the
-    # split-half reliability analysis (see CPO.yaml's matching comment / the session history
-    # around mc_eval_bootstrap_threshold) found n=5 badly under-samples cost specifically, while
-    # n=10 combined with mc_eval_bootstrap_threshold=0.01 costs about the same wall-clock as the
-    # old n=5/no-truncation default.
+    # split-half reliability analysis (see the session history / git log around
+    # mc_eval_bootstrap_threshold) found n=5 badly under-samples cost specifically (split-half
+    # correlation as low as ~0.6-0.9 per category, sometimes literally undefined at bursty/rare-
+    # cost positions), while n=10 combined with mc_eval_bootstrap_threshold=0.01 costs about the
+    # same wall-clock as the old n=5/no-truncation default.
     mc_value_study_repeats: 10
     # base offset for the probe seeds (probes use seed_offset .. seed_offset+probes-1), chosen
     # well outside the training seed range so probe layouts never coincide with a training seed
@@ -145,10 +145,14 @@ defaults:
     # Truncate mc_value_study/intermediate_state_study rollouts early once both streams'
     # discounted tail contribution drops below this fraction, bootstrapping the remainder with
     # the critic's own value there instead of continuing to simulate (see
-    # omnisafe.utils.value_eval._effective_rollout_horizon). None disables truncation entirely
-    # (full horizon, zero approximation, the original behavior). 0.01 (not None): the paired bias
-    # analysis found this keeps aggregate cost bias to ~1.3% of the true mean -- see CPO.yaml's
-    # matching comment for the full bias/speed tradeoff.
+    # omnisafe.utils.value_eval._effective_rollout_horizon). Trades a small, bounded bias (the
+    # substituted quantity is exactly what these studies exist to validate) for wall-clock -- at
+    # the default gamma=0.99, 0.01 cuts a 1000-step rollout to ~460 steps. None disables truncation
+    # entirely (full horizon, zero approximation, the original behavior). 0.01 (not None): the
+    # paired bias analysis found this keeps aggregate cost bias to ~1.3% of the true mean (0.05
+    # was faster but let individual late-cost-burst probes drift up to ~95% relative error; 0.001
+    # was bias-free but barely faster than no truncation at all) -- a reasonable bias/speed point,
+    # not a provably-optimal one.
     mc_eval_bootstrap_threshold: 0.01
     # On-policy intermediate-state value study (see omnisafe.utils.value_eval.
     # estimate_value_from_snapshots and omnisafe.utils.state_snapshot): the same same-state MC
@@ -168,6 +172,7 @@ defaults:
     # independent restore-and-rollout repeats averaged per probe state (same role, same n=10
     # rationale, as mc_value_study_repeats above)
     intermediate_state_study_repeats: 10
+  # logger configurations
   logger_cfgs:
     # use wandb for logging
     use_wandb: True

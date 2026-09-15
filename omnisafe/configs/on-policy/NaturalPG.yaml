@@ -89,15 +89,79 @@ defaults:
     fvp_obs: None
     # The sub-sampling rate of the observation
     fvp_sample_freq: 1
-  # logger configurations
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5
-    value_eval_freq: 50
+    value_eval_freq: 25
     # whether to run the full-episode true-vs-estimated value calibration rollout
-    # (see omnisafe.utils.value_eval.estimate_true_value)
-    test_estimate: True
+    # (see omnisafe.utils.value_eval.estimate_true_value). Off by default: it's a one-sample-
+    # per-state proxy (a single fresh rollout per probe, freshly reset each eval epoch) that
+    # mc_value_study/intermediate_state_study superseded with a genuine MC-repeated estimate on
+    # fixed/on-policy probes -- see their own comments below. Running both (the old way and the
+    # new way) was useful for validating the new studies against the old baseline; now that
+    # that's done, this just triples eval-epoch cost (Eval_s0/Eval_all's own eval_episodes
+    # rollouts, on top of the MC studies') for numbers the MC studies already supersede.
+    test_estimate: False
     # number of full episodes rolled out per calibration eval (see test_estimate above)
     value_eval_episodes: 100
+    # same-layout Monte-Carlo value study (see omnisafe.utils.value_eval.
+    # estimate_true_value_same_state_mc): compares the critic against a genuine MC estimate --
+    # mc_value_study_repeats independent same-seed (same procedurally-generated layout) rollouts
+    # per probe state, rather than estimate_true_value's one-sample-per-state proxy. Off by
+    # default: it is len(mc_value_study_probes) * mc_value_study_repeats extra full episodes on
+    # every eval epoch, on top of test_estimate's own eval_episodes. Enabled by default here.
+    mc_value_study: True
+    # number of fixed probe states (env reset seeds), held constant for the whole run
+    mc_value_study_probes: 17
+    # independent same-layout rollouts averaged per probe state -- 10 (not the original 5): the
+    # split-half reliability analysis (see the session history / git log around
+    # mc_eval_bootstrap_threshold) found n=5 badly under-samples cost specifically (split-half
+    # correlation as low as ~0.6-0.9 per category, sometimes literally undefined at bursty/rare-
+    # cost positions), while n=10 combined with mc_eval_bootstrap_threshold=0.01 costs about the
+    # same wall-clock as the old n=5/no-truncation default.
+    mc_value_study_repeats: 10
+    # base offset for the probe seeds (probes use seed_offset .. seed_offset+probes-1), chosen
+    # well outside the training seed range so probe layouts never coincide with a training seed
+    mc_value_study_seed_offset: 100000
+    # number of probe rollouts run concurrently (subprocess-parallel vectorized env), instead of
+    # the mc_value_study_probes * mc_value_study_repeats rollouts running one at a time on a
+    # single env -- this was ~80% of wall-clock in the value-function estimation study. Each
+    # probe still gets its own independent reset(seed=X); this only parallelizes across probes,
+    # it does not change what's computed. Set to 1 to fall back to the original sequential
+    # behavior. Pick based on free CPU cores, accounting for train_cfgs.vector_env_nums and
+    # however many other runs share the machine -- e.g. 20 (giving a clean 500/20=25 waves at the
+    # defaults above) on a lightly-loaded 16+-core box.
+    mc_value_study_vector_envs: 5
+    # Truncate mc_value_study/intermediate_state_study rollouts early once both streams'
+    # discounted tail contribution drops below this fraction, bootstrapping the remainder with
+    # the critic's own value there instead of continuing to simulate (see
+    # omnisafe.utils.value_eval._effective_rollout_horizon). Trades a small, bounded bias (the
+    # substituted quantity is exactly what these studies exist to validate) for wall-clock -- at
+    # the default gamma=0.99, 0.01 cuts a 1000-step rollout to ~460 steps. None disables truncation
+    # entirely (full horizon, zero approximation, the original behavior). 0.01 (not None): the
+    # paired bias analysis found this keeps aggregate cost bias to ~1.3% of the true mean (0.05
+    # was faster but let individual late-cost-burst probes drift up to ~95% relative error; 0.001
+    # was bias-free but barely faster than no truncation at all) -- a reasonable bias/speed point,
+    # not a provably-optimal one.
+    mc_eval_bootstrap_threshold: 0.01
+    # On-policy intermediate-state value study (see omnisafe.utils.value_eval.
+    # estimate_value_from_snapshots and omnisafe.utils.state_snapshot): the same same-state MC
+    # trick mc_value_study uses for s0, but for states the CURRENT policy actually visits
+    # mid-episode -- captured via an exact simulator-state snapshot/restore (not just a re-seeded
+    # reset, since these states aren't reachable that way), from a dedicated on-policy collection
+    # rollout run fresh every eval epoch. Adds meaningful eval-epoch cost (positions * probes *
+    # repeats extra partial episodes), like mc_value_study. Enabled by default here.
+    intermediate_state_study: True
+    # within-episode step indices to snapshot at (steps elapsed so far in that episode) --
+    # evenly-spaced by default to cover the whole episode timeline, not just its start
+    intermediate_state_study_positions: [100, 300, 500, 700, 900]
+    # on-policy states captured per position, per eval epoch (also sets this env's
+    # num_envs -- one collection rollout produces exactly this many probes per position in a
+    # single pass, no waves needed for collection itself, only for scoring)
+    intermediate_state_study_probes: 17
+    # independent restore-and-rollout repeats averaged per probe state (same role, same n=10
+    # rationale, as mc_value_study_repeats above)
+    intermediate_state_study_repeats: 10
+  # logger configurations
   logger_cfgs:
     # use wandb for logging
     use_wandb: True
