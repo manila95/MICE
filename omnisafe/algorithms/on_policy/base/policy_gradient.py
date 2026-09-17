@@ -1021,6 +1021,7 @@ class PolicyGradient(BaseAlgo):
                 max_episode_steps=self._mc_eval_max_episode_steps,
                 return_raw=True,
                 bootstrap_threshold=getattr(self._cfgs.algo_cfgs, 'mc_eval_bootstrap_threshold', None),
+                bootstrap_tail=bool(getattr(self._cfgs.algo_cfgs, 'mc_eval_bootstrap_tail', False)),
             )
             self._logger.store(mc_stats)
             eval_data_bundle['mc_study'] = {'stats': mc_stats, 'raw': mc_raw}
@@ -1070,6 +1071,7 @@ class PolicyGradient(BaseAlgo):
                     epoch=epoch,
                     return_raw=True,
                     bootstrap_threshold=getattr(self._cfgs.algo_cfgs, 'mc_eval_bootstrap_threshold', None),
+                    bootstrap_tail=bool(getattr(self._cfgs.algo_cfgs, 'mc_eval_bootstrap_tail', False)),
                 )
                 self._logger.store(
                     {f'IntermediateMC/pos{pos}/{k}': v for k, v in pos_stats.items()},

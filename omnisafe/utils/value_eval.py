@@ -475,6 +475,7 @@ def estimate_true_value_same_state_mc(
     max_episode_steps=None,
     return_raw=False,
     bootstrap_threshold=None,
+    bootstrap_tail=False,
 ):
     r"""Compare the critic's V(s0) against a genuine same-layout Monte-Carlo estimate.
 
@@ -546,6 +547,15 @@ def estimate_true_value_same_state_mc(
             substituted quantity is exactly what this function exists to validate) for wall-clock
             -- e.g. ``0.01`` with ``gamma=0.99`` cuts ``max_episode_steps=1000`` down to ~460
             steps. ``None`` (default) preserves the exact original full-horizon behavior.
+        bootstrap_tail (bool): Whether the truncated tail may be filled in with the critic's own
+            value. ``False`` (default) keeps the MC "true" return strictly simulation-only: it is
+            then a genuine sample of the discounted return, with the properties the real return
+            has -- in particular a cost return is non-negative whenever the per-step cost is,
+            which a critic-bootstrapped one is not (an untrained ``V_c`` predicts negative values
+            and those flow straight into the "ground truth"). ``True`` restores the older
+            behaviour and is only usable together with ``bootstrap_threshold``; the two are
+            checked for consistency, since truncating *without* bootstrapping would drop the tail
+            rather than estimate it.
 
     Returns:
         A dict of aggregate statistics over the ``len(probe_seeds)`` probes: for each of
@@ -575,6 +585,14 @@ def estimate_true_value_same_state_mc(
     # strictly less only when bootstrap_threshold is set, in which case the tail past `horizon`
     # is bootstrapped with the critic's own value instead of simulated.
     horizon = _effective_rollout_horizon(max_episode_steps, discount_r, discount_c, bootstrap_threshold)
+    if horizon < max_episode_steps and not bootstrap_tail:
+        raise ValueError(
+            'estimate_true_value_same_state_mc: bootstrap_threshold truncates the rollout at '
+            f'{horizon} of {max_episode_steps} steps, but bootstrap_tail=False means the '
+            'remaining tail would simply be dropped -- biasing every "true" value low instead of '
+            'approximating it. Either set bootstrap_threshold=None (full-horizon, exact) or '
+            'bootstrap_tail=True (truncated, tail estimated by the critic).',
+        )
 
     # Which advantage estimator/lambda each stream's target should mirror -- the same config
     # training itself reads (cost null-falls-back to reward's, same convention as
@@ -695,14 +713,13 @@ def estimate_true_value_same_state_mc(
         boot_c = np.where(is_terminated, 0.0, boot_value_c.reshape(-1).detach().cpu().numpy())
         v_r_seq[horizon] = boot_r
         v_c_seq[horizon] = boot_c
-        if horizon < max_episode_steps:
-            # Truncated early: g_r/g_c only summed *simulated* reward/cost through `horizon`
-            # steps, so the *true*-MC-return accumulator (unlike v_r_seq/v_c_seq, which always
-            # carries a bootstrap slot regardless of truncation) needs the discounted bootstrap
-            # tail added in explicitly here, or the "true" value would be missing that mass
-            # entirely rather than merely approximating it -- disc_r/disc_c already equal
-            # discount_r**horizon / discount_c**horizon at this point (multiplied once per loop
-            # iteration above).
+        if horizon < max_episode_steps and bootstrap_tail:
+            # Only reachable with bootstrap_tail=True (see this function's docstring): the MC
+            # "true" return is otherwise kept strictly simulation-only, so it stays a genuine
+            # sample of the return and can never inherit a critic artifact -- most visibly, a
+            # negative discounted cost-to-go, which is impossible for a non-negative cost signal
+            # but is exactly what an untrained V_c contributes here.
+            # disc_r/disc_c already equal discount**horizon at this point.
             g_r += disc_r * boot_r
             g_c += disc_c * boot_c
 
@@ -861,6 +878,7 @@ def estimate_value_from_snapshots(
     epoch=None,
     return_raw=False,
     bootstrap_threshold=None,
+    bootstrap_tail=False,
 ):
     r"""Like :func:`estimate_true_value_same_state_mc`, but for arbitrary on-policy *intermediate*
     states captured via :mod:`omnisafe.utils.state_snapshot`, instead of states reachable by
@@ -909,6 +927,8 @@ def estimate_value_from_snapshots(
             from pre-captured snapshots rather than reset seeds).
         bootstrap_threshold (float or None): See :func:`estimate_true_value_same_state_mc` --
             same meaning, applied against ``horizon``.
+        bootstrap_tail (bool): See :func:`estimate_true_value_same_state_mc` -- same meaning,
+            same default of ``False``.
 
     Returns:
         Same shape/semantics as :func:`estimate_true_value_same_state_mc`'s return dict, just
@@ -928,6 +948,13 @@ def estimate_value_from_snapshots(
     # it) -- horizon <= nominal_horizon always; strictly less only when bootstrap_threshold is
     # set.
     horizon = _effective_rollout_horizon(nominal_horizon, discount_r, discount_c, bootstrap_threshold)
+    if horizon < nominal_horizon and not bootstrap_tail:
+        raise ValueError(
+            'estimate_value_from_snapshots: bootstrap_threshold truncates the rollout at '
+            f'{horizon} of {nominal_horizon} steps, but bootstrap_tail=False means the tail '
+            'would be dropped rather than estimated. Set bootstrap_threshold=None or '
+            'bootstrap_tail=True.',
+        )
 
     adv_estimator_r = getattr(cfgs.algo_cfgs, 'adv_estimation_method', 'gae')
     adv_estimator_c = getattr(cfgs.algo_cfgs, 'cost_adv_estimation_method', None) or adv_estimator_r
@@ -1026,9 +1053,9 @@ def estimate_value_from_snapshots(
         boot_c = np.where(is_terminated, 0.0, boot_value_c.reshape(-1).detach().cpu().numpy())
         v_r_seq[horizon] = boot_r
         v_c_seq[horizon] = boot_c
-        if horizon < nominal_horizon:
-            # See estimate_true_value_same_state_mc's matching comment -- the true-return
-            # accumulator needs the discounted bootstrap tail added in explicitly on truncation.
+        if horizon < nominal_horizon and bootstrap_tail:
+            # See estimate_true_value_same_state_mc's matching branch -- off by default so the
+            # MC return stays simulation-only.
             g_r += disc_r * boot_r
             g_c += disc_c * boot_c
 
