@@ -424,3 +424,6 @@ Sessionx.vim
 tags
 # Persistent undo
 [._]*.un~
+
+# figures written by plots/scripts/*.py -- regenerate, do not commit
+plots/figures/
