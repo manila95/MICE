@@ -922,6 +922,23 @@ class PolicyGradient(BaseAlgo):
 
         return ep_ret, ep_cost, ep_len
 
+    def _is_value_eval_epoch(self, epoch: int) -> bool:
+        """Whether ``epoch`` is due for the (expensive) value-evaluation pass.
+
+        ``early_eval_freq`` sets the cadence for the first 100 epochs and ``value_eval_freq``
+        after, so the grid is the plain multiples of that frequency -- 5, 10, 15, ... for the
+        default ``early_eval_freq: 5`` -- with one change: the run's first evaluation happens at
+        epoch **1**, not epoch 0. At epoch 0 the rollout the study measures was produced by the
+        freshly initialised policy and critics, so the probe spends a full
+        ``value_eval_episodes`` rollout to measure noise; epoch 1 is the first point where there
+        is a trained update to look at. Every diagnostic series (value studies, SR diagnostics,
+        critic scatter plots) shares this one schedule, so they can be read side by side.
+        """
+        eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
+        early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
+        effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
+        return epoch == 1 or (epoch > 0 and epoch % effective_eval_freq == 0)
+
     def _run_eval_studies(self, epoch: int) -> None:
         """Run this epoch's value-function evaluation studies, if any are due.
 
@@ -937,10 +954,7 @@ class PolicyGradient(BaseAlgo):
         checkpoint. All gates are read from ``algo_cfgs`` via ``getattr(..., default)``, so an
         algorithm/config that doesn't set them simply skips that block, same as before.
         """
-        eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
-        early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
-        effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
-        is_eval_epoch = epoch % effective_eval_freq == 0
+        is_eval_epoch = self._is_value_eval_epoch(epoch)
         eval_episodes = getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100)
         # Collected across whichever of the eval blocks below actually run this epoch, then
         # persisted as one pickle (raw per-probe arrays + aggregate stats -- the online
@@ -1394,11 +1408,7 @@ class PolicyGradient(BaseAlgo):
         first 100 epochs, ``value_eval_freq`` after -- so every diagnostic series in the run
         shares one set of sample points and can be read side by side.
         """
-        epoch = getattr(self, '_current_epoch', 0)
-        eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
-        early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
-        effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
-        return epoch % effective_eval_freq == 0
+        return self._is_value_eval_epoch(getattr(self, '_current_epoch', 0))
 
     @torch.no_grad()
     def _sr_capture_pre_update(self, data: dict) -> None:
@@ -1837,11 +1847,7 @@ class PolicyGradient(BaseAlgo):
         (critic predictions collected during rollout, before any gradient step).  The AfterUpdate
         predictions are always re-queried from the live network.
         """
-        epoch = getattr(self, '_current_epoch', 0)
-        eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
-        early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
-        effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
-        if epoch % effective_eval_freq != 0:
+        if not self._is_value_eval_epoch(getattr(self, '_current_epoch', 0)):
             return
 
         target_r = target_value_r.flatten()
