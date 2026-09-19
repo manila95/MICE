@@ -190,7 +190,7 @@ def main() -> int:
     p.add_argument('run_dir')
     p.add_argument('--once', action='store_true', help='evaluate what exists now, then exit')
     p.add_argument('--epochs', default=None, help='comma-separated epochs (default: all found)')
-    p.add_argument('--poll', type=float, default=30.0, help='seconds between scans when following')
+    p.add_argument('--poll', type=float, default=5.0, help='seconds between scans when following')
     args = p.parse_args()
 
     cfgs = load_run_config(args.run_dir)
@@ -233,6 +233,18 @@ def main() -> int:
                 print(f'[eval_worker] epoch {epoch} done in {time.time() - t0:.0f}s', flush=True)
             if args.once or (wanted is not None and not set(wanted) - done):
                 break
+            # Training writes TRAINING_COMPLETE when its loop ends. Re-scan *after* seeing it
+            # rather than exiting straight away: a checkpoint can land between the scan above and
+            # the sentinel appearing, and dropping it would silently lose that epoch's
+            # evaluation. Only an empty rescan with the sentinel present means genuinely done.
+            if os.path.exists(os.path.join(args.run_dir, 'TRAINING_COMPLETE')):
+                remaining = [e for e in checkpoint_epochs(args.run_dir) if e not in done]
+                if wanted is not None:
+                    remaining = [e for e in remaining if e in wanted]
+                if not remaining:
+                    print('[eval_worker] training complete and backlog drained', flush=True)
+                    break
+                continue
             time.sleep(args.poll)
     finally:
         for key in ('mc_env', 'interm_env'):

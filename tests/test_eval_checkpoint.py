@@ -477,7 +477,11 @@ def test_async_eval_skips_studies_but_writes_usable_checkpoints(tmp_path) -> Non
         'train_cfgs': {'device': 'cpu', 'torch_threads': 2, 'vector_env_nums': 1, 'total_steps': 4000},
         'algo_cfgs': {
             'steps_per_epoch': 2000, 'update_iters': 1, 'test_estimate': False,
-            'async_eval': True,
+            # spawn_worker off so this isolates the *training-side* gate: that training skips the
+            # studies and still leaves an evaluable checkpoint. With the worker auto-spawned it
+            # would evaluate during the run and write the very bundle asserted absent below,
+            # which tests the lifecycle rather than the gate.
+            'async_eval': True, 'async_eval_spawn_worker': False,
             'mc_value_study': True, 'mc_value_study_probes': 3, 'mc_value_study_repeats': 2,
             'mc_value_study_vector_envs': 3,
             'intermediate_state_study': False,
@@ -510,3 +514,49 @@ def test_async_eval_skips_studies_but_writes_usable_checkpoints(tmp_path) -> Non
     assert os.path.exists(os.path.join(run_dir, 'eval_data', 'epoch_00001.pkl')), (
         'worker did not persist the eval bundle'
     )
+
+
+@pytest.mark.slow
+def test_single_invocation_trains_and_evaluates(tmp_path) -> None:
+    """One call to learn() must produce training *and* a complete set of evaluations.
+
+    The lifecycle counterpart to the gate test above. What makes this worth asserting is the
+    ending: evaluation lags training (evals are minutes apart in the dense early window and take
+    minutes each), so when the training loop finishes there is normally a backlog. If learn()
+    returned without joining, the run would silently abandon exactly the calibration data it was
+    launched to produce. So this checks every checkpoint written got evaluated -- not merely that
+    some did -- and that the worker is not left running afterwards.
+    """
+    import csv  # noqa: PLC0415
+
+    import omnisafe  # noqa: PLC0415
+    from omnisafe.utils.eval_checkpoint import checkpoint_epochs  # noqa: PLC0415
+
+    log_dir = str(tmp_path / 'run')
+    omnisafe.Agent('CPO', ENV_ID, seed=0, custom_cfgs={
+        'seed': 0,
+        'train_cfgs': {'device': 'cpu', 'torch_threads': 2, 'vector_env_nums': 1, 'total_steps': 12000},
+        'algo_cfgs': {
+            'steps_per_epoch': 2000, 'update_iters': 1, 'test_estimate': False,
+            'async_eval': True, 'async_eval_spawn_worker': True,
+            'mc_value_study': True, 'mc_value_study_probes': 2, 'mc_value_study_repeats': 2,
+            'mc_value_study_vector_envs': 2, 'intermediate_state_study': False,
+            'early_eval_freq': 5, 'early_eval_epochs': 50,
+        },
+        'model_cfgs': {'critic': {'lr': 3e-4, 'hidden_sizes': [64, 64]}},
+        'logger_cfgs': {'use_wandb': False, 'use_tensorboard': False, 'log_dir': log_dir},
+    }).learn()
+
+    run_dir = next(os.path.join(r, '') for r, _, fs in os.walk(log_dir) if 'config.json' in fs)
+    csv_path = os.path.join(run_dir, 'eval_progress.csv')
+    assert os.path.exists(csv_path), 'no eval_progress.csv -- the worker never ran or never joined'
+
+    with open(csv_path, encoding='utf-8') as f:
+        rows = list(csv.DictReader(f))
+    evaluated = sorted(int(float(r['epoch'])) for r in rows)
+    written = checkpoint_epochs(run_dir)
+    assert evaluated == written, (
+        f'checkpoints {written} but evaluations {evaluated} -- learn() returned before the '
+        f'worker drained its backlog'
+    )
+    assert any(k.startswith('MCStudy/') for k in rows[0]), 'rows carry no study statistics'

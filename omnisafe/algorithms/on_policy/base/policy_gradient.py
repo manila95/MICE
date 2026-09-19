@@ -16,8 +16,12 @@
 
 from __future__ import annotations
 
+import atexit
 import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -105,6 +109,10 @@ class PolicyGradient(BaseAlgo):
     # reset(seed=X) waves.
     _mc_intermediate_env: Any = None
     _mc_intermediate_max_episode_steps: int | None = None
+    # Subprocess running experiments/eval_worker.py under algo_cfgs.async_eval, spawned lazily at
+    # the first eval epoch and joined when training finishes. Kept here (not in learn()) so
+    # algorithms with their own learn() -- MICE -- get the same lifecycle without changing theirs.
+    _eval_worker_proc: Any = None
     # phi_source='contrastive' state; see _contrastive_update_phi / _relabel_after_phi_update.
     _sr_phi_source: str = 'trunk'
     _sr_phi_pretrain_steps: int = 0
@@ -832,11 +840,18 @@ class PolicyGradient(BaseAlgo):
             # progress.csv's MCStudy/IntermediateMC/PooledMC columns stay NaN for the whole run
             # and the numbers appear only if somebody actually starts the worker. Silently
             # producing a run with no calibration data is a far worse outcome than a noisy banner.
+            spawns = getattr(self._cfgs.algo_cfgs, 'async_eval_spawn_worker', True)
             self._logger.log(
-                'INFO: async_eval is ON -- this run computes NO value studies in-process.\n'
-                'INFO: Start the evaluator alongside it, or this run produces no eval data:\n'
-                f'INFO:     python experiments/eval_worker.py {self._logger.log_dir}\n'
-                'INFO: Results land in eval_progress.csv (keyed by epoch), not progress.csv.',
+                'INFO: async_eval is ON -- the value studies run in a separate process.\n'
+                + (
+                    'INFO: The evaluator is started automatically at the first eval epoch and\n'
+                    'INFO: joined when training ends, so this one command does both.\n'
+                    if spawns else
+                    'INFO: async_eval_spawn_worker is OFF -- start the evaluator yourself or\n'
+                    'INFO: this run produces no eval data:\n'
+                    f'INFO:     python experiments/eval_worker.py {self._logger.log_dir}\n'
+                )
+                + 'INFO: Results land in eval_progress.csv (keyed by epoch), not progress.csv.',
                 'yellow',
                 bold=True,
             )
@@ -939,6 +954,7 @@ class PolicyGradient(BaseAlgo):
         ep_ret = self._logger.get_stats('Metrics/EpRet')[0]
         ep_cost = self._logger.get_stats('Metrics/EpCost')[0]
         ep_len = self._logger.get_stats('Metrics/EpLen')[0]
+        self._join_eval_worker()
         self._logger.close()
         self._env.close()
 
@@ -999,6 +1015,82 @@ class PolicyGradient(BaseAlgo):
         with eval_rng(self._cfgs, epoch):
             self._run_eval_studies_inner(epoch)
 
+    def _maybe_spawn_eval_worker(self) -> None:
+        """Start the out-of-process evaluator, once, as a child of this training run.
+
+        Requiring a second command to be run by hand is a bad interface and a silent failure
+        mode: forget it and the run finishes with every calibration column NaN and nothing to
+        say why. Owning the worker here means one invocation of a training script does training
+        *and* evaluation, which is what callers expect.
+
+        Spawned at the first eval epoch rather than at startup, so a run that never reaches one
+        never pays for it, and ``config.json`` is certainly on disk by then (the logger writes it
+        during ``_init_log``) -- the worker reads it to rebuild the agent.
+
+        Set ``algo_cfgs.async_eval_spawn_worker: False`` to keep ``async_eval``'s
+        checkpoint-writing but supply the evaluator yourself -- on another box, over a shared
+        filesystem, or by hand for a re-run.
+        """
+        if self._eval_worker_proc is not None:
+            return
+        if not getattr(self._cfgs.algo_cfgs, 'async_eval_spawn_worker', True):
+            return
+        # This file is <repo>/omnisafe/algorithms/on_policy/base/policy_gradient.py, so the repo
+        # root is parents[4]; spelling it with pathlib rather than a stack of dirname() calls
+        # because getting that count wrong fails as a runtime warning rather than an error, and
+        # the run then completes with no eval data at all.
+        worker = str(Path(__file__).resolve().parents[4] / 'experiments' / 'eval_worker.py')
+        if not os.path.exists(worker):
+            self._logger.log(f'WARNING: eval worker not found at {worker}; no eval will run.', 'yellow')
+            return
+        log_path = os.path.join(self._logger.log_dir, 'eval_worker.log')
+        try:
+            # start_new_session: the worker gets its own process group, so a Ctrl-C aimed at the
+            # training process does not also kill an evaluator that may still be draining.
+            self._eval_worker_proc = subprocess.Popen(  # noqa: S603  # pylint: disable=consider-using-with
+                [sys.executable, worker, self._logger.log_dir],
+                stdout=open(log_path, 'a', encoding='utf-8'),  # noqa: SIM115
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
+            self._logger.log(f'WARNING: could not start eval worker: {exc}', 'yellow')
+            return
+        # Safety net for algorithms that override learn() and therefore never reach the explicit
+        # join at the end of PolicyGradient.learn().
+        atexit.register(self._join_eval_worker)
+        self._logger.log(
+            f'INFO: eval worker started (pid {self._eval_worker_proc.pid}), logging to {log_path}',
+            'cyan',
+        )
+
+    def _join_eval_worker(self) -> None:
+        """Signal the evaluator that no more checkpoints are coming, then wait for it to drain.
+
+        Evaluation legitimately lags training -- in the dense early window evals are ~46 s apart
+        and take ~241 s -- so at the end of training there is usually a backlog. Exiting here
+        would abandon it, which is exactly the eval data a run was launched to produce, so
+        training waits. The sentinel file is how the worker distinguishes "nothing to do yet"
+        from "nothing more will ever arrive".
+        """
+        proc, self._eval_worker_proc = self._eval_worker_proc, None
+        if proc is None:
+            return
+        try:
+            with open(
+                os.path.join(self._logger.log_dir, 'TRAINING_COMPLETE'), 'w', encoding='utf-8',
+            ) as f:
+                f.write('training finished; evaluate remaining checkpoints and exit\n')
+        except OSError:
+            pass
+        if proc.poll() is None:
+            self._logger.log('INFO: waiting for the eval worker to finish its backlog...', 'cyan')
+        try:
+            proc.wait()
+            self._logger.log(f'INFO: eval worker exited with code {proc.returncode}', 'cyan')
+        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
+            self._logger.log(f'WARNING: waiting on eval worker failed: {exc}', 'yellow')
+
     def _save_eval_checkpoint(self, epoch: int) -> None:
         """Persist this epoch's checkpoint for an out-of-process evaluator to pick up.
 
@@ -1009,6 +1101,7 @@ class PolicyGradient(BaseAlgo):
         copy. ``Logger.torch_save`` names the file from the logger's own epoch counter, which
         still equals ``epoch`` here because this runs before ``dump_tabular``.
         """
+        self._maybe_spawn_eval_worker()
         self._logger.torch_save()
         checkpoint_path = os.path.join(self._logger.log_dir, 'torch_save', f'epoch-{epoch}.pt')
         if os.path.exists(checkpoint_path):

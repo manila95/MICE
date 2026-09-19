@@ -39,6 +39,7 @@ EVAL_KEYS = (
     'early_eval_epochs',
     'eval_rng_seed_base',
     'async_eval',
+    'async_eval_spawn_worker',
     'value_eval_freq',
     'mc_value_study',
     'mc_value_study_probes',

@@ -111,6 +111,11 @@ defaults:
     # eval_progress.csv, keyed by the epoch they belong to rather than the epoch that was current
     # when they finished. learn() prints the exact command at startup.
     async_eval: True
+    # Spawn the evaluator automatically as a child of the training process, so one invocation of
+    # a training script does training *and* evaluation. Set False to keep async_eval's
+    # checkpoint-writing but supply the worker yourself (another box, a shared filesystem, or a
+    # manual re-run over past checkpoints).
+    async_eval_spawn_worker: True
     value_eval_freq: 50
     # whether to run the full-episode true-vs-estimated value calibration rollout
     # (see omnisafe.utils.value_eval.estimate_true_value). Off by default: it's a one-sample-
