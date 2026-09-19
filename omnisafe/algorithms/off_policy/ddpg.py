@@ -405,7 +405,10 @@ class DDPG(BaseAlgo):
             return
         eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
         early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
-        effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
+        # Same knob as PolicyGradient._is_value_eval_epoch; defaults to the old literal 100, so
+        # off-policy configs (which do not declare the key) keep their existing schedule.
+        early_eval_epochs = int(getattr(self._cfgs.algo_cfgs, 'early_eval_epochs', 100))
+        effective_eval_freq = early_eval_freq if epoch < early_eval_epochs else eval_freq
         if epoch % effective_eval_freq != 0:
             return
         if (epoch + 1) * self._cfgs.algo_cfgs.steps_per_epoch <= (

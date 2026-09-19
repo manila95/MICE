@@ -925,9 +925,10 @@ class PolicyGradient(BaseAlgo):
     def _is_value_eval_epoch(self, epoch: int) -> bool:
         """Whether ``epoch`` is due for the (expensive) value-evaluation pass.
 
-        ``early_eval_freq`` sets the cadence for the first 100 epochs and ``value_eval_freq``
-        after, so the grid is the plain multiples of that frequency -- 5, 10, 15, ... for the
-        default ``early_eval_freq: 5`` -- with one change: the run's first evaluation happens at
+        ``early_eval_freq`` sets the cadence for the first ``early_eval_epochs`` epochs and
+        ``value_eval_freq`` after, so the grid is the plain multiples of that frequency --
+        5, 10, 15, ... for the default ``early_eval_freq: 5`` -- with one change: the run's
+        first evaluation happens at
         epoch **1**, not epoch 0. At epoch 0 the rollout the study measures was produced by the
         freshly initialised policy and critics, so the probe spends a full
         ``value_eval_episodes`` rollout to measure noise; epoch 1 is the first point where there
@@ -936,7 +937,13 @@ class PolicyGradient(BaseAlgo):
         """
         eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
         early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
-        effective_eval_freq = early_eval_freq if epoch < 100 else eval_freq
+        # Width of the dense-cadence window, previously the bare literal 100. It is a real knob:
+        # an eval epoch costs ~240 s against a ~9 s training epoch (measured), so where this
+        # boundary sits is one of the few levers on total eval cost that does not weaken any
+        # individual measurement -- it only moves where the budget is spent. Defaulted to 100
+        # via getattr so a config predating the key keeps exactly its old schedule.
+        early_eval_epochs = int(getattr(self._cfgs.algo_cfgs, 'early_eval_epochs', 100))
+        effective_eval_freq = early_eval_freq if epoch < early_eval_epochs else eval_freq
         return epoch == 1 or (epoch > 0 and epoch % effective_eval_freq == 0)
 
     def _run_eval_studies(self, epoch: int) -> None:
