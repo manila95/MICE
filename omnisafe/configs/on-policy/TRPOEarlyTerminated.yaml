@@ -96,6 +96,27 @@ defaults:
     # ~9 s training epoch, so this is a direct lever on total eval cost that, unlike cutting
     # repeats/positions, leaves every individual measurement exactly as trustworthy.
     early_eval_epochs: 50
+    # base for the evaluation RNG seed. The studies roll the stochastic policy out, so their
+    # numbers are only reproducible if that randomness is pinned: the seed is
+    # eval_rng_seed_base + seed * 1_000_000 + epoch, derived from the run seed and the epoch
+    # alone. Same seed + same config => byte-identical eval numbers, whether evaluated in-process
+    # or later from checkpoints; different run seeds => independent eval draws, so seed-averaging
+    # actually averages the eval noise away. The scope saves/restores the RNG state, so this
+    # never perturbs the stream training draws from.
+    eval_rng_seed_base: 500000
+    # Decouple evaluation from training: at each eval epoch this process writes a checkpoint and
+    # moves straight on, and experiments/eval_worker.py runs the value studies in a separate
+    # process. Training's wall-clock then excludes eval entirely.
+    #
+    # Measured on this box: on 16 cores the two processes inflate each other ~1.4x but overlap to
+    # a net 1.39x speedup; on 8 cores they each roughly double, cancelling the overlap and coming
+    # out ~6% SLOWER than sequential. Set this False below ~16 cores.
+    #
+    # IMPORTANT: with this on, the studies only run if the worker is actually started. The
+    # MCStudy/IntermediateMC/PooledMC columns in progress.csv stay NaN; results go to
+    # eval_progress.csv, keyed by the epoch they belong to rather than the epoch that was current
+    # when they finished. learn() prints the exact command at startup.
+    async_eval: True
     value_eval_freq: 50
     # whether to run the full-episode true-vs-estimated value calibration rollout
     # (see omnisafe.utils.value_eval.estimate_true_value). Off by default: it's a one-sample-

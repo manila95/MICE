@@ -37,6 +37,8 @@ EVAL_KEYS = (
     'value_eval_episodes',
     'early_eval_freq',
     'early_eval_epochs',
+    'eval_rng_seed_base',
+    'async_eval',
     'value_eval_freq',
     'mc_value_study',
     'mc_value_study_probes',

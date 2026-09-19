@@ -38,6 +38,7 @@ from omnisafe.envs.wrapper import ActionScale, AutoReset, ObsNormalize, TimeLimi
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
 from omnisafe.utils import clearning, contrastive, distributed, laplacian, sr_diagnostics
 from omnisafe.utils.critic_ensemble import GPLBetaAdapter, TOPBanditAdapter
+from omnisafe.utils.eval_checkpoint import eval_rng
 from omnisafe.utils.eval_data_dump import (
     log_eval_data_to_wandb,
     log_scatter_to_wandb,
@@ -526,6 +527,14 @@ class PolicyGradient(BaseAlgo):
 
         what_to_save: dict[str, Any] = {}
         what_to_save['pi'] = self._actor_critic.actor
+        # Both critics, not just the actor. The value studies score V_r/V_c against a Monte-Carlo
+        # return, so a checkpoint without the critics cannot reproduce a single number they
+        # report -- which is what an out-of-process evaluator (experiments/eval_worker.py) needs
+        # in order to evaluate epoch N while training has already moved on to N+k. Two small MLPs
+        # ([256, 256] in the runs this was built for), so the checkpoints stay cheap.
+        what_to_save['reward_critic'] = self._actor_critic.reward_critic
+        if getattr(self._actor_critic, 'cost_critic', None) is not None:
+            what_to_save['cost_critic'] = self._actor_critic.cost_critic
         if self._cfgs.algo_cfgs.obs_normalize:
             obs_normalizer = self._env.save()['obs_normalizer']
             what_to_save['obs_normalizer'] = obs_normalizer
@@ -818,6 +827,19 @@ class PolicyGradient(BaseAlgo):
         """
         start_time = time.time()
         self._logger.log('INFO: Start training')
+        if getattr(self._cfgs.algo_cfgs, 'async_eval', False):
+            # Loud on purpose. With async_eval on, this process computes no value studies at all:
+            # progress.csv's MCStudy/IntermediateMC/PooledMC columns stay NaN for the whole run
+            # and the numbers appear only if somebody actually starts the worker. Silently
+            # producing a run with no calibration data is a far worse outcome than a noisy banner.
+            self._logger.log(
+                'INFO: async_eval is ON -- this run computes NO value studies in-process.\n'
+                'INFO: Start the evaluator alongside it, or this run produces no eval data:\n'
+                f'INFO:     python experiments/eval_worker.py {self._logger.log_dir}\n'
+                'INFO: Results land in eval_progress.csv (keyed by epoch), not progress.csv.',
+                'yellow',
+                bold=True,
+            )
         total_cost: float = 0.0
 
         for epoch in range(self._cfgs.train_cfgs.epochs):
@@ -947,6 +969,59 @@ class PolicyGradient(BaseAlgo):
         return epoch == 1 or (epoch > 0 and epoch % effective_eval_freq == 0)
 
     def _run_eval_studies(self, epoch: int) -> None:
+        """Run this epoch's value studies under a deterministic, side-effect-free eval RNG.
+
+        Everything inside :meth:`_run_eval_studies_inner` is gated on ``is_eval_epoch`` already,
+        so returning early here is equivalent -- it just avoids seeding on the ~96% of epochs
+        that evaluate nothing.
+
+        The :class:`~omnisafe.utils.eval_checkpoint.eval_rng` scope is what makes an evaluation
+        reproducible from its epoch alone, and therefore what lets the out-of-process evaluator
+        (``experiments/eval_worker.py``) be checked against this path by *exact* equality rather
+        than "close enough given Monte-Carlo noise". It saves and restores the global torch RNG
+        state, so training's own stream is untouched: a run with studies enabled follows the same
+        trajectory as one without.
+        """
+        if not self._is_value_eval_epoch(epoch):
+            return
+        if getattr(self._cfgs.algo_cfgs, 'async_eval', False):
+            # Decoupled evaluation: write the checkpoint and return immediately, leaving the
+            # studies to experiments/eval_worker.py in another process. Training's wall-clock
+            # then stops including eval at all.
+            #
+            # Measured trade-off (see the eval_worker docstring): on 16 cores the two processes
+            # inflate each other ~1.4x but overlap to a net 1.39x speedup; on 8 cores they each
+            # roughly double, which cancels the overlap entirely and comes out 6% SLOWER than
+            # running them sequentially. So this is worth enabling on a 16+ core box and worth
+            # turning off below that.
+            self._save_eval_checkpoint(epoch)
+            return
+        with eval_rng(self._cfgs, epoch):
+            self._run_eval_studies_inner(epoch)
+
+    def _save_eval_checkpoint(self, epoch: int) -> None:
+        """Persist this epoch's checkpoint for an out-of-process evaluator to pick up.
+
+        The same two artifacts the in-process path writes at an eval epoch, minus the studies:
+        the local ``torch_save/epoch-<N>.pt`` (which carries ``pi`` plus both critics and the
+        observation normalizer -- everything
+        :func:`~omnisafe.utils.eval_checkpoint.load_agent_from_checkpoint` needs) and its wandb
+        copy. ``Logger.torch_save`` names the file from the logger's own epoch counter, which
+        still equals ``epoch`` here because this runs before ``dump_tabular``.
+        """
+        self._logger.torch_save()
+        checkpoint_path = os.path.join(self._logger.log_dir, 'torch_save', f'epoch-{epoch}.pt')
+        if os.path.exists(checkpoint_path):
+            log_eval_data_to_wandb(
+                checkpoint_path, epoch,
+                name_prefix='actor-snapshot', artifact_type='actor_snapshot',
+                description=(
+                    f'Actor, critics and obs_normalizer at epoch {epoch}, saved for '
+                    f'out-of-process evaluation (algo_cfgs.async_eval).'
+                ),
+            )
+
+    def _run_eval_studies_inner(self, epoch: int) -> None:
         """Run this epoch's value-function evaluation studies, if any are due.
 
         Extracted out of :meth:`learn` so algorithms with their own ``learn()`` loop (MICE, in
