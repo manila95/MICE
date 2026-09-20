@@ -38,20 +38,20 @@ EVAL_KEYS = (
     'early_eval_freq',
     'early_eval_epochs',
     'value_eval_freq',
-    'mc_value_study',
+    'eval_critic',
     'mc_value_study_probes',
     'mc_value_study_repeats',
     'mc_value_study_seed_offset',
     'mc_value_study_vector_envs',
     'mc_eval_bootstrap_threshold',
     'mc_eval_bootstrap_tail',
-    'intermediate_state_study',
     'intermediate_state_study_positions',
     'intermediate_state_study_probes',
     'intermediate_state_study_repeats',
 )
 
-STUDY_SWITCHES = ('mc_value_study', 'intermediate_state_study')
+#: The single master switch for both calibration studies (was two separate booleans).
+STUDY_SWITCHES = ('eval_critic',)
 
 #: Algorithms whose adapter augments the observation space (SauteAdapter / SimmerAdapter append a
 #: safety state), while ``_get_mc_value_study_env`` / ``_get_intermediate_state_env`` rebuild the

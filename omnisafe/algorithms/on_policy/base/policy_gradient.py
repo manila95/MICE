@@ -597,7 +597,7 @@ class PolicyGradient(BaseAlgo):
 
         # Same-layout Monte-Carlo value study (opt-in; see
         # estimate_true_value_same_state_mc's docstring and learn()'s call site).
-        if getattr(self._cfgs.algo_cfgs, 'mc_value_study', False):
+        if getattr(self._cfgs.algo_cfgs, 'eval_critic', False):
             for stream in ('r', 'c'):
                 self._logger.register_key(f'MCStudy/Correlation_{stream}')
                 self._logger.register_key(f'MCStudy/EstimationError_{stream}')
@@ -616,7 +616,7 @@ class PolicyGradient(BaseAlgo):
         # On-policy intermediate-state value study (opt-in; see estimate_value_from_snapshots's
         # docstring and learn()'s call site). One block of keys per within-episode position, since
         # each is scored (and therefore logged) independently.
-        if getattr(self._cfgs.algo_cfgs, 'intermediate_state_study', False):
+        if getattr(self._cfgs.algo_cfgs, 'eval_critic', False):
             positions = getattr(
                 self._cfgs.algo_cfgs, 'intermediate_state_study_positions', [100, 300, 500, 700, 900],
             )
@@ -1022,7 +1022,7 @@ class PolicyGradient(BaseAlgo):
         # Same-layout Monte-Carlo value study (opt-in, default off -- see
         # estimate_true_value_same_state_mc's docstring). Shares effective_eval_freq with the
         # estimate_true_value call above so both diagnostics are read from the same epochs.
-        if getattr(self._cfgs.algo_cfgs, 'mc_value_study', False) and is_eval_epoch:
+        if getattr(self._cfgs.algo_cfgs, 'eval_critic', False) and is_eval_epoch:
             if self._mc_probe_seeds is None:
                 n_probes = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_probes', 100))
                 seed_offset = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_seed_offset', 100_000))
@@ -1054,7 +1054,7 @@ class PolicyGradient(BaseAlgo):
         # _mc_probe_seeds) -- by epoch 400 the policy visits very different states than at
         # epoch 20, so re-using an old batch would be scoring accuracy on states the current
         # policy may never actually visit.
-        if getattr(self._cfgs.algo_cfgs, 'intermediate_state_study', False) and is_eval_epoch:
+        if getattr(self._cfgs.algo_cfgs, 'eval_critic', False) and is_eval_epoch:
             positions = list(
                 getattr(
                     self._cfgs.algo_cfgs,

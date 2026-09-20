@@ -127,7 +127,16 @@ defaults:
     # _get_intermediate_state_env rebuild the env with the base OnlineAdapter wrapper recipe
     # only, so probe observations would not match the critic input layer. Enable once those
     # builders learn to reproduce the algorithm-specific observation augmentation.
-    mc_value_study: False
+    # Master switch for the critic-calibration studies: the same-layout Monte-Carlo s0 study and
+    # the on-policy intermediate-state study. True runs both, False runs neither. They were two
+    # separate booleans; nothing ever wanted one without the other, and switching evaluation off
+    # meant remembering both. The per-study *settings* below (probes/repeats/positions/...) are
+    # unchanged and still tune each one independently.
+    #
+    # This is what a run's wall-clock is mostly made of: an eval epoch costs ~240 s against a ~9 s
+    # training epoch, so False takes a 500-epoch run from ~2.6 h to ~1.3 h. (test_estimate is a
+    # separate, superseded diagnostic and has its own flag.)
+    eval_critic: False
     # number of fixed probe states (env reset seeds), held constant for the whole run
     mc_value_study_probes: 17
     # independent same-layout rollouts averaged per probe state -- 10 (not the original 5): the
@@ -178,7 +187,6 @@ defaults:
     # _get_intermediate_state_env rebuild the env with the base OnlineAdapter wrapper recipe
     # only, so probe observations would not match the critic input layer. Enable once those
     # builders learn to reproduce the algorithm-specific observation augmentation.
-    intermediate_state_study: False
     # within-episode step indices to snapshot at (steps elapsed so far in that episode) --
     # evenly-spaced by default to cover the whole episode timeline, not just its start
     intermediate_state_study_positions: [100, 300, 500, 700, 900]
