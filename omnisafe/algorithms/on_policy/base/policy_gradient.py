@@ -1383,7 +1383,25 @@ class PolicyGradient(BaseAlgo):
         train_data: dict,
         val_data: dict | None,
     ) -> None:
-        """Call ``_log_critic_diagnostics`` for Train and optionally Val splits."""
+        """Call ``_log_critic_diagnostics`` for Train and optionally Val splits.
+
+        Gated on ``algo_cfgs.eval_critic``, the same switch as the rollout-based MC studies, so
+        one flag turns critic evaluation off in full rather than leaving these behind. They are
+        the cheap half -- no extra environment steps, just a re-query of the critic over the
+        rollout batch already in hand plus the scatter rendering -- so the wall-clock argument for
+        disabling them is weak; the reason to share the switch is that "evaluation off" should
+        mean off, not "off except the part that still writes Value/Train/* and scatter plots".
+
+        The gate lives here rather than at the call site so an algorithm with its own ``_update``
+        (MICE) gets the same behaviour without repeating the check.
+
+        Note this also silences the SR diagnostics below (``_log_sr_diagnostics``, only reached
+        under ``sr_mode: 'td_ridge'``) -- phi/psi ranks, ridge R^2, explained variance. Those
+        describe the SR *representation* rather than critic calibration, so if you are studying SR
+        specifically and want them while ``eval_critic: False``, they need their own flag.
+        """
+        if not getattr(self._cfgs.algo_cfgs, 'eval_critic', False):
+            return
         self._log_critic_diagnostics(
             train_data['obs'],
             train_data['target_value_r'],
