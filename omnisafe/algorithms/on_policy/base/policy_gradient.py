@@ -526,6 +526,19 @@ class PolicyGradient(BaseAlgo):
 
         what_to_save: dict[str, Any] = {}
         what_to_save['pi'] = self._actor_critic.actor
+        # Both critics, unconditionally -- including when algo_cfgs.eval_critic is False.
+        #
+        # The value studies score V_r/V_c against a Monte-Carlo return, so a checkpoint holding
+        # only the actor cannot reproduce a single number they report: an evaluator loading it
+        # would score a freshly initialised critic and hand back perfectly plausible correlations
+        # that mean nothing. Saving them costs ~0.7 MB per checkpoint at the [256, 256] critics
+        # these runs use, against permanently losing the ability to evaluate a run after the fact
+        # -- and "after the fact" is exactly when a new diagnostic gets invented. Deliberately not
+        # gated on eval_critic: turning evaluation off for speed should not also decide, silently
+        # and irreversibly, that this run can never be evaluated.
+        what_to_save['reward_critic'] = self._actor_critic.reward_critic
+        if getattr(self._actor_critic, 'cost_critic', None) is not None:
+            what_to_save['cost_critic'] = self._actor_critic.cost_critic
         if self._cfgs.algo_cfgs.obs_normalize:
             obs_normalizer = self._env.save()['obs_normalizer']
             what_to_save['obs_normalizer'] = obs_normalizer
@@ -1150,20 +1163,27 @@ class PolicyGradient(BaseAlgo):
             # pred, mc_mean) the pickle already carries) had no way to reconstruct the actor and
             # was permanently stuck with whatever got logged live. _what_to_save on this
             # (on-policy) path is already just {'pi': actor, 'obs_normalizer': ...} -- i.e.
-            # already the lightweight, actor-only snapshot this needs, not a heavier full-model-
-            # plus-optimizer checkpoint -- so this reuses that exact file rather than writing a
-            # second, redundant copy. Naming/cadence mirrors eval_data_path exactly (same epoch,
-            # same is_eval_epoch gate) so the two artifacts are always available as a pair.
+            # already the lightweight snapshot this needs -- actor, both critics and the
+            # observation normalizer, but no optimizer state -- so this reuses that exact file
+            # rather than writing a second, redundant copy. Naming/cadence mirrors eval_data_path
+            # exactly (same epoch, same is_eval_epoch gate) so the two artifacts are always
+            # available as a pair.
+            #
+            # The artifact is still called "actor-snapshot" for continuity with runs logged before
+            # the critics were added; it has held them since, and the description below says so.
             checkpoint_path = os.path.join(self._logger.log_dir, 'torch_save', f'epoch-{epoch}.pt')
             if os.path.exists(checkpoint_path):
                 log_eval_data_to_wandb(
                     checkpoint_path, epoch,
                     name_prefix='actor-snapshot', artifact_type='actor_snapshot',
                     description=(
-                        f'Actor (+ obs_normalizer) state dict at epoch {epoch}, keyed by '
-                        f"_what_to_save ('pi', optionally 'obs_normalizer'). Pairs with this "
-                        f'same epoch\'s eval-data artifact to retroactively recompute '
-                        f'compute_gradient_alignment offline.'
+                        f'Agent state dicts at epoch {epoch}, keyed by _what_to_save: '
+                        f"'pi', 'reward_critic', 'cost_critic' and (when obs_normalize) "
+                        f"'obs_normalizer'. This is the PRE-update critic -- the snapshot is "
+                        f'taken before _update() runs, so it is exactly the critic an epoch-'
+                        f'{epoch} evaluation scores. Enough on its own to re-run the value '
+                        f'studies offline, and pairs with this epoch\'s eval-data artifact to '
+                        f'recompute compute_gradient_alignment.'
                     ),
                 )
 
