@@ -98,6 +98,17 @@ defaults:
     fvp_obs: None
     # Tolerance of constraint violation
     cost_limit: 25
+    # What estimates J_C(pi) for the trust-region optim-case decision in cpo.py's _update_actor:
+    #   'episode' : Metrics/EpCost, the undiscounted MC sum over this epoch's *completed*
+    #               episodes. Unbiased once episodes finish, but NaN (or built from very few
+    #               episodes, hence noisy) whenever steps_per_epoch is short relative to episode
+    #               length. The original and the default.
+    #   'critic'  : Value/cost, the cost critic's mean prediction over every state visited this
+    #               epoch. Always available (no dependency on any episode finishing) and much
+    #               lower-variance, at the cost of whatever bias the critic carries -- worst early
+    #               in training -- and of estimating E_{s~d^pi}[V_c(s)] rather than the
+    #               episode-start J_C(pi) the constraint is actually about.
+    cost_estimate_source: episode
     # Ablation: uniformly multiply the cost advantage (adv_c) by this factor before it touches
     # anything in _update_actor -- the cost gradient (b_grads), the closed-form step direction,
     # AND the line search's cost non-worsening check all consistently see the shrunk signal, as

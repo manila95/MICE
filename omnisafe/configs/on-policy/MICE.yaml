@@ -87,6 +87,15 @@ defaults:
     fvp_obs: None
     # Tolerance of constraint violation
     cost_limit: 25
+    # What estimates J_C(pi) for the trust-region optim-case decision in mice.py's _update_actor.
+    # See algo_cfgs.cost_estimate_source in CPO.yaml for the full rationale ('episode' =
+    # Metrics/EpCost, the default; 'critic' = Value/cost, the cost critic's mean prediction over
+    # every visited state). Under 'critic', the ep_discount_ci intrinsic-cost addition below
+    # (no_intrinsic_in_ep_costs) is skipped unconditionally, regardless of that flag's own
+    # setting -- Value/cost is the plain cost critic's prediction, which was never trained to
+    # include the intrinsic/novelty bias, so adding it here would inflate a critic-based estimate
+    # by a term the critic knows nothing about.
+    cost_estimate_source: episode
     # The sub-sampling rate of the observation
     fvp_sample_freq: 1
     # buf_size

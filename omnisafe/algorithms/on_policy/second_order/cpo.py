@@ -410,7 +410,19 @@ class CPO(TRPO):
         distributed.avg_grads(self._actor_critic.actor)
 
         b_grads = get_flat_gradients_from(self._actor_critic.actor)
-        ep_costs = self._logger.get_stats('Metrics/EpCost')[0] - self._cfgs.algo_cfgs.cost_limit
+        # algo_cfgs.cost_estimate_source picks what estimates J_C(pi) for the optim-case decision
+        # below: 'episode' (default) is Metrics/EpCost, the undiscounted MC sum over this epoch's
+        # *completed* episodes -- unbiased once an episode finishes, but NaN or high-variance
+        # whenever few/none do (short epochs relative to episode length). 'critic' reads Value/cost
+        # instead, the cost critic's mean prediction over every state visited this epoch -- always
+        # available and much lower-variance, at the cost of whatever bias the critic itself carries
+        # (worst early in training) and of being E_{s~d^pi}[V_c(s)] rather than the episode-start
+        # J_C(pi) the constraint is actually about.
+        cost_estimate_source = getattr(self._cfgs.algo_cfgs, 'cost_estimate_source', 'episode')
+        if cost_estimate_source == 'critic':
+            ep_costs = self._logger.get_stats('Value/cost')[0] - self._cfgs.algo_cfgs.cost_limit
+        else:
+            ep_costs = self._logger.get_stats('Metrics/EpCost')[0] - self._cfgs.algo_cfgs.cost_limit
 
         # Constant cost bias (algo_cfgs.cost_bias / cost_bias_decay_type -- see
         # PolicyGradient.learn()'s cost-bias block for where/how it's decayed and handed to the
@@ -421,7 +433,14 @@ class CPO(TRPO):
         # per-step add-on -- see that method's docstring), pooled across this epoch's finished
         # paths; 0.0 whenever algo_cfgs.cost_bias is unset, so this is an exact no-op by default
         # regardless of use_cost_bias.
-        if getattr(self._cfgs.algo_cfgs, 'use_cost_bias', False):
+        #
+        # Gated to cost_estimate_source: 'episode' for the same reason as MICE's ep_discount_ci
+        # gate (mice.py's _update_actor): mean_ep_cost_bias() is a bias term for Metrics/EpCost
+        # specifically (an add-on to the *episode* MC sum), not for anything the cost critic was
+        # trained to predict, so adding it to a Value/cost-based estimate would inflate that
+        # estimate by a term it knows nothing about -- exactly the failure mode this flag exists to
+        # avoid on the MICE side.
+        if cost_estimate_source == 'episode' and getattr(self._cfgs.algo_cfgs, 'use_cost_bias', False):
             ep_cost_bias = self._buf.mean_ep_cost_bias()
             ep_costs = ep_costs + ep_cost_bias
             self._logger.store({'Misc/EpCostBias': ep_cost_bias})

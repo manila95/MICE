@@ -298,7 +298,15 @@ class MICE(CPO):
         distributed.avg_grads(self._actor_critic.actor)
 
         b_grads = get_flat_gradients_from(self._actor_critic.actor)
-        self.ep_costs = self._logger.get_stats('Metrics/EpCost')[0] - self._cfgs.algo_cfgs.cost_limit
+        # algo_cfgs.cost_estimate_source: see CPO's cpo.py._update_actor for the full rationale
+        # ('episode' = Metrics/EpCost, the undiscounted MC sum over this epoch's completed
+        # episodes; 'critic' = Value/cost, the cost critic's mean prediction over every visited
+        # state, available and low-variance even when no episode has finished this epoch).
+        cost_estimate_source = getattr(self._cfgs.algo_cfgs, 'cost_estimate_source', 'episode')
+        if cost_estimate_source == 'critic':
+            self.ep_costs = self._logger.get_stats('Value/cost')[0] - self._cfgs.algo_cfgs.cost_limit
+        else:
+            self.ep_costs = self._logger.get_stats('Metrics/EpCost')[0] - self._cfgs.algo_cfgs.cost_limit
 
         ep_discount_ci = balancing_ep_dicount_ci.mean().item()
 
@@ -316,7 +324,16 @@ class MICE(CPO):
         # while leaving Train/discount_ci logged either way, for diagnostic visibility regardless
         # of whether it's actually being used. See CPO's algo_cfgs.use_cost_bias (cpo.py) for the
         # generalized, MICE-independent version of this same lever.
-        if not getattr(self._cfgs.algo_cfgs, 'no_intrinsic_in_ep_costs', False):
+        #
+        # Under cost_estimate_source: 'critic' the addition is skipped unconditionally, regardless
+        # of no_intrinsic_in_ep_costs: Value/cost is the plain cost critic's own prediction, and
+        # the intrinsic/novelty bias was never part of what it was trained to predict (it lives in
+        # deltas_n/target_value_c under a completely separate flag, no_intrinsic_in_deltas, which
+        # this does not touch) -- adding it here would inflate the critic-based estimate by a term
+        # the critic itself knows nothing about, the exact thing this switch exists to stop doing.
+        if cost_estimate_source != 'critic' and not getattr(
+            self._cfgs.algo_cfgs, 'no_intrinsic_in_ep_costs', False,
+        ):
             self.ep_costs += ep_discount_ci
 
 
