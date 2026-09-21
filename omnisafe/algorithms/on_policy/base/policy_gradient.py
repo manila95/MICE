@@ -1144,7 +1144,7 @@ class PolicyGradient(BaseAlgo):
         # consistent with eval_data_bundle's filename.
         if is_eval_epoch:
             eval_data_path = save_eval_data(self._logger.log_dir, epoch, eval_data_bundle)
-            log_eval_data_to_wandb(eval_data_path, epoch)
+            log_eval_data_to_wandb(eval_data_path)
             scatter_series = []
             if 'mc_study' in eval_data_bundle:
                 scatter_series.append(('s0', eval_data_bundle['mc_study']['raw']))
@@ -1166,26 +1166,16 @@ class PolicyGradient(BaseAlgo):
             # already the lightweight snapshot this needs -- actor, both critics and the
             # observation normalizer, but no optimizer state -- so this reuses that exact file
             # rather than writing a second, redundant copy. Naming/cadence mirrors eval_data_path
-            # exactly (same epoch, same is_eval_epoch gate) so the two artifacts are always
-            # available as a pair.
+            # exactly (same epoch, same is_eval_epoch gate) so the two files are always available
+            # as a pair in the run's Files tab.
             #
-            # The artifact is still called "actor-snapshot" for continuity with runs logged before
-            # the critics were added; it has held them since, and the description below says so.
+            # Still prefixed "actor-snapshot" for continuity with runs logged before the critics
+            # were added; it has held them since ('pi', 'reward_critic', 'cost_critic' and, when
+            # obs_normalize, 'obs_normalizer' -- the PRE-update critic, since the snapshot is taken
+            # before _update() runs, so it is exactly the critic this epoch's evaluation scores).
             checkpoint_path = os.path.join(self._logger.log_dir, 'torch_save', f'epoch-{epoch}.pt')
             if os.path.exists(checkpoint_path):
-                log_eval_data_to_wandb(
-                    checkpoint_path, epoch,
-                    name_prefix='actor-snapshot', artifact_type='actor_snapshot',
-                    description=(
-                        f'Agent state dicts at epoch {epoch}, keyed by _what_to_save: '
-                        f"'pi', 'reward_critic', 'cost_critic' and (when obs_normalize) "
-                        f"'obs_normalizer'. This is the PRE-update critic -- the snapshot is "
-                        f'taken before _update() runs, so it is exactly the critic an epoch-'
-                        f'{epoch} evaluation scores. Enough on its own to re-run the value '
-                        f'studies offline, and pairs with this epoch\'s eval-data artifact to '
-                        f'recompute compute_gradient_alignment.'
-                    ),
-                )
+                log_eval_data_to_wandb(checkpoint_path, name_prefix='actor-snapshot')
 
     def _persist_scatter_raw_data(self, epoch: int) -> None:
         """Persist + push the raw arrays behind every ``log_scatter_image`` call this epoch made.
@@ -1203,11 +1193,7 @@ class PolicyGradient(BaseAlgo):
             scatter_data_path = save_eval_data(
                 self._logger.log_dir, epoch, scatter_raw, subdir='scatter_data',
             )
-            log_eval_data_to_wandb(
-                scatter_data_path, epoch,
-                name_prefix='scatter-data', artifact_type='scatter_data',
-                description=f'Raw x/y/c arrays behind every log_scatter_image plot, epoch {epoch}.',
-            )
+            log_eval_data_to_wandb(scatter_data_path, name_prefix='scatter-data')
 
     def _get_cost_estimate(self) -> float:
         r"""Estimate :math:`J_C(\pi)` for whatever Lagrange-multiplier/case-selection update reads it.

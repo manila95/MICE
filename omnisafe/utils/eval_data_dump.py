@@ -131,44 +131,40 @@ def log_scatter_to_wandb(png_path: str | None, epoch: int) -> None:
     wandb.log({'eval_data/scatter': wandb.Image(png_path)}, step=epoch)
 
 
-def log_eval_data_to_wandb(
-    pkl_path: str,
-    epoch: int,
-    name_prefix: str = 'eval-data',
-    artifact_type: str = 'eval_data',
-    description: str | None = None,
-) -> None:
-    """Sync a per-epoch data pickle (see :func:`save_eval_data`) to the active wandb run, so the
-    raw arrays are downloadable from the run page without SSH access to whatever machine produced
-    them -- previously only the aggregate stats (via ``Logger.store``/``dump_tabular``) and quick-
-    look images (:func:`log_scatter_to_wandb`, ``Logger.log_scatter_image``) ever left local disk;
-    the raw pickle itself was local-only.
+def log_eval_data_to_wandb(pkl_path: str, name_prefix: str = 'eval-data') -> None:
+    """Sync a data pickle (see :func:`save_eval_data`) to the active wandb run, so the raw arrays
+    are downloadable from the run page without SSH access to whatever machine produced them --
+    previously only the aggregate stats (via ``Logger.store``/``dump_tabular``) and quick-look
+    images (:func:`log_scatter_to_wandb`, ``Logger.log_scatter_image``) ever left local disk; the
+    raw pickle itself was local-only.
 
-    Uses a per-epoch :class:`wandb.Artifact` (one version per epoch) rather than ``wandb.save`` --
-    an Artifact gets its own content-addressed version history and survives independently of the
-    run's live file sync, so a pickle from epoch 100 stays fetchable (``wandb.Api().artifact(...)``)
-    even long after the run itself has finished or if the plain run-files view gets pruned. The
-    per-epoch granularity mirrors ``save_eval_data``'s own filename scheme (``epoch_{epoch:05d}.pkl``)
-    precisely so a downloaded artifact identifies itself the same way the local copy does.
+    Pushed as a plain run file (``wandb.save``), not a :class:`wandb.Artifact`. Artifacts are
+    content-addressed and named per *project*, not per run: two runs whose epoch-N pickle happens
+    to hash identically (very plausible at low epoch numbers, before training has diverged
+    anything) collide on the same artifact name and silently share one version between them,
+    logged as "already exists, no new version created" -- confusing when browsing a specific run's
+    data. A plain file is scoped to the run it was saved from, so no such collision is possible;
+    the cost is that the file's lifecycle is tied to the run's own file storage rather than
+    surviving independently of it.
+
+    The destination filename is prefixed and copied into ``wandb.run.dir`` (rather than passing
+    the original path straight to ``wandb.save``, which requires the file to already live under
+    ``run.dir`` to be picked up) so multiple data streams sharing this same upload path (e.g.
+    ``'scatter-data'`` for the ``Logger.pop_scatter_raw_data`` bundle, ``'actor-snapshot'`` for
+    checkpoints) don't collide with each other inside one run's Files tab. No separate epoch
+    argument is needed -- ``save_eval_data``'s own ``epoch_{epoch:05d}.pkl`` filename scheme
+    already carries it, and it survives into the destination name via ``os.path.basename``.
 
     Args:
         pkl_path: Path returned by :func:`save_eval_data`.
-        epoch: Current epoch -- used for both the artifact's name suffix and the wandb step, so
-            this lands on the same x-axis position as that epoch's numeric eval metrics.
-        name_prefix: Artifact name becomes ``f'{name_prefix}-epoch-{epoch:05d}'`` -- override to
-            distinguish multiple data streams (e.g. ``'scatter-data'`` for the
-            ``Logger.pop_scatter_raw_data`` bundle) sharing this same upload path.
-        artifact_type: wandb Artifact ``type``, distinct per data stream for the same reason.
-        description: Optional artifact description; a generic one is used if omitted.
+        name_prefix: Destination filename becomes ``f'{name_prefix}-{os.path.basename(pkl_path)}'``.
     """
-    import wandb  # noqa: PLC0415 -- see save_scatter_grid's matplotlib import for why this is local
+    import shutil  # noqa: PLC0415 -- see save_scatter_grid's matplotlib import for why this is local
+
+    import wandb  # noqa: PLC0415
 
     if wandb.run is None:
         return
-    artifact = wandb.Artifact(
-        name=f'{name_prefix}-epoch-{epoch:05d}',
-        type=artifact_type,
-        description=description or f'Raw per-probe arrays + aggregate stats, epoch {epoch}.',
-    )
-    artifact.add_file(pkl_path, name=os.path.basename(pkl_path))
-    wandb.log_artifact(artifact)
+    dest_path = os.path.join(wandb.run.dir, f'{name_prefix}-{os.path.basename(pkl_path)}')
+    shutil.copy(pkl_path, dest_path)
+    wandb.save(dest_path, base_path=wandb.run.dir, policy='now')
