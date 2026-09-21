@@ -16,12 +16,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
 import random
 import sys
-from typing import Any
+from typing import Any, Generator
 
 import numpy as np
 import torch
@@ -195,6 +196,48 @@ def seed_all(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+@contextlib.contextmanager
+def isolated_rng() -> Generator[None, None, None]:
+    r"""Save ``random``/``np.random``/``torch`` (+ CUDA) RNG state on entry, restore it on exit.
+
+    Swapping *which environment* an evaluation pass steps (a dedicated, decoupled env instead of
+    the live training one) stops it from corrupting persistent *parameters* like an
+    ``ObsNormalize`` running mean/std -- but it does nothing about the *global* RNG streams:
+    stochastic action sampling reads the same actor network training itself samples from, via the
+    same global ``torch`` generator, and however many actions an eval pass happens to sample
+    (which depends directly on knobs like ``value_eval_episodes`` / ``mc_value_study_probes``)
+    shifts that shared stream by a different amount each time. Left unguarded, training's own
+    subsequent randomness -- and therefore its results -- silently depends on evaluation
+    configuration, exactly as if evaluation were still touching the training env directly.
+    Measured directly: with only the env swapped and this guard absent, two otherwise-identical
+    CPO runs differing only in ``value_eval_episodes`` (3 vs. 40) still diverged from the first
+    post-eval epoch onward (e.g. ``Value/reward`` -0.144 vs. -0.011 by epoch 2).
+
+    Restoring the global generator state afterward makes whatever run happens inside the block
+    -- however much or little randomness it consumes -- leave no trace on the stream the caller
+    continues from, so training proceeds exactly as if the block had not executed at all.
+
+    Note:
+        This only isolates the RNG *streams*; it does not undo other side effects (e.g. a
+        dedicated eval env's own internal state, which is fine to leave since it is never read by
+        training) and is not itself a substitute for using a decoupled env in the first place --
+        an ``ObsNormalize`` running mean/std is training-readable *parameter* state, not RNG
+        state, and no RNG save/restore touches it.
+    """
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    torch_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        yield
+    finally:
+        random.setstate(py_state)
+        np.random.set_state(np_state)
+        torch.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
 
 
 def custom_cfgs_to_dict(key_list: str, value: Any) -> dict[str, Any]:
