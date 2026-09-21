@@ -48,7 +48,7 @@ from omnisafe.utils.state_snapshot import (
     collect_on_policy_snapshots,
     enable_state_snapshots,
 )
-from omnisafe.utils.tools import decayed_constant
+from omnisafe.utils.tools import decayed_constant, isolated_rng
 from omnisafe.utils.value_eval import (
     estimate_true_value,
     compute_gradient_alignment,
@@ -973,6 +973,26 @@ class PolicyGradient(BaseAlgo):
         diagnostics, and finally persisting this epoch's raw eval data / scatter grid / model
         checkpoint. All gates are read from ``algo_cfgs`` via ``getattr(..., default)``, so an
         algorithm/config that doesn't set them simply skips that block, same as before.
+
+        The whole body runs inside :func:`~omnisafe.utils.tools.isolated_rng`. Using a dedicated,
+        decoupled env for each study (see the ``test_estimate`` block below) stops evaluation from
+        corrupting persistent parameters like an ``ObsNormalize`` running mean/std, but every study
+        still samples actions from the *same* actor training itself samples from, via the *same*
+        global ``torch`` RNG -- so without this, however many stochastic actions/env steps a study
+        happens to take (a direct function of knobs like ``value_eval_episodes`` /
+        ``mc_value_study_probes``) shifts the shared RNG stream training continues from by a
+        different amount each time, silently making training's own subsequent results depend on
+        evaluation configuration. Measured directly: with the env swap alone and this guard
+        absent, two otherwise-identical CPO runs differing only in ``value_eval_episodes`` (3 vs.
+        40) still diverged starting the epoch after their first eval (``Value/reward`` -0.144 vs.
+        -0.011 by epoch 2).
+        """
+        with isolated_rng():
+            self._run_eval_studies_impl(epoch)
+
+    def _run_eval_studies_impl(self, epoch: int) -> None:
+        """Body of :meth:`_run_eval_studies`, split out only so that method's ``isolated_rng``
+        wrapper does not require re-indenting this entire block.
         """
         is_eval_epoch = self._is_value_eval_epoch(epoch)
         eval_episodes = getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100)
@@ -983,6 +1003,20 @@ class PolicyGradient(BaseAlgo):
         # the save block after these three studies.
         eval_data_bundle: dict | None = {'epoch': epoch} if is_eval_epoch else None
         if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and is_eval_epoch:
+            # Deliberately NOT self._env._env (the live training env): stepping/resetting it here
+            # would fold these eval-only observations into its ObsNormalize running stats
+            # (update_stats=True there -- it's the one training actually reads from) and consume
+            # its procedural-generation RNG, silently making training's own results depend on
+            # whatever value_eval_episodes happens to be -- a real confound, not just an unused
+            # side effect, since it directly perturbs the normalization statistics the policy and
+            # critics are trained against. _get_mc_value_study_env() is the dedicated, decoupled
+            # env already built for exactly this (ObsNormalize update_stats=False); it needs an
+            # explicit normalizer sync first since, unlike estimate_true_value_same_state_mc below,
+            # this call has no sync_normalizer_from of its own. Building it here (rather than only
+            # inside the eval_critic-gated block) also makes it available when test_estimate is on
+            # but eval_critic is off, since the two are independent flags.
+            test_estimate_env = self._get_mc_value_study_env()
+            sync_obs_normalizer(test_estimate_env, self._env._env)
             (
                 s0_c_error, s0_true_c_m, s0_est_c_m, s0_corr_c,
                 s0_r_error, s0_true_r_m, s0_est_r_m, s0_corr_r,
@@ -990,7 +1024,7 @@ class PolicyGradient(BaseAlgo):
                 all_r_error, all_true_r_m, all_est_r_m, all_corr_r,
             ) = estimate_true_value(
                 agent=self._actor_critic,
-                env=self._env._env,
+                env=test_estimate_env,
                 cfgs=self._cfgs,
                 discount_r=self._cfgs.algo_cfgs.gamma,
                 discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma),

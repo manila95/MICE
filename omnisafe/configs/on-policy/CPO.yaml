@@ -153,6 +153,13 @@ defaults:
     # new way) was useful for validating the new studies against the old baseline; now that
     # that's done, this just triples eval-epoch cost (Eval_s0/Eval_all's own eval_episodes
     # rollouts, on top of the MC studies') for numbers the MC studies already supersede.
+    # Runs on the same dedicated, decoupled env as mc_value_study (mc_value_study_vector_envs
+    # controls its vectorization width too) rather than the live training env, specifically so
+    # that turning this on/off, or changing value_eval_episodes, cannot perturb training's own
+    # results -- the training env's ObsNormalize has update_stats=True (it's what training reads
+    # from), so stepping it here would have folded eval-only observations into that running
+    # mean/std and shifted its procedural-generation RNG, a real confound rather than a
+    # theoretical one. See PolicyGradient._run_eval_studies's test_estimate block.
     test_estimate: False
     # number of full episodes rolled out per calibration eval (see test_estimate above)
     value_eval_episodes: 100
