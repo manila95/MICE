@@ -89,7 +89,9 @@ class PCPO(CPO):
         distributed.avg_grads(self._actor_critic.actor)
 
         b_grads = get_flat_gradients_from(self._actor_critic.actor)
-        ep_costs = self._logger.get_stats('Metrics/EpCost')[0] - self._cfgs.algo_cfgs.cost_limit
+        # See PolicyGradient._get_cost_estimate for what algo_cfgs.cost_estimate_source picks
+        # between ('episode' = Metrics/EpCost, the default; 'critic' = Value/cost).
+        ep_costs = self._get_cost_estimate() - self._cfgs.algo_cfgs.cost_limit
 
         self._logger.log(f'c = {ep_costs}')
         self._logger.log(f'b^T b = {b_grads.dot(b_grads).item()}')

@@ -78,7 +78,9 @@ class P3O(PPO):
         logp_ = self._actor_critic.actor.log_prob(act)
         ratio = torch.exp(logp_ - logp)
         surr_cadv = (ratio * adv_c).mean()
-        Jc = self._logger.get_stats('Metrics/EpCost')[0] - self._cfgs.algo_cfgs.cost_limit
+        # See PolicyGradient._get_cost_estimate for what algo_cfgs.cost_estimate_source picks
+        # between ('episode' = Metrics/EpCost, the default; 'critic' = Value/cost).
+        Jc = self._get_cost_estimate() - self._cfgs.algo_cfgs.cost_limit
         loss_cost = self._cfgs.algo_cfgs.kappa * F.relu(surr_cadv + Jc)
         self._logger.store({'Loss/Loss_pi_cost': loss_cost.mean().item()})
         return loss_cost.mean()

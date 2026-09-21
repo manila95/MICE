@@ -410,19 +410,10 @@ class CPO(TRPO):
         distributed.avg_grads(self._actor_critic.actor)
 
         b_grads = get_flat_gradients_from(self._actor_critic.actor)
-        # algo_cfgs.cost_estimate_source picks what estimates J_C(pi) for the optim-case decision
-        # below: 'episode' (default) is Metrics/EpCost, the undiscounted MC sum over this epoch's
-        # *completed* episodes -- unbiased once an episode finishes, but NaN or high-variance
-        # whenever few/none do (short epochs relative to episode length). 'critic' reads Value/cost
-        # instead, the cost critic's mean prediction over every state visited this epoch -- always
-        # available and much lower-variance, at the cost of whatever bias the critic itself carries
-        # (worst early in training) and of being E_{s~d^pi}[V_c(s)] rather than the episode-start
-        # J_C(pi) the constraint is actually about.
+        # See PolicyGradient._get_cost_estimate for what algo_cfgs.cost_estimate_source picks
+        # between here.
         cost_estimate_source = getattr(self._cfgs.algo_cfgs, 'cost_estimate_source', 'episode')
-        if cost_estimate_source == 'critic':
-            ep_costs = self._logger.get_stats('Value/cost')[0] - self._cfgs.algo_cfgs.cost_limit
-        else:
-            ep_costs = self._logger.get_stats('Metrics/EpCost')[0] - self._cfgs.algo_cfgs.cost_limit
+        ep_costs = self._get_cost_estimate() - self._cfgs.algo_cfgs.cost_limit
 
         # Constant cost bias (algo_cfgs.cost_bias / cost_bias_decay_type -- see
         # PolicyGradient.learn()'s cost-bias block for where/how it's decayed and handed to the

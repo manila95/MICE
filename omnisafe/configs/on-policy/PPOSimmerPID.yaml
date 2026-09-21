@@ -81,6 +81,12 @@ defaults:
     penalty_coef: 0.0
     # use cost
     use_cost: False
+    # What estimates J_C(pi) for the Simmer budget controller (Jc in _update, fed to
+    # env.control_budget). 'critic' is NOT usable while use_cost is False above -- Value/cost is
+    # only registered when a cost critic is trained, and Simmer has none (safety comes from the
+    # budget-controlled reward shaping instead); _get_cost_estimate raises rather than reading a
+    # never-registered key. See algo_cfgs.cost_estimate_source in CPO.yaml for the full rationale.
+    cost_estimate_source: episode
     # The safety budget, equal to the cost limit
     safety_budget: 25.0
     # the upper bound of safety budget

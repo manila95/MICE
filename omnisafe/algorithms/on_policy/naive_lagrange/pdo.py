@@ -69,7 +69,9 @@ class PDO(PolicyGradient):
             where :math:`\lambda` is the Lagrange multiplier parameter.
         """
         # note that logger already uses MPI statistics across all processes..
-        Jc = self._logger.get_stats('Metrics/EpCost')[0]
+        # See PolicyGradient._get_cost_estimate for what algo_cfgs.cost_estimate_source picks
+        # between ('episode' = Metrics/EpCost, the default; 'critic' = Value/cost).
+        Jc = self._get_cost_estimate()
         # first update Lagrange multiplier parameter
         self._lagrange.update_lagrange_multiplier(Jc)
         # then update the policy and value function

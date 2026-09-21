@@ -79,6 +79,10 @@ defaults:
     penalty_coef: 0.0
     # use cost
     use_cost: True
+    # What estimates J_C(pi) for the Lagrange multiplier update (Jc in _update). See
+    # algo_cfgs.cost_estimate_source in CPO.yaml for the full rationale ('episode' =
+    # Metrics/EpCost, the default; 'critic' = Value/cost).
+    cost_estimate_source: episode
     # Damping value for conjugate gradient
     cg_damping: 0.1
     # Number of conjugate gradient iterations

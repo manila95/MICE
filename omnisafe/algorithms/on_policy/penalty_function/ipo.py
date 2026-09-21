@@ -64,7 +64,9 @@ class IPO(PPO):
         Returns:
             The advantage function combined with reward and cost.
         """
-        Jc = self._logger.get_stats('Metrics/EpCost')[0]
+        # See PolicyGradient._get_cost_estimate for what algo_cfgs.cost_estimate_source picks
+        # between ('episode' = Metrics/EpCost, the default; 'critic' = Value/cost).
+        Jc = self._get_cost_estimate()
         penalty = self._cfgs.algo_cfgs.kappa / (self._cfgs.algo_cfgs.cost_limit - Jc + 1e-8)
         if penalty < 0 or penalty > self._cfgs.algo_cfgs.penalty_max:
             penalty = self._cfgs.algo_cfgs.penalty_max

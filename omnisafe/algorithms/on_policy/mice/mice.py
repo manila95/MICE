@@ -298,15 +298,10 @@ class MICE(CPO):
         distributed.avg_grads(self._actor_critic.actor)
 
         b_grads = get_flat_gradients_from(self._actor_critic.actor)
-        # algo_cfgs.cost_estimate_source: see CPO's cpo.py._update_actor for the full rationale
-        # ('episode' = Metrics/EpCost, the undiscounted MC sum over this epoch's completed
-        # episodes; 'critic' = Value/cost, the cost critic's mean prediction over every visited
-        # state, available and low-variance even when no episode has finished this epoch).
+        # See PolicyGradient._get_cost_estimate for what algo_cfgs.cost_estimate_source picks
+        # between here.
         cost_estimate_source = getattr(self._cfgs.algo_cfgs, 'cost_estimate_source', 'episode')
-        if cost_estimate_source == 'critic':
-            self.ep_costs = self._logger.get_stats('Value/cost')[0] - self._cfgs.algo_cfgs.cost_limit
-        else:
-            self.ep_costs = self._logger.get_stats('Metrics/EpCost')[0] - self._cfgs.algo_cfgs.cost_limit
+        self.ep_costs = self._get_cost_estimate() - self._cfgs.algo_cfgs.cost_limit
 
         ep_discount_ci = balancing_ep_dicount_ci.mean().item()
 

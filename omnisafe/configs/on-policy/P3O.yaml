@@ -73,6 +73,10 @@ defaults:
     clip: 0.2
     # cost limit
     cost_limit: 25.0
+    # What estimates J_C(pi) for the penalty-loss computation (Jc in _update_actor). See
+    # algo_cfgs.cost_estimate_source in CPO.yaml for the full rationale ('episode' =
+    # Metrics/EpCost, the default; 'critic' = Value/cost).
+    cost_estimate_source: episode
     # advantage estimation method, options: gae, retrace
     adv_estimation_method: gae
     cost_adv_estimation_method: ~

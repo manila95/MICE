@@ -82,6 +82,10 @@ defaults:
     penalty_coef: 0.0
     # use cost
     use_cost: True
+    # What estimates J_C(pi) for the PID-Lagrange multiplier update (inherited from TRPOPID's
+    # Jc in _update). See algo_cfgs.cost_estimate_source in CPO.yaml for the full rationale
+    # ('episode' = Metrics/EpCost, the default; 'critic' = Value/cost).
+    cost_estimate_source: episode
     # use REINFORCE (raw MC return, no value baseline) for reward advantage
     reinforce_reward: True
     # use REINFORCE (raw MC return, no value baseline) for cost advantage

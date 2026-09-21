@@ -1209,6 +1209,49 @@ class PolicyGradient(BaseAlgo):
                 description=f'Raw x/y/c arrays behind every log_scatter_image plot, epoch {epoch}.',
             )
 
+    def _get_cost_estimate(self) -> float:
+        r"""Estimate :math:`J_C(\pi)` for whatever Lagrange-multiplier/case-selection update reads it.
+
+        Shared by every constrained on-policy algorithm's own cost-signal line (CPO's/PCPO's/
+        MICE's ``ep_costs``, and the plain ``Jc = ...`` read at the top of every Lagrangian/
+        penalty-function ``_update``) so ``algo_cfgs.cost_estimate_source`` is one switch, defined
+        once, rather than the same branch duplicated in a dozen files:
+
+        * ``'episode'`` (default): ``Metrics/EpCost``, the undiscounted MC sum over this epoch's
+          *completed* episodes. Unbiased once episodes finish, but ``NaN`` (or built from very few
+          episodes, hence noisy) whenever ``steps_per_epoch`` is short relative to episode length
+          -- observed directly on ``SafetyPointGoal1-v0`` at a 3-epoch/500-step budget, where it
+          stayed ``NaN`` throughout.
+        * ``'critic'``: ``Value/cost``, the cost critic's mean prediction over every state visited
+          this epoch (stored every rollout step regardless of whether any episode has finished).
+          Always available and much lower-variance, at the cost of whatever bias the critic itself
+          carries -- worst early in training -- and of estimating :math:`E_{s \sim d^\pi}[V_C(s)]`
+          rather than the episode-start :math:`J_C(\pi)` the constraint is actually about.
+
+        Callers that also apply an additive bias meant for the episode MC estimate (CPO's
+        ``use_cost_bias``, MICE's ``ep_discount_ci``) must gate that addition to ``'episode'``
+        themselves -- neither bias was ever part of what the cost critic was trained to predict, so
+        adding it to a ``'critic'``-sourced estimate would inflate it by a term the critic knows
+        nothing about. This method only picks the estimate; it does not know about those biases.
+
+        Raises:
+            ValueError: if ``cost_estimate_source`` is ``'critic'`` while ``algo_cfgs.use_cost`` is
+                ``False`` (e.g. the Simmer algorithms) -- ``Value/cost`` is only registered/stored
+                when a cost critic is actually being trained, so this would otherwise fail as an
+                opaque "key not registered" assertion inside the logger instead of explaining why.
+
+        Returns:
+            The scalar cost estimate, unadjusted (no ``cost_limit`` subtracted).
+        """
+        if getattr(self._cfgs.algo_cfgs, 'cost_estimate_source', 'episode') == 'critic':
+            if not self._cfgs.algo_cfgs.use_cost:
+                raise ValueError(
+                    "algo_cfgs.cost_estimate_source='critic' requires algo_cfgs.use_cost=True -- "
+                    "Value/cost is only registered when a cost critic is trained.",
+                )
+            return self._logger.get_stats('Value/cost')[0]
+        return self._logger.get_stats('Metrics/EpCost')[0]
+
     def _update(self) -> None:
         """Update actor, critic.
 

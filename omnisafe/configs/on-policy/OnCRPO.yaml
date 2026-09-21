@@ -89,6 +89,10 @@ defaults:
     fvp_sample_freq: 1
     # the cost limit
     cost_limit: 25.0
+    # What estimates J_C(pi) for the reward-vs-cost update-branch decision (Jc in _update). See
+    # algo_cfgs.cost_estimate_source in CPO.yaml for the full rationale ('episode' =
+    # Metrics/EpCost, the default; 'critic' = Value/cost).
+    cost_estimate_source: episode
     # the tolerance of cost limit
     distance: 2.0
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)

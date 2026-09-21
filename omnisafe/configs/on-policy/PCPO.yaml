@@ -87,6 +87,10 @@ defaults:
     fvp_obs: None
     # Tolerance of constraint violation
     cost_limit: 25
+    # What estimates J_C(pi) for the trust-region optim-case decision (pcpo.py's _update_actor).
+    # See algo_cfgs.cost_estimate_source in CPO.yaml for the full rationale ('episode' =
+    # Metrics/EpCost, the default; 'critic' = Value/cost).
+    cost_estimate_source: episode
     # The sub-sampling rate of the observation
     fvp_sample_freq: 1
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)

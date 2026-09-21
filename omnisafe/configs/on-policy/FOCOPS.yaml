@@ -85,6 +85,10 @@ defaults:
     penalty_coef: 0.0
     # use cost
     use_cost: True
+    # What estimates J_C(pi) for the Lagrange multiplier update (Jc in _update). See
+    # algo_cfgs.cost_estimate_source in CPO.yaml for the full rationale ('episode' =
+    # Metrics/EpCost, the default; 'critic' = Value/cost).
+    cost_estimate_source: episode
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5
     # width of the early_eval_freq window: epochs below this use early_eval_freq, epochs at or
