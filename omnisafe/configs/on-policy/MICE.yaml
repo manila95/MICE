@@ -209,23 +209,27 @@ defaults:
     # however many other runs share the machine -- e.g. 20 (giving a clean 500/20=25 waves at the
     # defaults above) on a lightly-loaded 16+-core box.
     mc_value_study_vector_envs: 5
-    # Whether the MC "true" value may include a critic-bootstrapped tail. False (default): the
-    # value is the discounted sum of *simulated* reward/cost only, over the full episode. That
-    # keeps it a genuine sample of the return, with the return's own properties -- decisively,
-    # a cost value is then non-negative whenever the per-step cost is. With bootstrapping on, an
-    # untrained V_c predicts negative values and those land straight in the "ground truth": a
-    # measured 14.4% of per-rollout cost returns (and 84 of 1350 probe means) came out negative
-    # in the 40-repeat study, which is impossible for a non-negative cost signal.
-    mc_eval_bootstrap_tail: False
+    # Whether the MC "true" value may include a critic-bootstrapped tail. True (the default,
+    # paired with mc_eval_bootstrap_threshold below): once a probe's remaining discounted tail
+    # contribution is negligible, the rest of the episode is skipped and the critic's own
+    # prediction stands in for it, roughly halving eval wall-clock. The tradeoff is a real,
+    # measured bias, not a free lunch: an untrained V_c predicts negative values, and 14.4% of
+    # per-rollout cost returns (84 of 1350 probe means, in a 40-repeat study) came out negative
+    # with this on -- impossible for a non-negative cost signal, and no longer a genuine sample
+    # of the return. Set to False (with mc_eval_bootstrap_threshold: ~) for the exact,
+    # full-episode, unbiased measurement these studies exist to provide.
+    mc_eval_bootstrap_tail: True
     # Truncate mc_value_study/intermediate_state_study rollouts early once both streams'
     # discounted tail contribution drops below this fraction, bootstrapping the remainder with
     # the critic's own value there (see omnisafe.utils.value_eval._effective_rollout_horizon) --
-    # at gamma=0.99, 0.01 cuts a 1000-step rollout to ~460 steps. ONLY valid together with
+    # at gamma=0.99, 0.01 cuts a 1000-step rollout to ~460 steps, roughly halving eval
+    # wall-clock (measured: mc_value_study_repeats=10 + this threshold costs about the same as
+    # the old repeats=5/no-truncation baseline). ONLY valid together with
     # mc_eval_bootstrap_tail: True; truncating without bootstrapping would drop the tail rather
     # than estimate it, so the combination raises instead of silently biasing every value low.
-    # None (default) = full horizon, no approximation, and the exact quantity these studies mean
-    # to measure. Costs ~2.2x the eval wall-clock of the old 0.01 truncation.
-    mc_eval_bootstrap_threshold: ~
+    # Set to ~ (with mc_eval_bootstrap_tail: False) for the exact, full-horizon quantity these
+    # studies mean to measure, at ~2.2x this setting's eval wall-clock.
+    mc_eval_bootstrap_threshold: 0.01
     # On-policy intermediate-state value study (see omnisafe.utils.value_eval.
     # estimate_value_from_snapshots and omnisafe.utils.state_snapshot): the same same-state MC
     # trick mc_value_study uses for s0, but for states the CURRENT policy actually visits
