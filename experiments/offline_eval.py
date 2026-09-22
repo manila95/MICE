@@ -37,12 +37,31 @@ None`` and no-ops); the main process holds the single resumed wandb session and 
 worker's resulting local pickle serially once it's ready -- avoiding concurrent writers to one run
 entirely, not just avoiding a race we didn't want to think about.
 
+**Watch mode** (``--watch``) runs the discover-evaluate-push cycle in a loop instead of once, so
+evaluation happens *concurrently* with a still-running training process instead of only after the
+fact. Training's own checkpoint save is already unconditional on the eval-epoch schedule (see
+``PolicyGradient._init_log``'s ``what_to_save`` comment) regardless of ``algo_cfgs.eval_critic``,
+so a training run started with ``eval_critic: False`` never blocks on evaluation at all -- it just
+checkpoints and moves on -- while this process, running independently as its own OS process (no
+shared Python state whatsoever, a strictly stronger isolation than the in-process ``isolated_rng``
+guard training's own live evaluation needs), watches for each new checkpoint and evaluates it as it
+appears. The loop stops once the run reaches a terminal wandb state (finished/crashed/failed) and
+one more pass finds nothing new to do, so a checkpoint written right before training exits still
+gets picked up.
+
+To avoid this competing with training's own rollout collection for cores on the same machine, the
+default worker-count heuristic reserves ``train_cfgs.vector_env_nums`` (read from the run's own
+recorded config, so it matches whatever training is actually running) off the top of
+``cpu_count()`` before sizing eval workers, on top of the existing per-epoch peak-env-slots
+capping. Pass ``--workers`` to override this entirely (e.g. the watcher is on a different machine).
+
 Usage::
 
     python experiments/offline_eval.py liam-paull/omnisafe/6jvsugv6
     python experiments/offline_eval.py 6jvsugv6 --project omnisafe --entity liam-paull
     python experiments/offline_eval.py <run> --epochs 1,5 --force
     python experiments/offline_eval.py <run> --workers 4
+    python experiments/offline_eval.py <run> --watch --poll-interval 60
 """
 
 from __future__ import annotations
@@ -54,6 +73,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -64,6 +84,10 @@ import omnisafe
 from omnisafe.utils.eval_data_dump import log_eval_data_to_wandb
 from omnisafe.utils.tools import update_dict
 from omnisafe.utils.value_eval import _find_obs_normalizer
+
+
+#: wandb run states that mean training will never produce another checkpoint.
+TERMINAL_RUN_STATES = frozenset({'finished', 'crashed', 'failed', 'killed'})
 
 
 ACTOR_SNAPSHOT_RE = re.compile(r'^actor-snapshot-epoch-(\d+)\.pt$')
@@ -127,6 +151,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--cache-dir', default=None,
         help='local dir to download checkpoints/write scratch logs into; default: a temp dir.',
+    )
+    parser.add_argument(
+        '--watch', action='store_true',
+        help='run continuously, evaluating each new checkpoint as it appears, instead of once '
+        'against whatever the run has right now. Stops once the run finishes and one more pass '
+        'finds nothing new.',
+    )
+    parser.add_argument(
+        '--poll-interval', type=float, default=60.0,
+        help='seconds between checks for new checkpoints in --watch mode.',
     )
     return parser.parse_args()
 
@@ -216,16 +250,32 @@ def _evaluate_one_epoch(
         return epoch, None, traceback.format_exc()
 
 
-def main() -> None:
-    args = _parse_args()
+def _list_run_files(run) -> list:
+    """``list(run.files())``, tolerating wandb's own file-listing API against a run so fresh it
+    hasn't uploaded anything yet.
 
-    api = wandb.Api()
-    run_path = args.run if args.run.count('/') == 2 else f'{args.entity}/{args.project}/{args.run}'
-    run = api.run(run_path)
-    entity, project, run_id = run.entity, run.project, run.id
-    print(f'evaluating run: {entity}/{project}/{run_id} ({run.name})')
+    Reproduced directly in ``--watch`` mode: connecting within a few seconds of ``wandb.init()``
+    on the training side, before even its first file (``config.yaml``/``wandb-metadata.json``) has
+    landed, gets back a GraphQL response with a null ``files.pageInfo`` -- wandb's own paginator
+    (``wandb/apis/public/files.py``) doesn't guard that case and raises
+    ``TypeError: 'NoneType' object is not subscriptable`` instead of treating it as an empty page.
+    Since "no files yet" is exactly the state a watcher polling a just-started run needs to handle
+    as "nothing to evaluate yet, not an error," this is the one place that translates the crash.
+    """
+    try:
+        return list(run.files())
+    except TypeError:
+        return []
 
-    files = list(run.files())
+
+def _discover_target_epochs(run, args: argparse.Namespace) -> tuple[list[int], bool]:
+    """Which epochs to (re-)evaluate right now, given the run's *current* file listing.
+
+    Returns ``(target_epochs, had_any_checkpoint)`` -- the second value lets watch mode
+    distinguish "nothing new yet, keep polling" from "this run will never have anything to
+    evaluate," though both currently print the same way; kept separate in case that changes.
+    """
+    files = _list_run_files(run)
     ckpt_epochs = sorted(
         int(m.group(1)) for f in files if (m := ACTOR_SNAPSHOT_RE.match(f.name))
     )
@@ -233,9 +283,6 @@ def main() -> None:
         int(m.group(1)) for f in files
         if (m := EVAL_DATA_RE.match(f.name)) and f.size > STUB_SIZE_THRESHOLD
     }
-    if not ckpt_epochs:
-        print('no actor-snapshot-epoch-*.pt files on this run -- nothing to evaluate.')
-        return
 
     if args.epochs:
         requested = [int(e) for e in args.epochs.split(',')]
@@ -253,28 +300,40 @@ def main() -> None:
                   f'(pass --force to redo).')
         target_epochs = [e for e in target_epochs if e not in have_eval_data]
 
-    if not target_epochs:
-        print('nothing to do.')
-        return
-    print(f'will evaluate epochs: {target_epochs}')
+    return target_epochs, bool(ckpt_epochs)
 
-    cache_dir = args.cache_dir or tempfile.mkdtemp(prefix='offline_eval_')
-    os.makedirs(cache_dir, exist_ok=True)
 
-    cfg = dict(run.config)
-    algo, env_id, seed = cfg['algo'], cfg['env_id'], cfg['seed']
-    base_custom_cfgs = _build_base_custom_cfgs(cfg, args)
+def _compute_n_workers(
+    base_custom_cfgs: dict, cfg: dict, args: argparse.Namespace, n_targets: int,
+) -> int:
+    """Worker-count heuristic, optionally reserving cores for a still-running training process.
 
+    In ``--watch`` mode, ``train_cfgs.vector_env_nums`` (read from the run's own recorded config,
+    so it matches what training is actually running -- not guessed) is reserved off the top of
+    ``cpu_count()`` before sizing eval workers, so evaluating concurrently with training doesn't
+    compete with its own rollout collection for cores. Batch mode (no ``--watch``) skips this --
+    nothing else is running concurrently with it, so the full core count is fair game.
+    """
     if args.workers is not None:
-        n_workers = max(1, args.workers)
-    else:
-        peak_slots = _peak_env_slots(base_custom_cfgs)
-        n_workers = max(1, (os.cpu_count() or 1) // peak_slots)
-    n_workers = min(n_workers, len(target_epochs))
-    print(f'running {len(target_epochs)} epoch(s) with {n_workers} concurrent worker(s) '
-          f'(peak env-slots/epoch: {_peak_env_slots(base_custom_cfgs)}, '
-          f'cpu_count: {os.cpu_count()})')
+        return max(1, min(args.workers, n_targets))
+    peak_slots = _peak_env_slots(base_custom_cfgs)
+    available = os.cpu_count() or 1
+    if args.watch:
+        reserved = int(cfg.get('train_cfgs', {}).get('vector_env_nums', 0) or 0)
+        available = max(1, available - reserved)
+    return max(1, min(available // peak_slots, n_targets))
 
+
+def _evaluate_and_push(
+    run, target_epochs: list[int], algo: str, env_id: str, seed: int,
+    base_custom_cfgs: dict, cache_dir: str, n_workers: int,
+) -> list[tuple[int, str]]:
+    """One discover-download-evaluate-push pass over ``target_epochs``. Assumes a wandb session
+    is already active (``wandb.init`` called by the caller) -- every worker's own
+    ``log_eval_data_to_wandb`` call pushes into that session, never its own.
+
+    Returns the ``(epoch, error)`` pairs for any epoch whose evaluation raised, if any.
+    """
     # Download every checkpoint up front, serially, in the main process -- simple, avoids any
     # concern about concurrent wandb API reads, and is a small fraction of total time next to the
     # eval studies themselves.
@@ -290,10 +349,6 @@ def main() -> None:
         )
         payloads.append((epoch, algo, env_id, seed, epoch_custom_cfgs, ckpt_path))
 
-    # Attach to the ORIGINAL run for the rest of the process -- the only wandb session active
-    # anywhere in this script, main process included; no worker ever calls wandb.init.
-    wandb.init(entity=entity, project=project, id=run_id, resume='must')
-
     failures: list[tuple[int, str]] = []
     ctx = mp.get_context('fork')
     with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
@@ -307,11 +362,82 @@ def main() -> None:
                 continue
             print(f'-- epoch {epoch}: eval studies done, pushing eval-data-epoch_{epoch:05d}.pkl --')
             log_eval_data_to_wandb(pkl_path)
-            print(f'-- epoch {epoch}: pushed to {run_id} --')
+            print(f'-- epoch {epoch}: pushed to {run.id} --')
+    return failures
 
-    wandb.finish()
-    if failures:
-        print(f'done, with {len(failures)} failure(s): {[e for e, _ in failures]}')
+
+def main() -> None:
+    args = _parse_args()
+
+    api = wandb.Api()
+    run_path = args.run if args.run.count('/') == 2 else f'{args.entity}/{args.project}/{args.run}'
+    run = api.run(run_path)
+    entity, project, run_id = run.entity, run.project, run.id
+    print(f'evaluating run: {entity}/{project}/{run_id} ({run.name})'
+          + (' [watch mode]' if args.watch else ''))
+
+    # Same race as _list_run_files, one field over: connecting within the first moment of
+    # wandb.init() can catch the run before its config has synced from the training process,
+    # so cfg comes back {} rather than raising -- retry briefly rather than KeyError on 'algo'.
+    cfg = dict(run.config)
+    for _ in range(10):
+        if 'algo' in cfg:
+            break
+        time.sleep(1.0)
+        run = api.run(run_path)
+        cfg = dict(run.config)
+    algo, env_id, seed = cfg['algo'], cfg['env_id'], cfg['seed']
+    base_custom_cfgs = _build_base_custom_cfgs(cfg, args)
+    cache_dir = args.cache_dir or tempfile.mkdtemp(prefix='offline_eval_')
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Deliberately NOT held open across the whole --watch loop: a resumed wandb session is an
+    # attached client that sends its own heartbeats, so if held continuously it makes run.state
+    # read 'running' and run.heartbeatAt stay fresh *because of the watcher's own presence* --
+    # indistinguishable from training itself still being alive. Measured directly: a held-open
+    # session kept a finished training run reading 'running' 10+ minutes after its process had
+    # already exited, since the watcher's own connection was the only thing still heartbeating.
+    # Attaching only for the few seconds it takes to push means the run's state between polls
+    # reflects training's own connection (or lack of one), not ours.
+    all_failures: list[tuple[int, str]] = []
+    while True:
+        target_epochs, _ = _discover_target_epochs(run, args)
+        if target_epochs:
+            n_workers = _compute_n_workers(base_custom_cfgs, cfg, args, len(target_epochs))
+            print(f'will evaluate epochs: {target_epochs} '
+                  f'({n_workers} concurrent worker(s), '
+                  f'peak env-slots/epoch: {_peak_env_slots(base_custom_cfgs)}, '
+                  f'cpu_count: {os.cpu_count()})')
+            wandb.init(entity=entity, project=project, id=run_id, resume='must')
+            try:
+                all_failures.extend(_evaluate_and_push(
+                    run, target_epochs, algo, env_id, seed, base_custom_cfgs, cache_dir, n_workers,
+                ))
+            finally:
+                wandb.finish()
+        elif not args.watch:
+            print('nothing to do.')
+
+        if not args.watch:
+            break
+
+        # Re-fetch (not just re-read the cached object) so .state and .files() reflect what's
+        # actually happened on the run since the last pass -- and, per the note above, is only
+        # meaningful because no wandb session of ours is attached at this point.
+        run = api.run(run_path)
+        if run.state in TERMINAL_RUN_STATES and not target_epochs:
+            print(f'run is {run.state} and nothing new to evaluate -- stopping watch.')
+            break
+        # Always sleep the same interval here, even when the run just went terminal with work
+        # still pending this pass: the file we just pushed needs a moment to be visible to a
+        # fresh run.files() call, and one more pass follows either way (the loop-top discovery +
+        # the terminal-and-empty check above) -- looping immediately here would risk hammering
+        # the wandb API in a tight loop if that visibility lags.
+        print(f'sleeping {args.poll_interval}s before next check...')
+        time.sleep(args.poll_interval)
+
+    if all_failures:
+        print(f'done, with {len(all_failures)} failure(s): {[e for e, _ in all_failures]}')
         sys.exit(1)
     print('done.')
 
