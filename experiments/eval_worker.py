@@ -113,7 +113,7 @@ def evaluate_epoch(run_dir: str, epoch: int, cfgs, envs: dict) -> dict:
                 mc_repeats=int(getattr(a, 'mc_value_study_repeats', 10)),
                 epoch=epoch, max_episode_steps=max_eps, return_raw=True,
                 bootstrap_threshold=getattr(a, 'mc_eval_bootstrap_threshold', None),
-                bootstrap_tail=getattr(a, 'mc_eval_bootstrap_tail', False),
+                tail_mode=getattr(a, 'mc_eval_tail', None),
             )
             flat.update(stats)
             bundle['mc_study'] = {'stats': stats, 'raw': raw}
@@ -136,7 +136,7 @@ def evaluate_epoch(run_dir: str, epoch: int, cfgs, envs: dict) -> dict:
                     snapshots=collected[pos], horizon=max_eps, mc_repeats=repeats,
                     epoch=epoch, return_raw=True,
                     bootstrap_threshold=getattr(a, 'mc_eval_bootstrap_threshold', None),
-                    bootstrap_tail=getattr(a, 'mc_eval_bootstrap_tail', False),
+                    tail_mode=getattr(a, 'mc_eval_tail', None),
                 )
                 # Same key shape the in-process path logs, so eval_progress.csv columns line up
                 # with progress.csv's rather than needing a translation table.

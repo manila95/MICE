@@ -47,7 +47,7 @@ EVAL_KEYS = (
     'mc_value_study_seed_offset',
     'mc_value_study_vector_envs',
     'mc_eval_bootstrap_threshold',
-    'mc_eval_bootstrap_tail',
+    'mc_eval_tail',
     'intermediate_state_study',
     'intermediate_state_study_positions',
     'intermediate_state_study_probes',
