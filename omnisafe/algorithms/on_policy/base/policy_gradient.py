@@ -422,6 +422,10 @@ class PolicyGradient(BaseAlgo):
             device=self._device,
             cost_gamma=getattr(self._cfgs.algo_cfgs, 'cost_gamma', None),
             cost_advantage_estimator=getattr(self._cfgs.algo_cfgs, 'cost_adv_estimation_method', None),
+            value_target_method=getattr(self._cfgs.algo_cfgs, 'value_target_method', None),
+            cost_value_target_method=getattr(
+                self._cfgs.algo_cfgs, 'cost_value_target_method', None,
+            ),
             sr_dim=self._cfgs.model_cfgs.sr_cfgs.sr_dim if self._sr_td_ridge else None,
             lam_sr=self._cfgs.model_cfgs.sr_cfgs.get('lam_sr', 0.95) if self._sr_td_ridge else 0.95,
             gamma_sr=self._cfgs.model_cfgs.sr_cfgs.get('gamma_sr', None) if self._sr_td_ridge else None,

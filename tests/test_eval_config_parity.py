@@ -36,6 +36,8 @@ EVAL_KEYS = (
     'test_estimate',
     'value_eval_episodes',
     'early_eval_freq',
+    'value_target_method',
+    'cost_value_target_method',
     'early_eval_epochs',
     'value_eval_freq',
     'eval_critic',

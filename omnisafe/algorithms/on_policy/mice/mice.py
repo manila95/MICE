@@ -60,6 +60,10 @@ class MICE(CPO):
             no_intrinsic_in_deltas=self._cfgs.algo_cfgs.no_intrinsic_in_deltas,
             cost_gamma=getattr(self._cfgs.algo_cfgs, 'cost_gamma', None),
             cost_advantage_estimator=getattr(self._cfgs.algo_cfgs, 'cost_adv_estimation_method', None),
+            value_target_method=getattr(self._cfgs.algo_cfgs, 'value_target_method', None),
+            cost_value_target_method=getattr(
+                self._cfgs.algo_cfgs, 'cost_value_target_method', None,
+            ),
             constant_cost_source=getattr(self._cfgs.algo_cfgs, 'constant_cost_source', 'fixed'),
             cost_limit=self._cfgs.algo_cfgs.cost_limit,
         )

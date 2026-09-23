@@ -21,7 +21,12 @@ import torch
 from omnisafe.common.buffer.base import BaseBuffer
 from omnisafe.typing import DEVICE_CPU, AdvatageEstimator, OmnisafeSpace
 from omnisafe.utils import distributed
-from omnisafe.utils.gae import calculate_adv_and_value_targets
+from omnisafe.utils.gae import (
+    ADV_TARGET_PRESETS,
+    ADVANTAGE_METHODS,
+    calculate_adv_and_value_targets,
+    resolve_adv_and_target,
+)
 from omnisafe.utils.math import discount_cumsum
 
 
@@ -104,6 +109,8 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         device: torch.device = DEVICE_CPU,
         cost_gamma: float | None = None,
         cost_advantage_estimator: AdvatageEstimator | None = None,
+        value_target_method: str | None = None,
+        cost_value_target_method: str | None = None,
         sr_dim: int | None = None,
         lam_sr: float = 0.95,
         gamma_sr: float | None = None,
@@ -133,16 +140,30 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self._cost_advantage_estimator: AdvatageEstimator = (
             cost_advantage_estimator if cost_advantage_estimator is not None else advantage_estimator
         )
+        # The critic's regression target, now independent of the advantage above (see
+        # omnisafe.utils.gae.resolve_adv_and_target). None keeps the legacy coupling, where the
+        # estimator name picked both. Cost falls back to the reward-side value when unset -- the
+        # same null-fallback convention as cost_gamma / lam_c / cost_advantage_estimator.
+        self._value_target_method: str | None = value_target_method
+        self._cost_value_target_method: str | None = (
+            cost_value_target_method if cost_value_target_method is not None else value_target_method
+        )
         self.ptr: int = 0
         self.path_start_idx: int = 0
         self.max_size: int = size
         self._episode_slices: list[tuple[int, int]] = []
         self._last_episode_slices: list[tuple[int, int]] = []
 
-        _valid = ['gae', 'gae-rtg', 'vtrace', 'plain', 'reinforce', 'td_zero', 'td_zero_gae']
+        # Presets stay valid names; so do the bare advantage methods, but only when the target
+        # axis is given explicitly (otherwise there is nothing to expand them with).
+        _valid = list(ADV_TARGET_PRESETS) + list(ADVANTAGE_METHODS)
         assert self._penalty_coefficient >= 0, 'penalty_coefficient must be non-negative!'
-        assert self._advantage_estimator in _valid
-        assert self._cost_advantage_estimator in _valid
+        assert self._advantage_estimator in _valid, self._advantage_estimator
+        assert self._cost_advantage_estimator in _valid, self._cost_advantage_estimator
+        # Resolve once at construction so a bad combination fails here, loudly, rather than on
+        # the first finish_path deep inside a rollout.
+        resolve_adv_and_target(self._advantage_estimator, self._value_target_method)
+        resolve_adv_and_target(self._cost_advantage_estimator, self._cost_value_target_method)
 
         # Constant cost bias (algo_cfgs.cost_bias / cost_bias_decay_type -- see
         # PolicyGradient.learn()'s cost-bias block, and CPO._update_actor's mean_ep_cost_bias()
@@ -310,6 +331,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             lam=self._lam_c,
             gamma=self._cost_gamma,
             advantage_estimator=self._cost_advantage_estimator,
+            value_target=self._cost_value_target_method,
         )
 
         self.data['adv_r'][path_slice] = adv_r
@@ -416,6 +438,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         lam: float,
         gamma: float | None = None,
         advantage_estimator: AdvatageEstimator | None = None,
+        value_target: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         r"""Compute the estimated advantage.
 
@@ -472,6 +495,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         """  # pylint: disable=line-too-long
         g = gamma if gamma is not None else self._gamma
         estimator = advantage_estimator if advantage_estimator is not None else self._advantage_estimator
+        target = value_target if value_target is not None else self._value_target_method
         action_probs = None
         if estimator == 'vtrace':
             #  v_s = V(x_s) + \sum^{T-1}_{t=s} \gamma^{t-s}
@@ -488,6 +512,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             lam=lam,
             gamma=g,
             advantage_estimator=estimator,
+            value_target=target,
             action_probs=action_probs,
             behavior_action_probs=action_probs,
         )

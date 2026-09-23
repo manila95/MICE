@@ -83,6 +83,22 @@ defaults:
     # advantage estimation method, options: gae, retrace
     adv_estimation_method: gae
     cost_adv_estimation_method: ~
+    # The critic's regression target, chosen INDEPENDENTLY of the advantage above.
+    # 'td_lambda' | 'mc' | 'td_zero' | 'vtrace'; null keeps the legacy coupling where
+    # adv_estimation_method picked both axes at once (see omnisafe.utils.gae.ADV_TARGET_PRESETS:
+    # gae -> td_lambda, plain -> mc, td_zero -> td_zero, gae-rtg -> mc, reinforce -> mc).
+    #
+    # Why this exists: those two choices were welded together, so only 6 of the 3x3 combinations
+    # were reachable -- "TD(0) advantage with a TD(lambda) target" could not be expressed at all.
+    # Worse for experiments, comparing two estimators silently varied BOTH axes: plain vs gae is
+    # (TD(0) adv, MC target) vs (GAE adv, TD(lambda) target), so a difference between them cannot
+    # be attributed to either one. Setting this pins the target while adv_estimation_method
+    # varies, or vice versa.
+    value_target_method: ~
+    # Cost-side override; null falls back to value_target_method -- same convention as
+    # cost_gamma / lam_c / cost_adv_estimation_method. Note the cost target uses cost_gamma and
+    # lam_c, not gamma/lam.
+    cost_value_target_method: ~
     n_val_episodes: 0
     # standardize reward advantage
     standardized_rew_adv: True
