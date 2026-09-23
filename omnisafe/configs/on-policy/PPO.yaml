@@ -157,23 +157,35 @@ defaults:
     # however many other runs share the machine -- e.g. 20 (giving a clean 500/20=25 waves at the
     # defaults above) on a lightly-loaded 16+-core box.
     mc_value_study_vector_envs: 5
-    # Whether the MC "true" value may include a critic-bootstrapped tail. False (default): the
-    # value is the discounted sum of *simulated* reward/cost only, over the full episode. That
-    # keeps it a genuine sample of the return, with the return's own properties -- decisively,
-    # a cost value is then non-negative whenever the per-step cost is. With bootstrapping on, an
-    # untrained V_c predicts negative values and those land straight in the "ground truth": a
-    # measured 14.4% of per-rollout cost returns (and 84 of 1350 probe means) came out negative
-    # in the 40-repeat study, which is impossible for a non-negative cost signal.
-    mc_eval_bootstrap_tail: False
+    # How the truncated tail is handled when mc_eval_bootstrap_threshold is set (it is, by
+    # default). Required then; null makes a non-null threshold raise rather than silently
+    # biasing every value.
+    #   'drop'      -- stop accumulating. The value is the exact truncated discounted sum, low by
+    #                  at most bootstrap_threshold of its own scale (1% at 0.01), one-sided and
+    #                  analytically known. Stays simulation-only, so a cost value is still
+    #                  non-negative, and the critic -- the thing these studies validate -- never
+    #                  enters the "ground truth".
+    #   'bootstrap' -- estimate the tail with the critic's own value there. Unbiased in principle,
+    #                  circular in practice: an untrained V_c made 14.4% of per-rollout cost
+    #                  returns negative, which a non-negative cost signal cannot produce. This is
+    #                  what commit abf5ff3 turned off by default.
+    # Ignored when bootstrap_threshold is null (full horizon, no approximation).
+    mc_eval_tail: drop
     # Truncate mc_value_study/intermediate_state_study rollouts early once both streams'
-    # discounted tail contribution drops below this fraction, bootstrapping the remainder with
-    # the critic's own value there (see omnisafe.utils.value_eval._effective_rollout_horizon) --
-    # at gamma=0.99, 0.01 cuts a 1000-step rollout to ~460 steps. ONLY valid together with
-    # mc_eval_bootstrap_tail: True; truncating without bootstrapping would drop the tail rather
-    # than estimate it, so the combination raises instead of silently biasing every value low.
-    # None (default) = full horizon, no approximation, and the exact quantity these studies mean
-    # to measure. Costs ~2.2x the eval wall-clock of the old 0.01 truncation.
-    mc_eval_bootstrap_threshold: ~
+    # discounted tail contribution drops below this fraction (see
+    # omnisafe.utils.value_eval._effective_rollout_horizon). At gamma=0.99, 0.01 stops at step
+    # 459 of 1000 -- 2.18x fewer simulated steps, and eval is ~85% of a run's wall-clock.
+    #
+    # What the default 0.01 costs, paired with mc_eval_tail: drop above: every "true" MC value is
+    # low by at most 1% of its own scale. That bias is one-sided and analytically known (it is
+    # exactly the dropped geometric tail), not noise -- so it does NOT average out across seeds.
+    # It shifts EstimationError_* by ~1% of the true value; Correlation_* is near-untouched,
+    # being close to a monotone rescaling.
+    #
+    # Set to null for the exact, bias-free quantity these studies mean to measure, at ~2.2x the
+    # eval wall-clock. Prefer that when an absolute value level is the result being reported;
+    # 0.01 is the right default when the questions are about calibration trends and correlations.
+    mc_eval_bootstrap_threshold: 0.01
     # On-policy intermediate-state value study (see omnisafe.utils.value_eval.
     # estimate_value_from_snapshots and omnisafe.utils.state_snapshot): the same same-state MC
     # trick mc_value_study uses for s0, but for states the CURRENT policy actually visits

@@ -124,15 +124,48 @@ def test_bootstrap_tail_reintroduces_the_negative_value() -> None:
     """
     horizon = _effective_rollout_horizon(HORIZON, 0.99, 0.99, 0.9)
     assert horizon < HORIZON, 'threshold too weak to truncate; pick a larger one'
-    _, raw = _run(bootstrap_threshold=0.9, bootstrap_tail=True)
+    _, raw = _run(bootstrap_threshold=0.9, tail_mode='bootstrap')
     returns = np.array(raw['c']['returns'])
-    assert (returns < 0).any(), 'bootstrap_tail=True should fold the negative V_c into the return'
+    assert (returns < 0).any(), "tail_mode='bootstrap' should fold the negative V_c into the return"
 
 
-def test_truncating_without_bootstrapping_is_refused() -> None:
-    """Dropping the tail silently would bias every value low -- it must raise instead."""
-    with pytest.raises(ValueError, match='bootstrap_tail=False'):
-        _run(bootstrap_threshold=0.9, bootstrap_tail=False)
+def test_truncating_without_choosing_a_tail_mode_is_refused() -> None:
+    """A threshold with no tail policy must raise, not silently bias every value low."""
+    with pytest.raises(ValueError, match='tail_mode'):
+        _run(bootstrap_threshold=0.9)
+
+
+def test_drop_truncates_without_touching_the_critic() -> None:
+    """tail_mode='drop': truncate for speed, keep the value simulation-only.
+
+    This is the combination the guard used to forbid outright. It is the useful one: the tail is
+    dropped rather than estimated, so the value never inherits a critic artifact -- the cost
+    return stays non-negative, unlike under 'bootstrap' (see the test above, where the same
+    threshold drives it negative).
+    """
+    horizon = _effective_rollout_horizon(HORIZON, 0.99, 0.99, 0.9)
+    assert horizon < HORIZON, 'threshold too weak to truncate; pick a larger one'
+    _, raw = _run(bootstrap_threshold=0.9, tail_mode='drop')
+    returns = np.array(raw['c']['returns'])
+    assert (returns >= 0).all(), f'drop must stay non-negative for a non-negative cost: {returns.min()}'
+
+
+def test_drop_equals_the_exact_truncated_sum() -> None:
+    """Not just non-negative -- exactly the geometric sum over the steps actually simulated.
+
+    Pins the bias as *known*: the value is short of the full-horizon sum by exactly the dropped
+    tail, so it is low by at most bootstrap_threshold of its own scale and can be reasoned about
+    (or corrected for) rather than merely bounded.
+    """
+    horizon = _effective_rollout_horizon(HORIZON, 0.99, 0.99, 0.9)
+    _, raw = _run(bootstrap_threshold=0.9, tail_mode='drop')
+    expected = _StubEnv.COST_PER_STEP * (1 - 0.99 ** horizon) / (1 - 0.99)
+    returns = np.array(raw['c']['returns'])
+    assert np.allclose(returns, expected, rtol=1e-6), (
+        f'expected the truncated sum {expected} over {horizon} steps, got {np.unique(returns)}'
+    )
+    full = _StubEnv.COST_PER_STEP * (1 - 0.99 ** HORIZON) / (1 - 0.99)
+    assert returns.max() < full, 'drop must be strictly below the full-horizon sum'
 
 
 if __name__ == '__main__':

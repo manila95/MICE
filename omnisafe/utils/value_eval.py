@@ -475,7 +475,7 @@ def estimate_true_value_same_state_mc(
     max_episode_steps=None,
     return_raw=False,
     bootstrap_threshold=None,
-    bootstrap_tail=False,
+    tail_mode=None,
 ):
     r"""Compare the critic's V(s0) against a genuine same-layout Monte-Carlo estimate.
 
@@ -547,7 +547,10 @@ def estimate_true_value_same_state_mc(
             substituted quantity is exactly what this function exists to validate) for wall-clock
             -- e.g. ``0.01`` with ``gamma=0.99`` cuts ``max_episode_steps=1000`` down to ~460
             steps. ``None`` (default) preserves the exact original full-horizon behavior.
-        bootstrap_tail (bool): Whether the truncated tail may be filled in with the critic's own
+        tail_mode (str or None): What to do with the tail once ``bootstrap_threshold``
+            truncates the rollout -- ``'drop'`` stops accumulating (the value stays a
+            simulation-only quantity, low by at most the threshold), ``'bootstrap'`` fills it
+            in with the critic's own
             value. ``False`` (default) keeps the MC "true" return strictly simulation-only: it is
             then a genuine sample of the discounted return, with the properties the real return
             has -- in particular a cost return is non-negative whenever the per-step cost is,
@@ -585,13 +588,17 @@ def estimate_true_value_same_state_mc(
     # strictly less only when bootstrap_threshold is set, in which case the tail past `horizon`
     # is bootstrapped with the critic's own value instead of simulated.
     horizon = _effective_rollout_horizon(max_episode_steps, discount_r, discount_c, bootstrap_threshold)
-    if horizon < max_episode_steps and not bootstrap_tail:
+    bootstrap_tail = tail_mode == 'bootstrap'
+    if horizon < max_episode_steps and tail_mode not in ('bootstrap', 'drop'):
         raise ValueError(
             'estimate_true_value_same_state_mc: bootstrap_threshold truncates the rollout at '
-            f'{horizon} of {max_episode_steps} steps, but bootstrap_tail=False means the '
-            'remaining tail would simply be dropped -- biasing every "true" value low instead of '
-            'approximating it. Either set bootstrap_threshold=None (full-horizon, exact) or '
-            'bootstrap_tail=True (truncated, tail estimated by the critic).',
+            f'{horizon} of {max_episode_steps} steps, so the tail must be handled explicitly. '
+            "Set tail_mode='drop' (stop accumulating; the value is the exact truncated "
+            'discounted sum, low by at most bootstrap_threshold of its own scale, and still a '
+            "simulation-only quantity) or tail_mode='bootstrap' (estimate the tail with the "
+            "critic's own value -- note that is the quantity these studies exist to validate, "
+            'and an untrained V_c makes cost returns negative). bootstrap_threshold=None keeps '
+            'the full horizon with no approximation.',
         )
 
     # Which advantage estimator/lambda each stream's target should mirror -- the same config
@@ -878,7 +885,7 @@ def estimate_value_from_snapshots(
     epoch=None,
     return_raw=False,
     bootstrap_threshold=None,
-    bootstrap_tail=False,
+    tail_mode=None,
 ):
     r"""Like :func:`estimate_true_value_same_state_mc`, but for arbitrary on-policy *intermediate*
     states captured via :mod:`omnisafe.utils.state_snapshot`, instead of states reachable by
@@ -927,7 +934,7 @@ def estimate_value_from_snapshots(
             from pre-captured snapshots rather than reset seeds).
         bootstrap_threshold (float or None): See :func:`estimate_true_value_same_state_mc` --
             same meaning, applied against ``horizon``.
-        bootstrap_tail (bool): See :func:`estimate_true_value_same_state_mc` -- same meaning,
+        tail_mode (str or None): See :func:`estimate_true_value_same_state_mc` -- same meaning,
             same default of ``False``.
 
     Returns:
@@ -948,12 +955,14 @@ def estimate_value_from_snapshots(
     # it) -- horizon <= nominal_horizon always; strictly less only when bootstrap_threshold is
     # set.
     horizon = _effective_rollout_horizon(nominal_horizon, discount_r, discount_c, bootstrap_threshold)
-    if horizon < nominal_horizon and not bootstrap_tail:
+    bootstrap_tail = tail_mode == 'bootstrap'
+    if horizon < nominal_horizon and tail_mode not in ('bootstrap', 'drop'):
         raise ValueError(
             'estimate_value_from_snapshots: bootstrap_threshold truncates the rollout at '
-            f'{horizon} of {nominal_horizon} steps, but bootstrap_tail=False means the tail '
-            'would be dropped rather than estimated. Set bootstrap_threshold=None or '
-            'bootstrap_tail=True.',
+            f'{horizon} of {nominal_horizon} steps, so the tail must be handled explicitly. '
+            "Set tail_mode='drop' or tail_mode='bootstrap' (see "
+            'estimate_true_value_same_state_mc), or bootstrap_threshold=None for the full '
+            'horizon.',
         )
 
     adv_estimator_r = getattr(cfgs.algo_cfgs, 'adv_estimation_method', 'gae')
