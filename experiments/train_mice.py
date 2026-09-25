@@ -126,6 +126,18 @@ if __name__ == '__main__':
         help='number of lidar angular bins (overrides lidar_conf.num_bins, default: 16)',
     )
     parser.add_argument(
+        '--hazards-num',
+        type=int,
+        default=None,
+        metavar='N',
+        help=(
+            'number of hazards, for the *GoalHazards* envs only '
+            '(e.g. --env-id SafetyPointGoalHazards1-v0 --hazards-num 4). Must be >= 1. '
+            'Unlike --lidar-bins this travels in the env config, so it reaches async vector '
+            'workers and does not force synchronous envs.'
+        ),
+    )
+    parser.add_argument(
         '--no-intrinsic-in-deltas',
         type=lambda x: x.lower() in ('true', '1', 'yes'),
         default=False,
@@ -262,6 +274,7 @@ if __name__ == '__main__':
     steps_per_epoch = args.steps_per_epoch
     early_eval_freq = args.early_eval_freq
     lidar_bins = args.lidar_bins
+    hazards_num = args.hazards_num
     opt = vars(args)
     del opt["seed"]
     del opt["constant_cost"]
@@ -285,6 +298,7 @@ if __name__ == '__main__':
     del opt["steps_per_epoch"]
     del opt["early_eval_freq"]
     del opt["lidar_bins"]
+    del opt["hazards_num"]
     custom_cfgs = {}
     for k, v in unparsed_args.items():
         update_dict(custom_cfgs, custom_cfgs_to_dict(k, v))
@@ -349,6 +363,8 @@ if __name__ == '__main__':
         update_dict(custom_cfgs, custom_cfgs_to_dict('algo_cfgs:early_eval_freq', str(early_eval_freq)))
     if lidar_bins is not None:
         update_dict(custom_cfgs, custom_cfgs_to_dict('env_cfgs:lidar_num_bins', str(lidar_bins)))
+    if hazards_num is not None:
+        update_dict(custom_cfgs, custom_cfgs_to_dict('env_cfgs:hazards_num', str(hazards_num)))
 
     agent = omnisafe.Agent(
         args.algo,

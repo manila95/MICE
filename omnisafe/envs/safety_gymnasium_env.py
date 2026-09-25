@@ -56,6 +56,8 @@ class SafetyGymnasiumEnv(CMDP):
         'SafetyPointGoal0-v0',
         'SafetyPointGoal1-v0',
         'SafetyPointGoal2-v0',
+        'SafetyPointGoalHazards1-v0',
+        'SafetyCarGoalHazards1-v0',
         'SafetyPointButton0-v0',
         'SafetyPointButton1-v0',
         'SafetyPointButton2-v0',
@@ -137,6 +139,18 @@ class SafetyGymnasiumEnv(CMDP):
 
         # Pop before passing to safety_gymnasium — it doesn't know this kwarg.
         lidar_num_bins = kwargs.pop('lidar_num_bins', None)
+        # Number of hazards, for the *GoalHazards* tasks only (see safety_gymnasium's
+        # tasks/safe_navigation/goal_hazards/). Unlike lidar_num_bins this needs no
+        # post-construction patching: it travels inside `config`, which safety_gymnasium.make
+        # merges into the registered spec's config, so it is applied when each env is built --
+        # including inside an AsyncVectorEnv's subprocess workers, which a parent-side patch
+        # cannot reach. That is why this does not force `asynchronous=False` the way
+        # lidar_num_bins has to.
+        hazards_num = kwargs.pop('hazards_num', None)
+        if hazards_num is not None:
+            config = dict(kwargs.pop('config', None) or {})
+            config['hazards_num'] = int(hazards_num)
+            kwargs['config'] = config
 
         if num_envs > 1:
             if lidar_num_bins is not None:

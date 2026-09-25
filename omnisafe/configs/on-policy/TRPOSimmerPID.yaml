@@ -550,6 +550,12 @@ defaults:
 
   env_cfgs:
     lidar_num_bins: ~
+    # Number of hazards, for the *GoalHazards* envs only (SafetyPointGoalHazards1-v0 etc.).
+    # null keeps the task's own default (8). Travels inside the env `config`, which
+    # safety_gymnasium.make merges into the registered spec, so it is applied when each env is
+    # constructed -- including inside async vector workers, which a parent-side patch cannot
+    # reach. That is why, unlike lidar_num_bins, it does not force synchronous vector envs.
+    hazards_num: ~
 SafetyCarCircle1-v0:
   # algorithm configurations
   algo_cfgs:
