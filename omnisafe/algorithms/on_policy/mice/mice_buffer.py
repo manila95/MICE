@@ -45,6 +45,8 @@ class MICEBuffer(OnPolicyBuffer):
         no_intrinsic_in_deltas: bool = False,
         cost_gamma: Optional[float] = None,
         cost_advantage_estimator: Optional[str] = None,
+        value_target_method: Optional[str] = None,
+        cost_value_target_method: Optional[str] = None,
         constant_cost_source: str = 'fixed',
         cost_limit: Optional[float] = None,
     ):
@@ -62,6 +64,8 @@ class MICEBuffer(OnPolicyBuffer):
             device,
             cost_gamma=cost_gamma,
             cost_advantage_estimator=cost_advantage_estimator,
+            value_target_method=value_target_method,
+            cost_value_target_method=cost_value_target_method,
         )
         self.data['intrinsic_costs'] = torch.zeros((size,), dtype=torch.float32, device=device)
         self.data['ep_discount_ci'] = torch.zeros((size,), dtype=torch.float32, device=device)
@@ -308,6 +312,8 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
         no_intrinsic_in_deltas: bool = False,
         cost_gamma: Optional[float] = None,
         cost_advantage_estimator: Optional[str] = None,
+        value_target_method: Optional[str] = None,
+        cost_value_target_method: Optional[str] = None,
         constant_cost_source: str = 'fixed',
         cost_limit: Optional[float] = None,
     ):
@@ -335,6 +341,8 @@ class MICEVectorBuffer(VectorOnPolicyBuffer):
                 no_intrinsic_in_deltas=no_intrinsic_in_deltas,
                 cost_gamma=cost_gamma,
                 cost_advantage_estimator=cost_advantage_estimator,
+                value_target_method=value_target_method,
+                cost_value_target_method=cost_value_target_method,
                 constant_cost_source=constant_cost_source,
                 cost_limit=cost_limit,
             )
