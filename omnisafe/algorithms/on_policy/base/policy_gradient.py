@@ -21,6 +21,7 @@ import time
 from typing import Any
 
 import numpy as np
+import gymnasium
 import torch
 import torch.nn as nn
 from rich.progress import track
@@ -54,6 +55,7 @@ from omnisafe.utils.value_eval import (
     compute_gradient_alignment,
     estimate_true_value_same_state_mc,
     estimate_value_from_snapshots,
+    resolve_study_positions,
     pool_correlation_stats,
     sync_obs_normalizer,
 )
@@ -104,6 +106,9 @@ class PolicyGradient(BaseAlgo):
     # reset(seed=X) waves.
     _mc_intermediate_env: Any = None
     _mc_intermediate_max_episode_steps: int | None = None
+    _intermediate_positions: list[int] | None = None
+    _intermediate_positions_dropped: list | None = None
+    _intermediate_positions_limit: int | None = None
     # phi_source='contrastive' state; see _contrastive_update_phi / _relabel_after_phi_update.
     _sr_phi_source: str = 'trunk'
     _sr_phi_pretrain_steps: int = 0
@@ -205,6 +210,35 @@ class PolicyGradient(BaseAlgo):
         self._mc_eval_max_episode_steps = probe_env.max_episode_steps
         probe_env.close()
         return self._mc_eval_env
+
+    def _intermediate_study_positions(self) -> list[int]:
+        """Configured study positions resolved to absolute step indices, computed once.
+
+        Resolved here rather than at the study call site because ``_init_log`` registers one
+        logger key block per position, and ``store()`` asserts on unregistered keys -- so the
+        two have to agree. The episode limit comes from the registry spec, which is metadata
+        (no env construction, no RNG draw) and is the same number
+        ``_get_intermediate_state_env`` reads off the env it builds later.
+        """
+        if self._intermediate_positions is None:
+            configured = list(
+                getattr(
+                    self._cfgs.algo_cfgs,
+                    'intermediate_state_study_positions',
+                    [0.1, 0.3, 0.5, 0.7, 0.9],
+                ),
+            )
+            max_eps = self._mc_intermediate_max_episode_steps
+            if max_eps is None:
+                try:
+                    max_eps = gymnasium.spec(self._env_id).max_episode_steps
+                except Exception:  # noqa: BLE001 # pylint: disable=broad-except
+                    max_eps = None
+            self._intermediate_positions, self._intermediate_positions_dropped = (
+                resolve_study_positions(configured, max_eps)
+            )
+            self._intermediate_positions_limit = max_eps
+        return self._intermediate_positions
 
     def _get_intermediate_state_env(self):
         """Lazily build the dedicated env for ``algo_cfgs.intermediate_state_study``.
@@ -634,10 +668,7 @@ class PolicyGradient(BaseAlgo):
         # docstring and learn()'s call site). One block of keys per within-episode position, since
         # each is scored (and therefore logged) independently.
         if getattr(self._cfgs.algo_cfgs, 'eval_critic', False):
-            positions = getattr(
-                self._cfgs.algo_cfgs, 'intermediate_state_study_positions', [100, 300, 500, 700, 900],
-            )
-            for pos in positions:
+            for pos in self._intermediate_study_positions():
                 for stream in ('r', 'c'):
                     self._logger.register_key(f'IntermediateMC/pos{pos}/Correlation_{stream}')
                     self._logger.register_key(f'IntermediateMC/pos{pos}/EstimationError_{stream}')
@@ -1076,18 +1107,31 @@ class PolicyGradient(BaseAlgo):
                 getattr(
                     self._cfgs.algo_cfgs,
                     'intermediate_state_study_positions',
-                    [100, 300, 500, 700, 900],
+                    [0.1, 0.3, 0.5, 0.7, 0.9],
                 ),
             )
             n_probes = int(getattr(self._cfgs.algo_cfgs, 'intermediate_state_study_probes', 20))
             repeats = int(getattr(self._cfgs.algo_cfgs, 'intermediate_state_study_repeats', 5))
             interm_env = self._get_intermediate_state_env()
             sync_obs_normalizer(interm_env, self._env._env)
+            max_eps = self._mc_intermediate_max_episode_steps
+            positions = self._intermediate_study_positions()
+            if not positions:
+                raise ValueError(
+                    f'intermediate_state_study_positions resolved to nothing for this env\'s '
+                    f'{self._intermediate_positions_limit}-step episode limit -- no state to '
+                    f'study.',
+                )
+            if self._intermediate_positions_dropped:
+                self._logger.log(
+                    f'INFO: intermediate-state study skipping positions '
+                    f'{self._intermediate_positions_dropped} (unreachable within this env\'s '
+                    f'{self._intermediate_positions_limit}-step episode limit); using {positions}.',
+                )
             base_seed = 700_000 + epoch * n_probes
             collected = collect_on_policy_snapshots(
                 self._actor_critic, interm_env, positions, base_seed=base_seed,
             )
-            max_eps = self._mc_intermediate_max_episode_steps
             eval_data_bundle['intermediate_study'] = {}
             for pos in positions:
                 pos_stats, pos_raw = estimate_value_from_snapshots(

@@ -197,7 +197,7 @@ defaults:
     # repeats extra partial episodes), like mc_value_study. Enabled by default here.
     # within-episode step indices to snapshot at (steps elapsed so far in that episode) --
     # evenly-spaced by default to cover the whole episode timeline, not just its start
-    intermediate_state_study_positions: [100, 300, 500, 700, 900]
+    intermediate_state_study_positions: [0.1, 0.3, 0.5, 0.7, 0.9]
     # on-policy states captured per position, per eval epoch (also sets this env's
     # num_envs -- one collection rollout produces exactly this many probes per position in a
     # single pass, no waves needed for collection itself, only for scoring)
