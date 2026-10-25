@@ -50,7 +50,9 @@ from omnisafe.utils.state_snapshot import (
     enable_state_snapshots,
 )
 from omnisafe.utils.tools import decayed_constant
+from omnisafe.utils.isolated_eval import env_needs_isolated_eval, run_isolated_value_studies
 from omnisafe.utils.value_eval import (
+    _find_obs_normalizer,
     estimate_true_value,
     compute_gradient_alignment,
     estimate_true_value_same_state_mc,
@@ -107,6 +109,7 @@ class PolicyGradient(BaseAlgo):
     _mc_intermediate_env: Any = None
     _mc_intermediate_max_episode_steps: int | None = None
     _intermediate_positions: list[int] | None = None
+    _isolated_eval: bool | None = None
     _intermediate_positions_dropped: list | None = None
     _intermediate_positions_limit: int | None = None
     # phi_source='contrastive' state; see _contrastive_update_phi / _relabel_after_phi_update.
@@ -211,6 +214,18 @@ class PolicyGradient(BaseAlgo):
         probe_env.close()
         return self._mc_eval_env
 
+    @property
+    def _use_isolated_eval(self) -> bool:
+        """Whether this env's value studies must run in their own process.
+
+        True only for environments that declare they cannot host a second env instance
+        (MetaDrive's global engine); every other env keeps the in-process study path
+        untouched. See :mod:`omnisafe.utils.isolated_eval`.
+        """
+        if self._isolated_eval is None:
+            self._isolated_eval = env_needs_isolated_eval(self._env_id)
+        return self._isolated_eval
+
     def _intermediate_study_positions(self) -> list[int]:
         """Configured study positions resolved to absolute step indices, computed once.
 
@@ -228,12 +243,17 @@ class PolicyGradient(BaseAlgo):
                     [0.1, 0.3, 0.5, 0.7, 0.9],
                 ),
             )
-            max_eps = self._mc_intermediate_max_episode_steps
-            if max_eps is None:
-                try:
-                    max_eps = gymnasium.spec(self._env_id).max_episode_steps
-                except Exception:  # noqa: BLE001 # pylint: disable=broad-except
-                    max_eps = None
+            if self._use_isolated_eval:
+                # These episodes end on events, not a clock; the configured rollout cap is the
+                # only horizon there is, so positions are proportions of it.
+                max_eps = int(getattr(self._cfgs.algo_cfgs, 'isolated_eval_episode_cap', 1500))
+            else:
+                max_eps = self._mc_intermediate_max_episode_steps
+                if max_eps is None:
+                    try:
+                        max_eps = gymnasium.spec(self._env_id).max_episode_steps
+                    except Exception:  # noqa: BLE001 # pylint: disable=broad-except
+                        max_eps = None
             self._intermediate_positions, self._intermediate_positions_dropped = (
                 resolve_study_positions(configured, max_eps)
             )
@@ -638,7 +658,7 @@ class PolicyGradient(BaseAlgo):
         # the logs via wandb (see value_eval._rollout_and_report); stored here unconditionally
         # from learn()'s call to estimate_true_value so it lands in progress.csv regardless of
         # logger_cfgs.use_wandb.
-        if getattr(self._cfgs.algo_cfgs, 'test_estimate', True):
+        if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and not self._use_isolated_eval:
             for split in ('Eval_s0', 'Eval_all'):
                 for stream in ('r', 'c'):
                     self._logger.register_key(f'{split}/Correlation_{stream}')
@@ -994,6 +1014,60 @@ class PolicyGradient(BaseAlgo):
         effective_eval_freq = early_eval_freq if epoch < early_eval_epochs else eval_freq
         return epoch == 1 or (epoch > 0 and epoch % effective_eval_freq == 0)
 
+    def _run_isolated_eval_studies(self, epoch: int, eval_data_bundle: dict) -> None:
+        """Run both value studies in a subprocess and file the results as the in-process path does.
+
+        Used only for environments that cannot host a second env instance in this process (see
+        :attr:`_use_isolated_eval`). The results land in exactly the same places -- ``MCStudy/*``
+        and ``IntermediateMC/pos*/*`` logger keys, ``eval_data_bundle['mc_study']`` and
+        ``['intermediate_study'][pos]`` -- so the pooling, scatter-plot and dump code downstream
+        needs no knowledge of which path produced them.
+        """
+        if self._mc_probe_seeds is None:
+            n_probes = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_probes', 100))
+            seed_offset = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_seed_offset', 100_000))
+            self._mc_probe_seeds = list(range(seed_offset, seed_offset + n_probes))
+        env_cfgs = {}
+        if hasattr(self._cfgs, 'env_cfgs') and self._cfgs.env_cfgs is not None:
+            env_cfgs = self._cfgs.env_cfgs.todict()
+        normalizer = _find_obs_normalizer(self._env._env)
+        interm_probes = int(getattr(self._cfgs.algo_cfgs, 'intermediate_state_study_probes', 20))
+        result = run_isolated_value_studies(
+            env_id=self._env_id,
+            env_cfgs=env_cfgs,
+            cfgs=self._cfgs,
+            model_cfgs=self._cfgs.model_cfgs,
+            obs_space=self._env.observation_space,
+            act_space=self._env.action_space,
+            epochs=self._cfgs.train_cfgs.epochs,
+            actor_state=self._actor_critic.state_dict(),
+            norm_state=normalizer.state_dict() if normalizer is not None else None,
+            obs_normalize=self._cfgs.algo_cfgs.obs_normalize,
+            probe_seeds=self._mc_probe_seeds,
+            mc_repeats=int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_repeats', 5)),
+            positions=self._intermediate_study_positions(),
+            interm_probes=interm_probes,
+            interm_base_seed=700_000 + epoch * interm_probes,
+            discount_r=self._cfgs.algo_cfgs.gamma,
+            discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma),
+            episode_cap=int(getattr(self._cfgs.algo_cfgs, 'isolated_eval_episode_cap', 1500)),
+        )
+        mc_stats, mc_raw = result['mc_study']
+        self._logger.store(mc_stats)
+        eval_data_bundle['mc_study'] = {'stats': mc_stats, 'raw': mc_raw}
+        eval_data_bundle['intermediate_study'] = {}
+        for pos, (pos_stats, pos_raw) in result['intermediate'].items():
+            self._logger.store({f'IntermediateMC/pos{pos}/{k}': v for k, v in pos_stats.items()})
+            eval_data_bundle['intermediate_study'][pos] = {'stats': pos_stats, 'raw': pos_raw}
+        if result['skipped_positions']:
+            # Episodes here end on events, not a clock, so a position deeper than every sampled
+            # episode simply has no visited state to score this epoch.
+            self._logger.log(
+                f'INFO: intermediate-state study had no probe reach positions '
+                f'{result["skipped_positions"]} this epoch (episode lengths '
+                f'{min(result["episode_lengths"])}-{max(result["episode_lengths"])}).',
+            )
+
     def _run_eval_studies(self, epoch: int) -> None:
         """Run this epoch's value-function evaluation studies, if any are due.
 
@@ -1017,7 +1091,11 @@ class PolicyGradient(BaseAlgo):
         # scatter-plot quick-look and a model checkpoint, all on this same eval cadence -- see
         # the save block after these three studies.
         eval_data_bundle: dict | None = {'epoch': epoch} if is_eval_epoch else None
-        if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and is_eval_epoch:
+        if (
+            getattr(self._cfgs.algo_cfgs, 'test_estimate', True)
+            and is_eval_epoch
+            and not self._use_isolated_eval
+        ):
             (
                 s0_c_error, s0_true_c_m, s0_est_c_m, s0_corr_c,
                 s0_r_error, s0_true_r_m, s0_est_r_m, s0_corr_r,
@@ -1070,7 +1148,14 @@ class PolicyGradient(BaseAlgo):
         # Same-layout Monte-Carlo value study (opt-in, default off -- see
         # estimate_true_value_same_state_mc's docstring). Shares effective_eval_freq with the
         # estimate_true_value call above so both diagnostics are read from the same epochs.
-        if getattr(self._cfgs.algo_cfgs, 'eval_critic', False) and is_eval_epoch:
+        if (
+            getattr(self._cfgs.algo_cfgs, 'eval_critic', False)
+            and is_eval_epoch
+            and self._use_isolated_eval
+        ):
+            # One subprocess runs both studies; see _run_isolated_eval_studies.
+            self._run_isolated_eval_studies(epoch, eval_data_bundle)
+        elif getattr(self._cfgs.algo_cfgs, 'eval_critic', False) and is_eval_epoch:
             if self._mc_probe_seeds is None:
                 n_probes = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_probes', 100))
                 seed_offset = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_seed_offset', 100_000))
@@ -1102,7 +1187,11 @@ class PolicyGradient(BaseAlgo):
         # _mc_probe_seeds) -- by epoch 400 the policy visits very different states than at
         # epoch 20, so re-using an old batch would be scoring accuracy on states the current
         # policy may never actually visit.
-        if getattr(self._cfgs.algo_cfgs, 'eval_critic', False) and is_eval_epoch:
+        if (
+            getattr(self._cfgs.algo_cfgs, 'eval_critic', False)
+            and is_eval_epoch
+            and not self._use_isolated_eval
+        ):
             positions = list(
                 getattr(
                     self._cfgs.algo_cfgs,
@@ -1161,6 +1250,9 @@ class PolicyGradient(BaseAlgo):
                 eval_data_bundle['intermediate_study'][pos] = {
                     'stats': pos_stats, 'raw': pos_raw,
                 }
+        # Pooling, gradient alignment and the scatter quick-look read only what the two studies
+        # above filed in eval_data_bundle, so they run for whichever path produced it.
+        if getattr(self._cfgs.algo_cfgs, 'eval_critic', False) and is_eval_epoch:
             # Pooled diversity correlation over every state actually evaluated on this
             # epoch -- s0 (if mc_value_study also ran) plus every intermediate position,
             # pooled into one set before computing a single correlation. See
