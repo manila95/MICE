@@ -36,9 +36,12 @@ if __name__ == '__main__':
     parser.add_argument(
         '--total-steps',
         type=int,
-        default= 10240000,  
+        default=None,
         metavar='STEPS',
-        help='total number of steps to train for algorithm',
+        help=(
+            'total number of steps to train for algorithm; unset leaves it to the config, '
+            "including any per-environment override (e.g. the SafeMetaDrive: block)"
+        ),
     )
     
     parser.add_argument(
@@ -299,6 +302,11 @@ if __name__ == '__main__':
     del opt["early_eval_freq"]
     del opt["lidar_bins"]
     del opt["hazards_num"]
+    # vars(args) is handed over as train_terminal_cfgs, which is applied *after* the yaml --
+    # so leaving an argparse default in here silently overrides the per-environment block
+    # (SafeMetaDrive's total_steps, say). Drop it when the flag was not actually passed.
+    if opt.get("total_steps") is None:
+        del opt["total_steps"]
     custom_cfgs = {}
     for k, v in unparsed_args.items():
         update_dict(custom_cfgs, custom_cfgs_to_dict(k, v))
