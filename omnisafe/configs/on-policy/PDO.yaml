@@ -530,3 +530,8 @@ defaults:
     # constructed -- including inside async vector workers, which a parent-side patch cannot
     # reach. That is why, unlike lidar_num_bins, it does not force synchronous vector envs.
     hazards_num: ~
+SafeMetaDrive:
+  # training configurations
+  train_cfgs:
+    # number of threads used for torch
+    torch_threads: 4
