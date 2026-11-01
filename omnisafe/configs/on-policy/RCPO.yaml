@@ -202,7 +202,8 @@ defaults:
     # within-episode step indices to snapshot at (steps elapsed so far in that episode) --
     # evenly-spaced by default to cover the whole episode timeline, not just its start
     intermediate_state_study_positions: [0.1, 0.3, 0.5, 0.7, 0.9]
-    # Rollout cap for envs whose episodes have no time limit (MetaDrive); unused elsewhere.
+    # Fallback rollout cap for the isolated eval path, used only when the environment
+    # declares no horizon of its own in env_cfgs; unused elsewhere.
     isolated_eval_episode_cap: 1500
     # on-policy states captured per position, per eval epoch (also sets this env's
     # num_envs -- one collection rollout produces exactly this many probes per position in a
@@ -540,5 +541,29 @@ defaults:
 SafeMetaDrive:
   # training configurations
   train_cfgs:
-    # number of threads used for torch
     torch_threads: 4
+    total_steps: 500000
+  logger_cfgs:
+    save_model_freq: 15
+  algo_cfgs:
+    batch_size: 512
+    steps_per_epoch: 3000
+    update_iters: 10
+    reward_normalize: false
+    cost_normalize: true
+    obs_normalize: false
+    max_grad_norm: 20.0
+  model_cfgs:
+    actor:
+      hidden_sizes: [256, 256]
+      lr: 5.0e-05
+    critic:
+      hidden_sizes: [256, 256]
+      lr: 5.0e-05
+  env_cfgs:
+    meta_drive_config:
+      horizon: 1500
+      random_traffic: false
+      crash_vehicle_penalty: 1.0
+      crash_object_penalty: 0.5
+      out_of_road_penalty: 1.0
