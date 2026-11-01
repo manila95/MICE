@@ -21,7 +21,6 @@ def main() -> None:
             'algo_cfgs': {
                 'steps_per_epoch': 2000,
                 'eval_critic': True,
-                'isolated_eval_episode_cap': 1000,   # episodes here have no time limit
                 'mc_value_study_probes': 12,
                 'mc_value_study_repeats': 3,
                 'intermediate_state_study_probes': 12,

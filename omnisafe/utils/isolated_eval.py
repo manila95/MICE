@@ -50,7 +50,7 @@ import numpy as np
 import torch
 
 
-__all__ = ['env_needs_isolated_eval', 'run_isolated_value_studies']
+__all__ = ['env_needs_isolated_eval', 'resolve_episode_cap', 'run_isolated_value_studies']
 
 
 def env_needs_isolated_eval(env_id: str) -> bool:
@@ -67,6 +67,32 @@ def env_needs_isolated_eval(env_id: str) -> bool:
     except (KeyError, ValueError):
         return False
     return bool(getattr(env_class, 'eval_needs_isolated_process', False))
+
+
+def resolve_episode_cap(cfgs) -> tuple[int, str]:
+    """Episode horizon to roll the isolated studies out for, and where it came from.
+
+    Prefer a horizon the environment itself declares in ``env_cfgs`` (MetaDrive takes one as
+    ``env_cfgs.meta_drive_config.horizon``, and truncates there), so the studies use the same
+    episode length training does instead of a second number that can drift from it. Envs on this
+    path set ``need_time_limit_wrapper = False``, so omnisafe exposes no ``max_episode_steps``
+    to read it off -- hence looking in the config rather than at the env.
+
+    Falls back to ``algo_cfgs.isolated_eval_episode_cap`` when nothing declares one, which is
+    then the only thing stopping an episode that never ends.
+    """
+    env_cfgs = getattr(cfgs, 'env_cfgs', None)
+    if env_cfgs is not None:
+        env_cfgs = env_cfgs.todict() if hasattr(env_cfgs, 'todict') else dict(env_cfgs)
+        if env_cfgs.get('horizon'):
+            return int(env_cfgs['horizon']), 'env_cfgs.horizon'
+        for key, value in env_cfgs.items():
+            if isinstance(value, dict) and value.get('horizon'):
+                return int(value['horizon']), f'env_cfgs.{key}.horizon'
+    return (
+        int(getattr(cfgs.algo_cfgs, 'isolated_eval_episode_cap', 1500)),
+        'algo_cfgs.isolated_eval_episode_cap',
+    )
 
 
 def _build_env(env_id: str, env_cfgs: dict, obs_normalize: bool, norm_state: dict | None):

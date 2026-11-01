@@ -50,7 +50,11 @@ from omnisafe.utils.state_snapshot import (
     enable_state_snapshots,
 )
 from omnisafe.utils.tools import decayed_constant
-from omnisafe.utils.isolated_eval import env_needs_isolated_eval, run_isolated_value_studies
+from omnisafe.utils.isolated_eval import (
+    env_needs_isolated_eval,
+    resolve_episode_cap,
+    run_isolated_value_studies,
+)
 from omnisafe.utils.value_eval import (
     _find_obs_normalizer,
     estimate_true_value,
@@ -110,6 +114,7 @@ class PolicyGradient(BaseAlgo):
     _mc_intermediate_max_episode_steps: int | None = None
     _intermediate_positions: list[int] | None = None
     _isolated_eval: bool | None = None
+    _isolated_cap_logged: bool = False
     _intermediate_positions_dropped: list | None = None
     _intermediate_positions_limit: int | None = None
     # phi_source='contrastive' state; see _contrastive_update_phi / _relabel_after_phi_update.
@@ -244,9 +249,9 @@ class PolicyGradient(BaseAlgo):
                 ),
             )
             if self._use_isolated_eval:
-                # These episodes end on events, not a clock; the configured rollout cap is the
-                # only horizon there is, so positions are proportions of it.
-                max_eps = int(getattr(self._cfgs.algo_cfgs, 'isolated_eval_episode_cap', 1500))
+                # Same horizon the study itself rolls out for -- these envs expose no
+                # max_episode_steps, so it comes from the config (see resolve_episode_cap).
+                max_eps, _ = resolve_episode_cap(self._cfgs)
             else:
                 max_eps = self._mc_intermediate_max_episode_steps
                 if max_eps is None:
@@ -1032,6 +1037,10 @@ class PolicyGradient(BaseAlgo):
             env_cfgs = self._cfgs.env_cfgs.todict()
         normalizer = _find_obs_normalizer(self._env._env)
         interm_probes = int(getattr(self._cfgs.algo_cfgs, 'intermediate_state_study_probes', 20))
+        cap, cap_source = resolve_episode_cap(self._cfgs)
+        if not self._isolated_cap_logged:
+            self._isolated_cap_logged = True
+            self._logger.log(f'INFO: isolated value study horizon {cap} (from {cap_source}).')
         result = run_isolated_value_studies(
             env_id=self._env_id,
             env_cfgs=env_cfgs,
@@ -1050,7 +1059,7 @@ class PolicyGradient(BaseAlgo):
             interm_base_seed=700_000 + epoch * interm_probes,
             discount_r=self._cfgs.algo_cfgs.gamma,
             discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma),
-            episode_cap=int(getattr(self._cfgs.algo_cfgs, 'isolated_eval_episode_cap', 1500)),
+            episode_cap=cap,
         )
         mc_stats, mc_raw = result['mc_study']
         self._logger.store(mc_stats)
