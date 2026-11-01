@@ -9,6 +9,47 @@ from omnisafe.utils.config import get_default_kwargs_yaml
 from omnisafe.utils.tools import custom_cfgs_to_dict, update_dict
 
 
+def _typed_flags(parser, argv):
+    """Which dests the user actually typed -- argparse cannot tell a default from a given value."""
+    typed = set()
+    for action in parser._actions:  # pylint: disable=protected-access
+        for opt in action.option_strings:
+            if any(a == opt or a.startswith(opt + '=') for a in argv):
+                typed.add(action.dest)
+    return typed
+
+
+def _env_block(algo, env_id):
+    """The per-environment block for this algo/env from its yaml, or {} if there is none."""
+    import glob as _glob  # noqa: PLC0415
+    import os as _os  # noqa: PLC0415
+
+    import yaml as _yaml  # noqa: PLC0415
+
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    for path in _glob.glob(_os.path.join(here, '..', 'omnisafe', 'configs', '*', f'{algo}.yaml')):
+        with open(path, encoding='utf-8') as handle:
+            return (_yaml.safe_load(handle) or {}).get(env_id) or {}
+    return {}
+
+
+def _check_env_block_applied(cfgs, block, typed):
+    """Report any key the per-environment block asked for that did not survive resolution."""
+    mismatches = []
+
+    def walk(want, got, path=''):
+        for key, value in want.items():
+            if key not in got:
+                mismatches.append((f'{path}{key}', value, '<missing>'))
+            elif isinstance(value, dict):
+                walk(value, got[key], f'{path}{key}.')
+            elif str(got[key]) != str(value):
+                mismatches.append((f'{path}{key}', value, got[key]))
+
+    walk(block, cfgs)
+    return [m for m in mismatches if m[0].split('.')[-1] not in typed]
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument(
@@ -138,6 +179,21 @@ if __name__ == '__main__':
             '(e.g. --env-id SafetyPointGoalHazards1-v0 --hazards-num 4). Must be >= 1. '
             'Unlike --lidar-bins this travels in the env config, so it reaches async vector '
             'workers and does not force synchronous envs.'
+        ),
+    )
+    parser.add_argument(
+        '--use-env-cfgs',
+        type=lambda x: x.lower() in ('true', '1', 'yes'),
+        default=True,
+        metavar='BOOL',
+        help=(
+            'honour the per-environment block in the algorithm yaml (e.g. SafeMetaDrive). '
+            'This script hands argparse defaults to omnisafe as train_terminal_cfgs, which are '
+            'applied after the yaml, so a flag left at its default would otherwise silently '
+            'override whatever that block sets. With this on, any train_cfgs key the block '
+            'defines and you did not actually type is left to the block, and the resolved '
+            'config is checked against it afterwards. Off reproduces the old behaviour: the '
+            "script's own defaults win."
         ),
     )
     parser.add_argument(
@@ -302,11 +358,26 @@ if __name__ == '__main__':
     del opt["early_eval_freq"]
     del opt["lidar_bins"]
     del opt["hazards_num"]
+    use_env_cfgs = opt.pop("use_env_cfgs")
     # vars(args) is handed over as train_terminal_cfgs, which is applied *after* the yaml --
     # so leaving an argparse default in here silently overrides the per-environment block
     # (SafeMetaDrive's total_steps, say). Drop it when the flag was not actually passed.
     if opt.get("total_steps") is None:
         del opt["total_steps"]
+    import sys as _sys
+
+    typed = _typed_flags(parser, _sys.argv[1:])
+    # Held onto here: algo_wrapper pops 'env_id'/'algo' out of train_terminal_cfgs, which is
+    # this same vars(args) dict, so args loses them once the Agent is built.
+    env_id_name = args.env_id
+    env_block = _env_block(args.algo, env_id_name) if use_env_cfgs else {}
+    if env_block:
+        # Leave every train_cfgs key the block sets to the block, unless it was actually typed.
+        deferred = [k for k in (env_block.get("train_cfgs") or {}) if k not in typed and k in opt]
+        for key in deferred:
+            del opt[key]
+        if deferred:
+            print(f'[use-env-cfgs] deferring to the {env_id_name} block for: {sorted(deferred)}')
     custom_cfgs = {}
     for k, v in unparsed_args.items():
         update_dict(custom_cfgs, custom_cfgs_to_dict(k, v))
@@ -385,4 +456,13 @@ if __name__ == '__main__':
     print('\n=== Resolved config ===')
     print(json.dumps(agent.cfgs.todict(), indent=2, default=str))
     print('=======================\n')
+    if env_block:
+        unapplied = _check_env_block_applied(agent.cfgs.todict(), env_block, typed)
+        if unapplied:
+            print(f'[use-env-cfgs] WARNING: the {env_id_name} block asked for values that did '
+                  'not survive resolution, and they were not overridden on the command line:')
+            for key, want, got in unapplied:
+                print(f'    {key}: block={want!r} resolved={got!r}')
+        else:
+            print(f'[use-env-cfgs] every {env_id_name} block value is applied.')
     agent.learn()
