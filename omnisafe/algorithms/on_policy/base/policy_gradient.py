@@ -1434,63 +1434,40 @@ class PolicyGradient(BaseAlgo):
         original_risk = risk
         old_distribution = self._actor_critic.actor(obs)
 
+        # Extras ride the same sampler as obs so everything stays index-aligned once the
+        # batch is shuffled. They are independent of each other: a run can use the successor
+        # representation, SRPL risk, both, or neither.
+        tensors = [obs, act, logp, target_value_r, target_value_c, adv_r, adv_c]
         if self._sr_td_ridge:
-            dataloader = DataLoader(
-                dataset=TensorDataset(
-                    obs,
-                    act,
-                    logp,
-                    target_value_r,
-                    target_value_c,
-                    adv_r,
-                    adv_c,
-                    target_sr,
-                ),
-                batch_size=self._cfgs.algo_cfgs.batch_size,
-                shuffle=True,
-            )
-        elif use_risk:
-            dataloader = DataLoader(
-                dataset=TensorDataset(
-                    obs, act, logp, target_value_r, target_value_c, adv_r, adv_c, risk,
-                ),
-                batch_size=self._cfgs.algo_cfgs.batch_size,
-                shuffle=True,
-            )
-        else:
-            dataloader = DataLoader(
-                dataset=TensorDataset(obs, act, logp, target_value_r, target_value_c, adv_r, adv_c),
-                batch_size=self._cfgs.algo_cfgs.batch_size,
-                shuffle=True,
-            )
+            tensors.append(target_sr)
+        if use_risk:
+            tensors.append(risk)
+        dataloader = DataLoader(
+            dataset=TensorDataset(*tensors),
+            batch_size=self._cfgs.algo_cfgs.batch_size,
+            shuffle=True,
+        )
 
         update_counts = 0
         final_kl = 0.0
 
         for i in track(range(self._cfgs.algo_cfgs.update_iters), description='Updating...'):
             for batch in dataloader:
+                items = list(batch)
+                obs, act, logp, target_value_r, target_value_c, adv_r, adv_c = items[:7]
+                extra = items[7:]
                 if self._sr_td_ridge:
-                    obs, act, logp, target_value_r, target_value_c, adv_r, adv_c, target_sr = batch
-                elif use_risk:
-                    obs, act, logp, target_value_r, target_value_c, adv_r, adv_c, risk = batch
-                else:
-                    obs, act, logp, target_value_r, target_value_c, adv_r, adv_c = batch
-                # Only pass risk when it exists: subclasses override these with their own
-                # signatures, and an unexpected keyword would break every algorithm that does
-                # not take part in SRPL.
+                    target_sr = extra.pop(0)
+                risk = extra.pop(0) if use_risk else None
+                self._update_reward_critic(obs, target_value_r)
+                if self._cfgs.algo_cfgs.use_cost:
+                    self._update_cost_critic(obs, target_value_c)
+                if self._sr_td_ridge:
+                    self._update_successor_features(obs, target_sr)
                 if use_risk:
-                    self._update_reward_critic(obs, target_value_r, risk=risk)
-                    if self._cfgs.algo_cfgs.use_cost:
-                        self._update_cost_critic(obs, target_value_c, risk=risk)
                     self._update_actor(obs, act, logp, adv_r, adv_c, risk=risk)
                 else:
-                    self._update_reward_critic(obs, target_value_r)
-                    if self._cfgs.algo_cfgs.use_cost:
-                        self._update_cost_critic(obs, target_value_c)
-                    if self._sr_td_ridge:
-                        self._update_successor_features(obs, target_sr)
                     self._update_actor(obs, act, logp, adv_r, adv_c)
-
             new_distribution = (
                 self._actor_critic.actor(original_obs, original_risk)
                 if use_risk
@@ -2280,12 +2257,7 @@ class PolicyGradient(BaseAlgo):
             if arm_c is not None:
                 self._logger.store({'Ensemble/arm_c': arm_c})
 
-    def _update_reward_critic(
-        self,
-        obs: torch.Tensor,
-        target_value_r: torch.Tensor,
-        risk: torch.Tensor | None = None,
-    ) -> None:
+    def _update_reward_critic(self, obs: torch.Tensor, target_value_r: torch.Tensor) -> None:
         r"""Update value network under a double for loop.
 
         The loss function is ``MSE`` by default, or ``Huber`` if ``algo_cfgs.critic_loss`` (or
@@ -2326,11 +2298,7 @@ class PolicyGradient(BaseAlgo):
         loss = torch.stack(
             [
                 self._critic_loss(v, target_value_r, stream='r')
-                for v in (
-                    self._actor_critic.reward_critic.raw_values(obs, risk)
-                    if risk is not None
-                    else self._actor_critic.reward_critic.raw_values(obs)
-                )
+                for v in self._actor_critic.reward_critic.raw_values(obs)
             ],
         ).mean()
 
@@ -2357,12 +2325,7 @@ class PolicyGradient(BaseAlgo):
 
         self._logger.store({'Loss/Loss_reward_critic': loss.mean().item()})
 
-    def _update_cost_critic(
-        self,
-        obs: torch.Tensor,
-        target_value_c: torch.Tensor,
-        risk: torch.Tensor | None = None,
-    ) -> None:
+    def _update_cost_critic(self, obs: torch.Tensor, target_value_c: torch.Tensor) -> None:
         r"""Update value network under a double for loop.
 
         The loss function is ``MSE`` by default, or ``Huber`` if ``algo_cfgs.critic_loss`` (or
@@ -2394,11 +2357,7 @@ class PolicyGradient(BaseAlgo):
         loss = torch.stack(
             [
                 self._critic_loss(v, target_value_c, stream='c')
-                for v in (
-                    self._actor_critic.cost_critic.raw_values(obs, risk)
-                    if risk is not None
-                    else self._actor_critic.cost_critic.raw_values(obs)
-                )
+                for v in self._actor_critic.cost_critic.raw_values(obs)
             ],
         ).mean()
 

@@ -25,7 +25,7 @@ from torch import optim
 from omnisafe.models.actor_critic.actor_critic import ActorCritic
 from omnisafe.models.base import Critic
 from omnisafe.models.critic.critic_builder import CriticBuilder
-from omnisafe.models.risk_net import RiskGaussianLearningActor, RiskVCritic
+from omnisafe.models.risk_net import RiskGaussianLearningActor
 from omnisafe.models.critic.successor_representation_critic import (
     SuccessorRepresentationLinearReadout,
     SuccessorRepresentationReadout,
@@ -488,23 +488,9 @@ class ConstraintActorCritic(ActorCritic):
         )
         self.add_module('actor', self.actor)
 
-        for name, cfgs, stream in (
-            ('reward_critic', model_cfgs.critic, 'r'),
-            ('cost_critic', model_cfgs.critic, 'c'),
-        ):
-            critic = RiskVCritic(
-                obs_space=obs_space,
-                act_space=act_space,
-                hidden_sizes=cfgs.hidden_sizes,
-                activation=cfgs.activation,
-                weight_initialization_mode=model_cfgs.weight_initialization_mode,
-                num_critics=1,
-                risk_size=self._risk_size,
-                stream=stream,
-            )
-            setattr(self, name, critic)
-            self.add_module(name, critic)
-
+        # Critics are left alone: see omnisafe.models.risk_net's module docstring for why
+        # only the actor is conditioned (and how that lets this coexist with the
+        # successor-representation critics).
         obs_dim = int(obs_space.shape[0])  # type: ignore[union-attr]
         self.risk_estimator = BayesRiskEst(
             obs_size=obs_dim,
@@ -544,13 +530,11 @@ class ConstraintActorCritic(ActorCritic):
             log_prob: The log probability of the action.
         """
         with torch.no_grad():
+            value_r = self.reward_critic(obs)
+            value_c = self.cost_critic(obs)
             if self._use_risk:
-                value_r = self.reward_critic(obs, risk)
-                value_c = self.cost_critic(obs, risk)
                 action = self.actor.predict(obs, deterministic=deterministic, risk=risk)
             else:
-                value_r = self.reward_critic(obs)
-                value_c = self.cost_critic(obs)
                 action = self.actor.predict(obs, deterministic=deterministic)
             log_prob = self.actor.log_prob(action)
 

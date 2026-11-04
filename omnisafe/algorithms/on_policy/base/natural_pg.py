@@ -230,8 +230,9 @@ class NaturalPG(PolicyGradient):
             train_data['adv_r'],
             train_data['adv_c'],
         )
-        # SRPL: the risk each action was taken under, carried through the critics' sampler too
-        # so obs and risk stay index-aligned when the batch is shuffled.
+        # SRPL conditions the actor only, and the actor is updated once on the whole batch
+        # here -- so risk needs no place in the critics' shuffled sampler below, and the
+        # successor-representation path is left exactly as it was.
         use_risk = bool(getattr(self._cfgs.model_cfgs, 'use_risk', False))
         risk = train_data['risk'] if use_risk else None
         if use_risk:
@@ -242,12 +243,6 @@ class NaturalPG(PolicyGradient):
         if self._sr_td_ridge:
             dataloader = DataLoader(
                 dataset=TensorDataset(obs, target_value_r, target_value_c, target_sr),
-                batch_size=self._cfgs.algo_cfgs.batch_size,
-                shuffle=True,
-            )
-        elif use_risk:
-            dataloader = DataLoader(
-                dataset=TensorDataset(obs, target_value_r, target_value_c, risk),
                 batch_size=self._cfgs.algo_cfgs.batch_size,
                 shuffle=True,
             )
@@ -262,20 +257,13 @@ class NaturalPG(PolicyGradient):
             for batch in dataloader:
                 if self._sr_td_ridge:
                     obs, target_value_r, target_value_c, target_sr = batch
-                elif use_risk:
-                    obs, target_value_r, target_value_c, risk = batch
                 else:
                     obs, target_value_r, target_value_c = batch
-                if use_risk:
-                    self._update_reward_critic(obs, target_value_r, risk=risk)
-                    if self._cfgs.algo_cfgs.use_cost:
-                        self._update_cost_critic(obs, target_value_c, risk=risk)
-                else:
-                    self._update_reward_critic(obs, target_value_r)
-                    if self._cfgs.algo_cfgs.use_cost:
-                        self._update_cost_critic(obs, target_value_c)
-                    if self._sr_td_ridge:
-                        self._update_successor_features(obs, target_sr)
+                self._update_reward_critic(obs, target_value_r)
+                if self._cfgs.algo_cfgs.use_cost:
+                    self._update_cost_critic(obs, target_value_c)
+                if self._sr_td_ridge:
+                    self._update_successor_features(obs, target_sr)
 
         self._logger.store(
             {
