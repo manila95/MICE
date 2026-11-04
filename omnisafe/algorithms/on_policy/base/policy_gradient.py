@@ -467,6 +467,11 @@ class PolicyGradient(BaseAlgo):
         )
 
         self._buf: VectorOnPolicyBuffer = VectorOnPolicyBuffer(
+            risk_size=(
+                self._actor_critic._risk_size  # pylint: disable=protected-access
+                if getattr(self._cfgs.model_cfgs, 'use_risk', False)
+                else None
+            ),
             obs_space=self._env.observation_space,
             act_space=self._env.action_space,
             size=self._steps_per_epoch,
@@ -663,6 +668,10 @@ class PolicyGradient(BaseAlgo):
         # the logs via wandb (see value_eval._rollout_and_report); stored here unconditionally
         # from learn()'s call to estimate_true_value so it lands in progress.csv regardless of
         # logger_cfgs.use_wandb.
+        if bool(getattr(self._cfgs.model_cfgs, 'use_risk', False)):
+            # Stored only on the steps an estimator update actually runs, so the column
+            # is the loss at those steps rather than a rate-diluted average.
+            self._logger.register_key('Risk/Loss')
         if getattr(self._cfgs.algo_cfgs, 'test_estimate', True) and not self._use_isolated_eval:
             for split in ('Eval_s0', 'Eval_all'):
                 for stream in ('r', 'c'):
@@ -1407,6 +1416,10 @@ class PolicyGradient(BaseAlgo):
                 self._sgd_update_readout_weights(data)
             target_sr = train_data['target_sr']
 
+        # SRPL: the risk each action was taken under, carried through the same sampler as obs
+        # so the two stay index-aligned when the batch is shuffled.
+        use_risk = bool(getattr(self._cfgs.model_cfgs, 'use_risk', False))
+        risk = train_data['risk'] if use_risk else None
         obs, act, logp, target_value_r, target_value_c, adv_r, adv_c = (
             train_data['obs'],
             train_data['act'],
@@ -1418,6 +1431,7 @@ class PolicyGradient(BaseAlgo):
         )
 
         original_obs = obs
+        original_risk = risk
         old_distribution = self._actor_critic.actor(obs)
 
         if self._sr_td_ridge:
@@ -1431,6 +1445,14 @@ class PolicyGradient(BaseAlgo):
                     adv_r,
                     adv_c,
                     target_sr,
+                ),
+                batch_size=self._cfgs.algo_cfgs.batch_size,
+                shuffle=True,
+            )
+        elif use_risk:
+            dataloader = DataLoader(
+                dataset=TensorDataset(
+                    obs, act, logp, target_value_r, target_value_c, adv_r, adv_c, risk,
                 ),
                 batch_size=self._cfgs.algo_cfgs.batch_size,
                 shuffle=True,
@@ -1449,16 +1471,31 @@ class PolicyGradient(BaseAlgo):
             for batch in dataloader:
                 if self._sr_td_ridge:
                     obs, act, logp, target_value_r, target_value_c, adv_r, adv_c, target_sr = batch
+                elif use_risk:
+                    obs, act, logp, target_value_r, target_value_c, adv_r, adv_c, risk = batch
                 else:
                     obs, act, logp, target_value_r, target_value_c, adv_r, adv_c = batch
-                self._update_reward_critic(obs, target_value_r)
-                if self._cfgs.algo_cfgs.use_cost:
-                    self._update_cost_critic(obs, target_value_c)
-                if self._sr_td_ridge:
-                    self._update_successor_features(obs, target_sr)
-                self._update_actor(obs, act, logp, adv_r, adv_c)
+                # Only pass risk when it exists: subclasses override these with their own
+                # signatures, and an unexpected keyword would break every algorithm that does
+                # not take part in SRPL.
+                if use_risk:
+                    self._update_reward_critic(obs, target_value_r, risk=risk)
+                    if self._cfgs.algo_cfgs.use_cost:
+                        self._update_cost_critic(obs, target_value_c, risk=risk)
+                    self._update_actor(obs, act, logp, adv_r, adv_c, risk=risk)
+                else:
+                    self._update_reward_critic(obs, target_value_r)
+                    if self._cfgs.algo_cfgs.use_cost:
+                        self._update_cost_critic(obs, target_value_c)
+                    if self._sr_td_ridge:
+                        self._update_successor_features(obs, target_sr)
+                    self._update_actor(obs, act, logp, adv_r, adv_c)
 
-            new_distribution = self._actor_critic.actor(original_obs)
+            new_distribution = (
+                self._actor_critic.actor(original_obs, original_risk)
+                if use_risk
+                else self._actor_critic.actor(original_obs)
+            )
 
             kl = (
                 torch.distributions.kl.kl_divergence(old_distribution, new_distribution)
@@ -2243,7 +2280,12 @@ class PolicyGradient(BaseAlgo):
             if arm_c is not None:
                 self._logger.store({'Ensemble/arm_c': arm_c})
 
-    def _update_reward_critic(self, obs: torch.Tensor, target_value_r: torch.Tensor) -> None:
+    def _update_reward_critic(
+        self,
+        obs: torch.Tensor,
+        target_value_r: torch.Tensor,
+        risk: torch.Tensor | None = None,
+    ) -> None:
         r"""Update value network under a double for loop.
 
         The loss function is ``MSE`` by default, or ``Huber`` if ``algo_cfgs.critic_loss`` (or
@@ -2284,7 +2326,11 @@ class PolicyGradient(BaseAlgo):
         loss = torch.stack(
             [
                 self._critic_loss(v, target_value_r, stream='r')
-                for v in self._actor_critic.reward_critic.raw_values(obs)
+                for v in (
+                    self._actor_critic.reward_critic.raw_values(obs, risk)
+                    if risk is not None
+                    else self._actor_critic.reward_critic.raw_values(obs)
+                )
             ],
         ).mean()
 
@@ -2311,7 +2357,12 @@ class PolicyGradient(BaseAlgo):
 
         self._logger.store({'Loss/Loss_reward_critic': loss.mean().item()})
 
-    def _update_cost_critic(self, obs: torch.Tensor, target_value_c: torch.Tensor) -> None:
+    def _update_cost_critic(
+        self,
+        obs: torch.Tensor,
+        target_value_c: torch.Tensor,
+        risk: torch.Tensor | None = None,
+    ) -> None:
         r"""Update value network under a double for loop.
 
         The loss function is ``MSE`` by default, or ``Huber`` if ``algo_cfgs.critic_loss`` (or
@@ -2343,7 +2394,11 @@ class PolicyGradient(BaseAlgo):
         loss = torch.stack(
             [
                 self._critic_loss(v, target_value_c, stream='c')
-                for v in self._actor_critic.cost_critic.raw_values(obs)
+                for v in (
+                    self._actor_critic.cost_critic.raw_values(obs, risk)
+                    if risk is not None
+                    else self._actor_critic.cost_critic.raw_values(obs)
+                )
             ],
         ).mean()
 
@@ -2997,6 +3052,7 @@ class PolicyGradient(BaseAlgo):
         logp: torch.Tensor,
         adv_r: torch.Tensor,
         adv_c: torch.Tensor,
+        risk: torch.Tensor | None = None,
     ) -> None:
         """Update policy network under a double for loop.
 
@@ -3053,6 +3109,7 @@ class PolicyGradient(BaseAlgo):
         act: torch.Tensor,
         logp: torch.Tensor,
         adv: torch.Tensor,
+        risk: torch.Tensor | None = None,
     ) -> torch.Tensor:
         r"""Computing pi/actor loss.
 
@@ -3077,7 +3134,11 @@ class PolicyGradient(BaseAlgo):
         Returns:
             The loss of pi/actor.
         """
-        distribution = self._actor_critic.actor(obs)
+        distribution = (
+            self._actor_critic.actor(obs, risk)
+            if risk is not None
+            else self._actor_critic.actor(obs)
+        )
         logp_ = self._actor_critic.actor.log_prob(act)
         std = self._actor_critic.actor.std
         ratio = torch.exp(logp_ - logp)

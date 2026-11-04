@@ -43,6 +43,9 @@ class NaturalPG(PolicyGradient):
     """
 
     _fvp_obs: torch.Tensor
+    #: SRPL: risk aligned with _fvp_obs, so the Fisher-vector product is taken
+    #: against the same risk-conditioned policy the loss is.
+    _fvp_risk: torch.Tensor | None = None
 
     def _init_log(self) -> None:
         r"""Log the Natural Policy Gradient specific information.
@@ -89,9 +92,17 @@ class NaturalPG(PolicyGradient):
             The Fisher vector product.
         """
         self._actor_critic.actor.zero_grad()
-        q_dist = self._actor_critic.actor(self._fvp_obs)
+        q_dist = (
+            self._actor_critic.actor(self._fvp_obs, self._fvp_risk)
+            if self._fvp_risk is not None
+            else self._actor_critic.actor(self._fvp_obs)
+        )
         with torch.no_grad():
-            p_dist = self._actor_critic.actor(self._fvp_obs)
+            p_dist = (
+                self._actor_critic.actor(self._fvp_obs, self._fvp_risk)
+                if self._fvp_risk is not None
+                else self._actor_critic.actor(self._fvp_obs)
+            )
         kl = torch.distributions.kl.kl_divergence(p_dist, q_dist).mean()
 
         grads = torch.autograd.grad(
@@ -125,6 +136,7 @@ class NaturalPG(PolicyGradient):
         logp: torch.Tensor,
         adv_r: torch.Tensor,
         adv_c: torch.Tensor,
+        risk: torch.Tensor | None = None,
     ) -> None:
         r"""Update policy network.
 
@@ -148,10 +160,13 @@ class NaturalPG(PolicyGradient):
             AssertionError: If :math:`\alpha` is not finite.
         """
         self._fvp_obs = obs[:: self._cfgs.algo_cfgs.fvp_sample_freq]
+        self._fvp_risk = (
+            risk[:: self._cfgs.algo_cfgs.fvp_sample_freq] if risk is not None else None
+        )
         theta_old = get_flat_params_from(self._actor_critic.actor)
         self._actor_critic.actor.zero_grad()
         adv = self._compute_adv_surrogate(adv_r, adv_c)
-        loss = self._loss_pi(obs, act, logp, adv)
+        loss = self._loss_pi(obs, act, logp, adv, risk=risk)
 
         loss.backward()
         distributed.avg_grads(self._actor_critic.actor)
@@ -169,7 +184,7 @@ class NaturalPG(PolicyGradient):
         set_param_values_to_model(self._actor_critic.actor, theta_new)
 
         with torch.no_grad():
-            loss = self._loss_pi(obs, act, logp, adv)
+            loss = self._loss_pi(obs, act, logp, adv, risk=risk)
 
         self._logger.store(
             {
@@ -215,11 +230,24 @@ class NaturalPG(PolicyGradient):
             train_data['adv_r'],
             train_data['adv_c'],
         )
-        self._update_actor(obs, act, logp, adv_r, adv_c)
+        # SRPL: the risk each action was taken under, carried through the critics' sampler too
+        # so obs and risk stay index-aligned when the batch is shuffled.
+        use_risk = bool(getattr(self._cfgs.model_cfgs, 'use_risk', False))
+        risk = train_data['risk'] if use_risk else None
+        if use_risk:
+            self._update_actor(obs, act, logp, adv_r, adv_c, risk=risk)
+        else:
+            self._update_actor(obs, act, logp, adv_r, adv_c)
 
         if self._sr_td_ridge:
             dataloader = DataLoader(
                 dataset=TensorDataset(obs, target_value_r, target_value_c, target_sr),
+                batch_size=self._cfgs.algo_cfgs.batch_size,
+                shuffle=True,
+            )
+        elif use_risk:
+            dataloader = DataLoader(
+                dataset=TensorDataset(obs, target_value_r, target_value_c, risk),
                 batch_size=self._cfgs.algo_cfgs.batch_size,
                 shuffle=True,
             )
@@ -234,13 +262,20 @@ class NaturalPG(PolicyGradient):
             for batch in dataloader:
                 if self._sr_td_ridge:
                     obs, target_value_r, target_value_c, target_sr = batch
+                elif use_risk:
+                    obs, target_value_r, target_value_c, risk = batch
                 else:
                     obs, target_value_r, target_value_c = batch
-                self._update_reward_critic(obs, target_value_r)
-                if self._cfgs.algo_cfgs.use_cost:
-                    self._update_cost_critic(obs, target_value_c)
-                if self._sr_td_ridge:
-                    self._update_successor_features(obs, target_sr)
+                if use_risk:
+                    self._update_reward_critic(obs, target_value_r, risk=risk)
+                    if self._cfgs.algo_cfgs.use_cost:
+                        self._update_cost_critic(obs, target_value_c, risk=risk)
+                else:
+                    self._update_reward_critic(obs, target_value_r)
+                    if self._cfgs.algo_cfgs.use_cost:
+                        self._update_cost_critic(obs, target_value_c)
+                    if self._sr_td_ridge:
+                        self._update_successor_features(obs, target_sr)
 
         self._logger.store(
             {

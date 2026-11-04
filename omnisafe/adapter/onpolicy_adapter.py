@@ -19,11 +19,19 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from torch import nn
 from rich.progress import track
 
 from omnisafe.adapter.online_adapter import OnlineAdapter
 from omnisafe.common.buffer import VectorOnPolicyBuffer
 from omnisafe.common.logger import Logger
+from omnisafe.utils.risk import (
+    RiskReplayBuffer,
+    compute_fear,
+    fear_to_binary,
+    fear_to_quantile,
+    quantile_bins,
+)
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
 from omnisafe.utils.config import Config
 
@@ -69,6 +77,96 @@ class OnPolicyAdapter(OnlineAdapter):
         use_sr = bool(self._cfgs.model_cfgs.get('use_successor_representation', False))
         return use_sr and self._cfgs.model_cfgs.sr_cfgs.get('sr_mode', 'shared_trunk') == 'td_ridge'
 
+    @property
+    def _use_risk(self) -> bool:
+        """Whether SRPL risk conditioning is active, read from cfgs like :attr:`_sr_td_ridge`."""
+        model_cfgs = getattr(self._cfgs, 'model_cfgs', None)
+        return bool(model_cfgs is not None and model_cfgs.get('use_risk', False))
+
+    def _risk_setup(self, agent: ConstraintActorCritic) -> None:
+        """Allocate the hindsight-label buffers this rollout will fill.
+
+        ``_risk_costs``/``_risk_obs`` accumulate each environment's episode as it happens, since
+        the label for a state -- how far it is from the nearest violation -- is only knowable
+        once the episode has finished.
+        """
+        risk_cfgs = self._cfgs.model_cfgs.risk_cfgs
+        self._risk_type = str(risk_cfgs.get('risk_type', 'quantile'))
+        self._risk_size = int(agent._risk_size)  # pylint: disable=protected-access
+        self._risk_bins = quantile_bins(
+            int(risk_cfgs.get('quantile_num', 10)),
+            int(risk_cfgs.get('quantile_size', 4)),
+        )
+        self._fear_radius = int(risk_cfgs.get('fear_radius', 5))
+        self._fine_tune_risk = bool(risk_cfgs.get('fine_tune_risk', True))
+        self._risk_update_period = int(risk_cfgs.get('risk_update_period', 10))
+        self._risk_batch_size = int(risk_cfgs.get('risk_batch_size', 5000))
+        if not hasattr(self, '_risk_replay'):
+            obs_dim = int(self._env.observation_space.shape[0])
+            self._risk_replay = RiskReplayBuffer(
+                capacity=int(risk_cfgs.get('risk_buffer_size', 100_000)),
+                obs_dim=obs_dim,
+                risk_size=self._risk_size,
+            )
+            weight = float(risk_cfgs.get('risk_weight', 1.0))
+            weights = torch.ones(self._risk_size)
+            # The nearest-to-violation bin is the rare and the important one; the reference
+            # up-weights it rather than letting the classifier collapse onto "far from harm".
+            weights[0] = weight
+            self._risk_criterion = nn.NLLLoss(weight=weights.to(self._device))
+            self._risk_step = 0
+        self._risk_obs = [[] for _ in range(self._env.num_envs)]
+        self._risk_costs = [[] for _ in range(self._env.num_envs)]
+
+    @torch.no_grad()
+    def _risk_estimate(self, agent: ConstraintActorCritic, obs: torch.Tensor) -> torch.Tensor:
+        """The estimator's current risk distribution for ``obs``, as probabilities.
+
+        ``no_grad`` deliberately: the estimator is a predictor of where violations happen, and
+        must not be shaped by the policy's objective. Exponentiated because the module returns
+        log-probabilities (the reference does the same before feeding the policy).
+        """
+        flat = obs.reshape(-1, obs.shape[-1])
+        return torch.exp(agent.risk_estimator(flat)).reshape(*obs.shape[:-1], self._risk_size)
+
+    def _risk_finish_episode(self, idx: int) -> None:
+        """Label one finished episode in hindsight and file it for training."""
+        if not self._risk_costs[idx]:
+            return
+        costs = torch.stack(self._risk_costs[idx])
+        obs = torch.stack(self._risk_obs[idx])
+        fear = compute_fear(costs)
+        labels = (
+            fear_to_quantile(fear, self._risk_bins)
+            if self._risk_type == 'quantile'
+            else fear_to_binary(fear, self._fear_radius)
+        )
+        self._risk_replay.add(obs, labels)
+        self._risk_obs[idx] = []
+        self._risk_costs[idx] = []
+
+    def _update_risk_model(self, agent: ConstraintActorCritic, logger: Logger) -> None:
+        """One gradient step on the risk estimator, if it is due and there is data."""
+        self._risk_step += 1
+        if (
+            not self._fine_tune_risk
+            or len(self._risk_replay) == 0
+            or self._risk_step % self._risk_update_period
+        ):
+            return
+        obs, labels = self._risk_replay.sample(self._risk_batch_size)
+        if obs.shape[0] < 2:
+            # Batch norm cannot normalize a batch of one.
+            return
+        agent.risk_estimator.train()
+        pred = agent.risk_estimator(obs.to(self._device))
+        loss = self._risk_criterion(pred, torch.argmax(labels.to(self._device), dim=1))
+        agent.risk_optimizer.zero_grad()
+        loss.backward()
+        agent.risk_optimizer.step()
+        agent.risk_estimator.eval()
+        logger.store({'Risk/Loss': loss.item()})
+
     def rollout(  # pylint: disable=too-many-locals
         self,
         steps_per_epoch: int,
@@ -91,16 +189,26 @@ class OnPolicyAdapter(OnlineAdapter):
         """
         self._reset_log()
         self._epoch_cost_sum = 0.0
+        if self._use_risk:
+            self._risk_setup(agent)
 
         obs, _ = self.reset()
         for step in track(
             range(steps_per_epoch),
             description=f'Processing rollout for epoch: {logger.current_epoch}...',
         ):
-            act, value_r, value_c, logp = agent.step(obs)
+            risk = self._risk_estimate(agent, obs) if self._use_risk else None
+            act, value_r, value_c, logp = agent.step(obs, risk=risk)
             if self._sr_td_ridge:
                 phi, psi = agent.sr_features(obs)
             next_obs, reward, cost, terminated, truncated, info = self.step(act)
+            if self._use_risk:
+                for env_idx in range(self._env.num_envs):
+                    # Labelled against next_obs, as in the reference: the risk of a state is
+                    # read from where the transition landed.
+                    self._risk_obs[env_idx].append(next_obs[env_idx].detach().cpu())
+                    self._risk_costs[env_idx].append(cost[env_idx].detach().cpu())
+                self._update_risk_model(agent, logger)
 
             self._log_value(reward=reward, cost=cost, info=info)
 
@@ -119,6 +227,10 @@ class OnPolicyAdapter(OnlineAdapter):
             }
             if self._sr_td_ridge:
                 store_kwargs.update(phi=phi, psi=psi)
+            if self._use_risk:
+                # Kept per step so the update re-conditions on the same risk the action was
+                # taken under, rather than on a re-estimate from a since-updated estimator.
+                store_kwargs['risk'] = risk
             buffer.store(**store_kwargs)
 
             obs = next_obs
@@ -138,12 +250,17 @@ class OnPolicyAdapter(OnlineAdapter):
                     last_psi = torch.zeros(agent.sr_trunk.sr_dim) if self._sr_td_ridge else None
                     if not done:
                         if epoch_end:
-                            _, last_value_r, last_value_c, _ = agent.step(obs[idx])
+                            _, last_value_r, last_value_c, _ = agent.step(
+                                obs[idx],
+                                risk=self._risk_estimate(agent, obs[idx]) if self._use_risk else None,
+                            )
                             if self._sr_td_ridge:
                                 _, last_psi = agent.sr_features(obs[idx])
                         if time_out:
+                            final_obs = info['final_observation'][idx]
                             _, last_value_r, last_value_c, _ = agent.step(
-                                info['final_observation'][idx],
+                                final_obs,
+                                risk=self._risk_estimate(agent, final_obs) if self._use_risk else None,
                             )
                             if self._sr_td_ridge:
                                 _, last_psi = agent.sr_features(info['final_observation'][idx])
@@ -151,6 +268,8 @@ class OnPolicyAdapter(OnlineAdapter):
                         last_value_c = last_value_c.unsqueeze(0)
 
                     if done or time_out:
+                        if self._use_risk:
+                            self._risk_finish_episode(idx)
                         self._log_metrics(logger, idx)
                         self._reset_log(idx)
 

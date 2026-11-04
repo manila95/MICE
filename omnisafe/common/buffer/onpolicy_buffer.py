@@ -112,6 +112,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         value_target_method: str | None = None,
         cost_value_target_method: str | None = None,
         sr_dim: int | None = None,
+        risk_size: int | None = None,
         lam_sr: float = 0.95,
         gamma_sr: float | None = None,
         use_cost_bias_in_target: bool = False,
@@ -180,6 +181,12 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         # stream ``phi``/``psi`` trained with the same estimator machinery as the scalar
         # reward/cost streams above (see :meth:`finish_path`).
         self._sr_dim: int | None = sr_dim
+        # SRPL: the risk vector the action at each step was conditioned on, kept so the update
+        # re-conditions on exactly that rather than on a re-estimate from a since-updated
+        # estimator (see OnPolicyAdapter.rollout).
+        self._risk_size: int | None = risk_size
+        if risk_size is not None:
+            self.data['risk'] = torch.zeros((size, risk_size), dtype=torch.float32, device=device)
         self._lam_sr: float = lam_sr
         self._gamma_sr: float = gamma if gamma_sr is None else gamma_sr
         if self._sr_dim is not None:
@@ -411,6 +418,8 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             'adv_c': self.data['adv_c'],
             'target_value_c': self.data['target_value_c'],
         }
+        if self._risk_size is not None:
+            data['risk'] = self.data['risk']
         if self._sr_dim is not None:
             data['phi'] = self.data['phi']
             data['target_sr'] = self.data['target_sr']

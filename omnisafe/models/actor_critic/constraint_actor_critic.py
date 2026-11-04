@@ -25,6 +25,7 @@ from torch import optim
 from omnisafe.models.actor_critic.actor_critic import ActorCritic
 from omnisafe.models.base import Critic
 from omnisafe.models.critic.critic_builder import CriticBuilder
+from omnisafe.models.risk_net import RiskGaussianLearningActor, RiskVCritic
 from omnisafe.models.critic.successor_representation_critic import (
     SuccessorRepresentationLinearReadout,
     SuccessorRepresentationReadout,
@@ -33,6 +34,7 @@ from omnisafe.models.critic.successor_representation_critic import (
 )
 from omnisafe.typing import OmnisafeSpace
 from omnisafe.utils.config import ModelConfig
+from omnisafe.utils.risk import BayesRiskEst
 
 
 class ConstraintActorCritic(ActorCritic):
@@ -151,9 +153,11 @@ class ConstraintActorCritic(ActorCritic):
                     lr=model_cfgs.critic.lr,
                     weight_decay=float(_cost_or_shared('weight_decay', 0.0) or 0.0),
                 )
+            self._build_risk_models(obs_space, act_space, model_cfgs)
             return
 
         self._build_successor_representation_critics(obs_space, act_space, model_cfgs)
+        self._build_risk_models(obs_space, act_space, model_cfgs)
 
     def _build_successor_representation_critics(
         self,
@@ -443,10 +447,88 @@ class ConstraintActorCritic(ActorCritic):
             psi = self.sr_trunk.psi(obs, z=z)
         return phi, psi
 
+    def _build_risk_models(
+        self,
+        obs_space: OmnisafeSpace,
+        act_space: OmnisafeSpace,
+        model_cfgs: ModelConfig,
+    ) -> None:
+        """Swap in risk-conditioned networks and build the risk estimator, under ``use_risk``.
+
+        SRPL conditions the policy and both value functions on an estimate of how close the
+        current state is to a constraint violation (see :mod:`omnisafe.utils.risk`). The
+        estimator itself is an ordinary classifier trained on hindsight labels; it is held here
+        so that it moves with ``.to(device)`` and is checkpointed alongside the policy, and its
+        optimizer sits next to the critics' for the same reason.
+
+        The plain networks built by the base class are replaced rather than conditionally not
+        built, which keeps every non-risk run on exactly the code path it had before -- the cost
+        is constructing a few MLPs that are then discarded, once, at startup.
+        """
+        self._use_risk: bool = bool(model_cfgs.get('use_risk', False))
+        if not self._use_risk:
+            self.risk_estimator = None
+            return
+
+        risk_cfgs = model_cfgs.risk_cfgs
+        risk_type = str(risk_cfgs.get('risk_type', 'quantile'))
+        if risk_type not in ('quantile', 'binary'):
+            raise ValueError(f"risk_type must be 'quantile' or 'binary', got {risk_type!r}.")
+        self._risk_size: int = (
+            int(risk_cfgs.get('quantile_num', 10)) if risk_type == 'quantile' else 2
+        )
+
+        self.actor = RiskGaussianLearningActor(
+            obs_space=obs_space,
+            act_space=act_space,
+            hidden_sizes=model_cfgs.actor.hidden_sizes,
+            activation=model_cfgs.actor.activation,
+            weight_initialization_mode=model_cfgs.weight_initialization_mode,
+            risk_size=self._risk_size,
+        )
+        self.add_module('actor', self.actor)
+
+        for name, cfgs, stream in (
+            ('reward_critic', model_cfgs.critic, 'r'),
+            ('cost_critic', model_cfgs.critic, 'c'),
+        ):
+            critic = RiskVCritic(
+                obs_space=obs_space,
+                act_space=act_space,
+                hidden_sizes=cfgs.hidden_sizes,
+                activation=cfgs.activation,
+                weight_initialization_mode=model_cfgs.weight_initialization_mode,
+                num_critics=1,
+                risk_size=self._risk_size,
+                stream=stream,
+            )
+            setattr(self, name, critic)
+            self.add_module(name, critic)
+
+        obs_dim = int(obs_space.shape[0])  # type: ignore[union-attr]
+        self.risk_estimator = BayesRiskEst(
+            obs_size=obs_dim,
+            out_size=self._risk_size,
+            batch_norm=bool(risk_cfgs.get('batch_norm', True)),
+        )
+        self.add_module('risk_estimator', self.risk_estimator)
+        # Batch norm: kept in eval() except during its own update, so a rollout's single-step
+        # batch is normalized by the running statistics rather than by itself.
+        self.risk_estimator.eval()
+        path = risk_cfgs.get('risk_model_path', None)
+        if path:
+            self.risk_estimator.load_state_dict(torch.load(path, map_location='cpu'))
+        self.risk_optimizer: optim.Optimizer = optim.Adam(
+            self.risk_estimator.parameters(),
+            lr=float(risk_cfgs.get('risk_lr', 1e-5)),
+            eps=1e-10,
+        )
+
     def step(
         self,
         obs: torch.Tensor,
         deterministic: bool = False,
+        risk: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Choose action based on observation.
 
@@ -462,10 +544,14 @@ class ConstraintActorCritic(ActorCritic):
             log_prob: The log probability of the action.
         """
         with torch.no_grad():
-            value_r = self.reward_critic(obs)
-            value_c = self.cost_critic(obs)
-
-            action = self.actor.predict(obs, deterministic=deterministic)
+            if self._use_risk:
+                value_r = self.reward_critic(obs, risk)
+                value_c = self.cost_critic(obs, risk)
+                action = self.actor.predict(obs, deterministic=deterministic, risk=risk)
+            else:
+                value_r = self.reward_critic(obs)
+                value_c = self.cost_critic(obs)
+                action = self.actor.predict(obs, deterministic=deterministic)
             log_prob = self.actor.log_prob(action)
 
         return action, value_r[0], value_c[0], log_prob
@@ -474,6 +560,7 @@ class ConstraintActorCritic(ActorCritic):
         self,
         obs: torch.Tensor,
         deterministic: bool = False,
+        risk: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Choose action based on observation.
 
@@ -488,4 +575,4 @@ class ConstraintActorCritic(ActorCritic):
             value_c: The cost value of the observation.
             log_prob: The log probability of the action.
         """
-        return self.step(obs, deterministic=deterministic)
+        return self.step(obs, deterministic=deterministic, risk=risk)

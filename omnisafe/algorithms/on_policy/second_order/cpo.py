@@ -74,6 +74,7 @@ class CPO(TRPO):
         decay: float = 0.8,
         violation_c: int = 0,
         optim_case: int = 0,
+        risk: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, int]:
         r"""Use line-search to find the step size that satisfies the constraint.
 
@@ -126,14 +127,18 @@ class CPO(TRPO):
             with torch.no_grad():
                 try:
                     # loss of policy reward from target/expected reward
-                    loss_reward = self._loss_pi(obs=obs, act=act, logp=logp, adv=adv_r)
+                    loss_reward = self._loss_pi(obs=obs, act=act, logp=logp, adv=adv_r, risk=risk)
                 except ValueError:
                     step_frac *= decay
                     continue
                 # loss of cost of policy cost from real/expected reward
-                loss_cost = self._loss_pi_cost(obs=obs, act=act, logp=logp, adv_c=adv_c)
+                loss_cost = self._loss_pi_cost(obs=obs, act=act, logp=logp, adv_c=adv_c, risk=risk)
                 # compute KL distance between new and old policy
-                q_dist = self._actor_critic.actor(obs)
+                q_dist = (
+            self._actor_critic.actor(obs, risk)
+            if risk is not None
+            else self._actor_critic.actor(obs)
+        )
                 kl = torch.distributions.kl.kl_divergence(p_dist, q_dist).mean()
             # compute improvement of reward
             loss_reward_improve = loss_reward_before - loss_reward
@@ -189,6 +194,7 @@ class CPO(TRPO):
         act: torch.Tensor,
         logp: torch.Tensor,
         adv_c: torch.Tensor,
+        risk: torch.Tensor | None = None,
     ) -> torch.Tensor:
         r"""Compute the performance of cost on this moment.
 
@@ -210,7 +216,10 @@ class CPO(TRPO):
         Returns:
             The loss of the cost performance.
         """
-        self._actor_critic.actor(obs)
+        if risk is not None:
+            self._actor_critic.actor(obs, risk)
+        else:
+            self._actor_critic.actor(obs)
         logp_ = self._actor_critic.actor.log_prob(act)
         ratio = torch.exp(logp_ - logp)
         return (ratio * adv_c).mean()
@@ -348,6 +357,7 @@ class CPO(TRPO):
         logp: torch.Tensor,
         adv_r: torch.Tensor,
         adv_c: torch.Tensor,
+        risk: torch.Tensor | None = None,
     ) -> None:
         """Update policy network.
 
@@ -386,11 +396,18 @@ class CPO(TRPO):
             self._logger.store({'Train/CostAdvShrinkage': cost_adv_shrinkage})
 
         self._fvp_obs = obs[:: self._cfgs.algo_cfgs.fvp_sample_freq]
+        self._fvp_risk = (
+            risk[:: self._cfgs.algo_cfgs.fvp_sample_freq] if risk is not None else None
+        )
         theta_old = get_flat_params_from(self._actor_critic.actor)
         self._actor_critic.actor.zero_grad()
-        loss_reward = self._loss_pi(obs, act, logp, adv_r)
+        loss_reward = self._loss_pi(obs, act, logp, adv_r, risk=risk)
         loss_reward_before = distributed.dist_avg(loss_reward)
-        p_dist = self._actor_critic.actor(obs)
+        p_dist = (
+            self._actor_critic.actor(obs, risk)
+            if risk is not None
+            else self._actor_critic.actor(obs)
+        )
 
         loss_reward.backward()
         distributed.avg_grads(self._actor_critic.actor)
@@ -403,7 +420,7 @@ class CPO(TRPO):
         alpha = torch.sqrt(2 * self._cfgs.algo_cfgs.target_kl / (xHx + 1e-8))
 
         self._actor_critic.zero_grad()
-        loss_cost = self._loss_pi_cost(obs, act, logp, adv_c)
+        loss_cost = self._loss_pi_cost(obs, act, logp, adv_c, risk=risk)
         loss_cost_before = distributed.dist_avg(loss_cost)
 
         loss_cost.backward()
@@ -466,14 +483,15 @@ class CPO(TRPO):
             total_steps=20,
             violation_c=ep_costs,
             optim_case=optim_case,
+            risk=risk,
         )
 
         theta_new = theta_old + step_direction
         set_param_values_to_model(self._actor_critic.actor, theta_new)
 
         with torch.no_grad():
-            loss_reward = self._loss_pi(obs, act, logp, adv_r)
-            loss_cost = self._loss_pi_cost(obs, act, logp, adv_c)
+            loss_reward = self._loss_pi(obs, act, logp, adv_r, risk=risk)
+            loss_cost = self._loss_pi_cost(obs, act, logp, adv_c, risk=risk)
             loss = loss_reward + loss_cost
 
         self._logger.store(

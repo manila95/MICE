@@ -278,6 +278,33 @@ defaults:
     window_lens: 100
   # model configurations
   model_cfgs:
+    # SRPL: condition the actor and both critics on an estimate of how close the current state
+    # is to a constraint violation. False leaves the algorithm exactly as it was.
+    use_risk: False
+    risk_cfgs:
+      # 'quantile' buckets the distance-to-violation into quantile_num bins; 'binary' is
+      # "within fear_radius steps of a violation, or not".
+      risk_type: quantile
+      # number of bins, and how many steps wide each one is
+      quantile_num: 10
+      quantile_size: 4
+      # horizon for the binary variant
+      fear_radius: 5
+      # learning rate for the risk estimator
+      risk_lr: 0.00001
+      # batch norm inside the estimator
+      batch_norm: True
+      # keep training the estimator online from the agent's own episodes
+      fine_tune_risk: True
+      # how many states per estimator update, and how often to take one (in env steps)
+      risk_batch_size: 5000
+      risk_update_period: 10
+      # up-weights the nearest-to-violation class, which is the rare one
+      risk_weight: 1.0
+      # states retained for estimator training
+      risk_buffer_size: 100000
+      # optional pretrained estimator to start from
+      risk_model_path: ~
     # weight initialization mode
     weight_initialization_mode: "kaiming_uniform"
     # actor type, options: gaussian, gaussian_learning
