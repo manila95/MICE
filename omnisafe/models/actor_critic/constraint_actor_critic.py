@@ -501,6 +501,7 @@ class ConstraintActorCritic(ActorCritic):
         # Batch norm: kept in eval() except during its own update, so a rollout's single-step
         # batch is normalized by the running statistics rather than by itself.
         self.risk_estimator.eval()
+        self.actor.attach_risk_estimator(self.risk_estimator)
         path = risk_cfgs.get('risk_model_path', None)
         if path:
             self.risk_estimator.load_state_dict(torch.load(path, map_location='cpu'))

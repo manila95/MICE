@@ -105,6 +105,10 @@ class RiskGaussianLearningActor(GaussianLearningActor):
     ) -> None:
         """Initialize an instance of :class:`RiskGaussianLearningActor`."""
         super().__init__(obs_space, act_space, hidden_sizes, activation, weight_initialization_mode)
+        # A list, not a plain attribute: nn.Module registers Module-valued attributes, and the
+        # estimator's parameters must not end up in actor.parameters() -- the actor's optimizer,
+        # the Fisher-vector product and set_param_values_to_model all iterate that.
+        self._risk_source: list = []
         self.mean = RiskNet(
             sizes=[self._obs_dim, *self._hidden_sizes, self._act_dim],
             risk_size=risk_size,
@@ -112,13 +116,36 @@ class RiskGaussianLearningActor(GaussianLearningActor):
             weight_initialization_mode=weight_initialization_mode,
         )
 
+    def attach_risk_estimator(self, estimator: nn.Module) -> None:
+        """Let the actor estimate risk itself when a caller does not supply it.
+
+        The training loop always passes the risk explicitly -- the value stored at rollout time,
+        which is what the action was actually taken under. Everything else that reaches the actor
+        (the value-evaluation studies, video recording, any ad-hoc ``actor(obs)``) has no risk to
+        hand and should not have to: the estimate is a deterministic function of the observation,
+        so the actor can recover it. Without this each such call site would have to be found and
+        threaded individually, and a missed one is a crash.
+        """
+        self._risk_source = [estimator]
+
+    def _resolve_risk(self, obs: torch.Tensor, risk: torch.Tensor | None) -> torch.Tensor:
+        """The supplied risk, or a fresh estimate when none was given."""
+        if risk is not None:
+            return risk
+        if not self._risk_source:
+            return _check_risk(None, 'actor')
+        with torch.no_grad():
+            flat = obs.reshape(-1, obs.shape[-1])
+            estimate = torch.exp(self._risk_source[0](flat))
+        return estimate.reshape(*obs.shape[:-1], estimate.shape[-1])
+
     def _distribution(  # type: ignore[override]
         self,
         obs: torch.Tensor,
         risk: torch.Tensor | None = None,
     ) -> Normal:
         """The action distribution at ``obs`` given its risk estimate."""
-        mean = self.mean(obs, _check_risk(risk, 'actor'))
+        mean = self.mean(obs, self._resolve_risk(obs, risk))
         return Normal(mean, torch.exp(self.log_std))
 
     def predict(  # type: ignore[override]
