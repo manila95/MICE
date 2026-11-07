@@ -36,6 +36,13 @@ class MujocoEnv(CMDP):
     """
 
     need_auto_reset_wrapper = True
+    # The value-eval studies run through omnisafe.utils.isolated_eval for these envs. Not for
+    # MetaDrive's reason (a singleton engine) but for the other two the standalone path
+    # handles: a plain Gymnasium MuJoCo env is not a safety_gymnasium Builder, so the
+    # snapshot/restore the intermediate study needs does not exist for it; and its episodes
+    # end on termination (an unhealthy Ant falls over in tens of steps), which breaks the
+    # shared rollout loop's assumption that every probe reaches done at max_episode_steps.
+    eval_needs_isolated_process: bool = True
 
     need_time_limit_wrapper = False
     need_action_repeat_wrapper = True
@@ -75,9 +82,14 @@ class MujocoEnv(CMDP):
         self._num_envs = num_envs
         self._device = torch.device(device)
 
-        # Plain gymnasium Mujoco envs have no lidar; drop it rather than
-        # forwarding it to the constructor (mirrors SafetyGymnasiumEnv).
-        kwargs.pop('lidar_num_bins', None)
+        # env_cfgs is one flat block shared by every env class, so Safety-Gymnasium task
+        # options arrive here too. A plain Gymnasium MuJoCo env has no lidar and no hazards and
+        # rejects them outright, so drop them rather than forward them.
+        for task_only in ('lidar_num_bins', 'hazards_num'):
+            kwargs.pop(task_only, None)
+        # `~` in the configs means "leave the environment's own default"; forwarding that as an
+        # explicit None is a different thing to gymnasium.make, which has no such convention.
+        kwargs = {key: value for key, value in kwargs.items() if value is not None}
 
         if num_envs > 1:
             self._env = gymnasium.vector.make(env_id, num_envs=num_envs, **kwargs)

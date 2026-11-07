@@ -26,10 +26,14 @@ relaxing the shared code (which would change behaviour for every other env):
   not on a time limit, so they have different lengths and the shared rollout loop's "every probe
   is done at exactly ``max_episode_steps``" assumption does not hold. The loops here stop at each
   episode's own ``done`` and discount accordingly.
-- **No horizon at all.** ``config['horizon']`` is ``None``, and an episode that never crashes
-  never ends (a zero-action car simply idles indefinitely), so every rollout needs an explicit
-  cap -- ``algo_cfgs.isolated_eval_episode_cap``. A rollout stopped by that cap is not a terminal
-  state, so it is bootstrapped with the critic's own value exactly as a time-limit truncation is.
+- **No horizon at all.** MetaDrive's ``config['horizon']`` can be ``None``, and an episode that
+  never crashes never ends (a zero-action car simply idles indefinitely), so every rollout needs
+  a horizon -- taken from the environment's declared one where it has it, otherwise from
+  ``algo_cfgs.isolated_eval_episode_cap``. A rollout stopped there is not a terminal state, so it
+  is bootstrapped with the critic's own value exactly as a time-limit truncation is.
+- **Intermediate positions are fractions of each episode's own length.** A fixed step index only
+  means something when episodes reach it; here they mostly do not, so the study is keyed by
+  fraction and each episode is read at its own scaled index.
 
 **Snapshots are not used.** The intermediate-state study here is a single on-policy pass: roll an
 episode, read ``V(s_t)`` at each configured position, and take the realized discounted
@@ -69,7 +73,7 @@ def env_needs_isolated_eval(env_id: str) -> bool:
     return bool(getattr(env_class, 'eval_needs_isolated_process', False))
 
 
-def resolve_episode_cap(cfgs) -> tuple[int, str]:
+def resolve_episode_cap(cfgs, env_id: str | None = None) -> tuple[int, str]:
     """Episode horizon to roll the isolated studies out for, and where it came from.
 
     Prefer a horizon the environment itself declares in ``env_cfgs`` (MetaDrive takes one as
@@ -89,6 +93,16 @@ def resolve_episode_cap(cfgs) -> tuple[int, str]:
         for key, value in env_cfgs.items():
             if isinstance(value, dict) and value.get('horizon'):
                 return int(value['horizon']), f'env_cfgs.{key}.horizon'
+    if env_id is not None:
+        # A registered time limit is the same horizon training runs under.
+        try:
+            import gymnasium  # noqa: PLC0415
+
+            spec_steps = gymnasium.spec(env_id).max_episode_steps
+        except Exception:  # noqa: BLE001 # pylint: disable=broad-except
+            spec_steps = None
+        if spec_steps:
+            return int(spec_steps), f'{env_id} registered max_episode_steps'
     return (
         int(getattr(cfgs.algo_cfgs, 'isolated_eval_episode_cap', 1500)),
         'algo_cfgs.isolated_eval_episode_cap',
@@ -375,21 +389,28 @@ def _child(queue, payload: dict) -> None:
 
         # Intermediate-state study: one on-policy episode per probe, read at each position. No
         # snapshot/restore is involved -- see this module's docstring.
-        positions = payload['positions']
-        per_pos: dict[int, list[dict]] = {pos: [] for pos in positions}
+        # Positions are fractions of each episode's own length, not fixed step indices. These
+        # environments end on termination -- an unhealthy Ant falls over in tens of steps against
+        # a 1000-step limit -- so a fixed index is past the end of most episodes and the deep
+        # ones collect nothing. Scaling per episode puts every probe at the same *relative* point
+        # in its own trajectory, which is the comparable quantity here, and gives every fraction
+        # the full probe count. Results are keyed by the fraction, so a column means the same
+        # thing from epoch to epoch even as episodes lengthen.
+        fractions = sorted(f for f in payload['position_fractions'] if 0 < f < 1)
+        per_pos: dict[float, list[dict]] = {f: [] for f in fractions}
         for i in range(payload['interm_probes']):
             seed = payload['interm_base_seed'] + i
             ep = _roll_one_episode(agent, env, seed, cap, scenario_count)
             result['episode_lengths'].append(int(len(ep['rewards'])))
-            for pos in positions:
-                if pos >= len(ep['rewards']):
-                    # This episode ended before the position -- that state was never visited, so
-                    # there is nothing to score. Positions deep into the episode therefore get
-                    # fewer probes than shallow ones, which NumProbes records per position.
-                    continue
+            length = len(ep['rewards'])
+            if length < 2:
+                # Nothing to look at part-way through a one-step episode.
+                continue
+            for frac in fractions:
+                pos = min(max(int(round(frac * length)), 0), length - 1)
                 ret_r, ret_c = _return_from(ep, pos, discount_r, discount_c)
                 tgt_r, tgt_c = _target_from(ep, pos, cfgs, discount_r, discount_c)
-                per_pos[pos].append({
+                per_pos[frac].append({
                     'seed': seed,
                     'pred_r': float(ep['values_r'][pos]), 'pred_c': float(ep['values_c'][pos]),
                     'returns_r': [ret_r], 'returns_c': [ret_c],
@@ -397,9 +418,9 @@ def _child(queue, payload: dict) -> None:
                     'obs': [ep['obs'][pos]], 'act': [ep['act'][pos]],
                 })
         result['intermediate'] = {
-            pos: _assemble(entries, 1, '') for pos, entries in per_pos.items() if entries
+            frac: _assemble(entries, 1, '') for frac, entries in per_pos.items() if entries
         }
-        result['skipped_positions'] = [pos for pos, entries in per_pos.items() if not entries]
+        result['skipped_positions'] = [f for f, entries in per_pos.items() if not entries]
         env.close()
         queue.put(('ok', result))
     except Exception:  # noqa: BLE001 # pylint: disable=broad-except
@@ -421,7 +442,8 @@ def run_isolated_value_studies(
     probe_seeds: list[int],
     mc_repeats: int,
     positions: list[int],
-    interm_probes: int,
+    position_fractions: list[float] | None = None,
+    interm_probes: int = 20,
     interm_base_seed: int,
     discount_r: float,
     discount_c: float,
@@ -444,6 +466,7 @@ def run_isolated_value_studies(
         'norm_state': norm_state, 'obs_normalize': obs_normalize,
         'probe_seeds': list(probe_seeds), 'mc_repeats': int(mc_repeats),
         'positions': list(positions), 'interm_probes': int(interm_probes),
+        'position_fractions': list(position_fractions or []),
         'interm_base_seed': int(interm_base_seed),
         'discount_r': float(discount_r), 'discount_c': float(discount_c),
         'episode_cap': int(episode_cap),

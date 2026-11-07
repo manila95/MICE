@@ -249,16 +249,24 @@ class PolicyGradient(BaseAlgo):
                 ),
             )
             if self._use_isolated_eval:
-                # Same horizon the study itself rolls out for -- these envs expose no
-                # max_episode_steps, so it comes from the config (see resolve_episode_cap).
-                max_eps, _ = resolve_episode_cap(self._cfgs)
-            else:
-                max_eps = self._mc_intermediate_max_episode_steps
-                if max_eps is None:
-                    try:
-                        max_eps = gymnasium.spec(self._env_id).max_episode_steps
-                    except Exception:  # noqa: BLE001 # pylint: disable=broad-except
-                        max_eps = None
+                # These environments read each episode at a fraction of its own length rather
+                # than at a fixed step (see omnisafe.utils.isolated_eval), so the fractions
+                # themselves are the study's keys -- stable across epochs, unlike a step index
+                # that would move as episodes lengthen.
+                self._intermediate_positions = sorted(
+                    f for f in configured if 0 < f < 1
+                )
+                self._intermediate_positions_dropped = [f for f in configured if not 0 < f < 1]
+                self._intermediate_positions_limit, _ = resolve_episode_cap(
+                    self._cfgs, self._env_id,
+                )
+                return self._intermediate_positions
+            max_eps = self._mc_intermediate_max_episode_steps
+            if max_eps is None:
+                try:
+                    max_eps = gymnasium.spec(self._env_id).max_episode_steps
+                except Exception:  # noqa: BLE001 # pylint: disable=broad-except
+                    max_eps = None
             self._intermediate_positions, self._intermediate_positions_dropped = (
                 resolve_study_positions(configured, max_eps)
             )
@@ -1046,7 +1054,7 @@ class PolicyGradient(BaseAlgo):
             env_cfgs = self._cfgs.env_cfgs.todict()
         normalizer = _find_obs_normalizer(self._env._env)
         interm_probes = int(getattr(self._cfgs.algo_cfgs, 'intermediate_state_study_probes', 20))
-        cap, cap_source = resolve_episode_cap(self._cfgs)
+        cap, cap_source = resolve_episode_cap(self._cfgs, self._env_id)
         if not self._isolated_cap_logged:
             self._isolated_cap_logged = True
             self._logger.log(f'INFO: isolated value study horizon {cap} (from {cap_source}).')
@@ -1063,7 +1071,8 @@ class PolicyGradient(BaseAlgo):
             obs_normalize=self._cfgs.algo_cfgs.obs_normalize,
             probe_seeds=self._mc_probe_seeds,
             mc_repeats=int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_repeats', 5)),
-            positions=self._intermediate_study_positions(),
+            positions=[],
+            position_fractions=self._intermediate_study_positions(),
             interm_probes=interm_probes,
             interm_base_seed=700_000 + epoch * interm_probes,
             discount_r=self._cfgs.algo_cfgs.gamma,
