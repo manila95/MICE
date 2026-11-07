@@ -67,6 +67,11 @@ class ConstraintActorCritic(ActorCritic):
         trunk still fits its reward read-out ``w_r`` every update for diagnostic parity with the
         non-``cost_only`` run; it is simply never consulted by the actual reward critic.
 
+        ``model_cfgs.sr_cfgs.reward_only`` is the mirror image: ``cost_critic`` is the plain,
+        independent critic and the trunk backs ``reward_critic`` alone. The two are mutually
+        exclusive -- each asks for the *other* stream to be the plain critic, so together they
+        would leave the successor representation backing neither.
+
     Args:
         obs_space (OmnisafeSpace): The observation space.
         act_space (OmnisafeSpace): The action space.
@@ -98,10 +103,22 @@ class ConstraintActorCritic(ActorCritic):
         self._sr_cost_only: bool = (
             bool(model_cfgs.sr_cfgs.get('cost_only', False)) if self._use_sr else False
         )
-        if self._sr_cost_only and self._sr_mode != 'td_ridge':
-            raise NotImplementedError(
-                'model_cfgs.sr_cfgs.cost_only is only supported under sr_mode == "td_ridge", '
-                f'got sr_mode "{self._sr_mode}".',
+        # sr_cfgs.reward_only: the mirror image -- cost_critic becomes the plain, independent
+        # critic and the trunk backs reward_critic alone.
+        self._sr_reward_only: bool = (
+            bool(model_cfgs.sr_cfgs.get('reward_only', False)) if self._use_sr else False
+        )
+        for name, flag in (('cost_only', self._sr_cost_only), ('reward_only', self._sr_reward_only)):
+            if flag and self._sr_mode != 'td_ridge':
+                raise NotImplementedError(
+                    f'model_cfgs.sr_cfgs.{name} is only supported under sr_mode == "td_ridge", '
+                    f'got sr_mode "{self._sr_mode}".',
+                )
+        if self._sr_cost_only and self._sr_reward_only:
+            raise ValueError(
+                'model_cfgs.sr_cfgs.cost_only and reward_only are mutually exclusive: each asks '
+                'for the *other* stream to be the plain critic, so together they would leave the '
+                'successor representation backing neither.',
             )
 
         if not self._use_sr:
@@ -304,14 +321,34 @@ class ConstraintActorCritic(ActorCritic):
             # functional -- see SuccessorRepresentationLinearReadout.value_clip's docstring.
             # None (the default) reproduces the unclamped behavior exactly.
             cost_value_clip = sr_cfgs.get('cost_value_clip', None)
-            self.cost_critic = SuccessorRepresentationLinearReadout(
-                obs_space,
-                act_space,
-                trunk,
-                'w_c',
-                model_cfgs.weight_initialization_mode,
-                value_clip=tuple(cost_value_clip) if cost_value_clip is not None else None,
-            )
+            if self._sr_reward_only:
+                # Mirror of the cost_only branch above: a genuine standalone VCritic on the
+                # plain model_cfgs.critic.* knobs, with the trunk backing reward alone. The
+                # trunk still fits w_c each update, for the same diagnostic parity; it simply
+                # never backs an actual critic. cost_value_clip governs the SR cost read-out
+                # and so does not apply here.
+                self.cost_critic = CriticBuilder(
+                    obs_space=obs_space,
+                    act_space=act_space,
+                    hidden_sizes=model_cfgs.critic.hidden_sizes,
+                    activation=model_cfgs.critic.activation,
+                    weight_initialization_mode=model_cfgs.weight_initialization_mode,
+                    num_critics=1,
+                    use_obs_encoder=False,
+                    dropout=float(model_cfgs.critic.get('dropout', 0.0) or 0.0),
+                    use_layer_norm=bool(model_cfgs.critic.get('use_layer_norm', False)),
+                    use_spectral_norm=bool(model_cfgs.critic.get('use_spectral_norm', False)),
+                ).build_critic('v')
+                self.cost_critic.eval()
+            else:
+                self.cost_critic = SuccessorRepresentationLinearReadout(
+                    obs_space,
+                    act_space,
+                    trunk,
+                    'w_c',
+                    model_cfgs.weight_initialization_mode,
+                    value_clip=tuple(cost_value_clip) if cost_value_clip is not None else None,
+                )
             self.sr_trunk = trunk
             # The trunk parameters (trunk body + phi_head + psi_head) are trained by the value /
             # SR-feature losses through the shared sr_optimizer. Under readout='sgd', w_r / w_c are
@@ -371,21 +408,32 @@ class ConstraintActorCritic(ActorCritic):
                 lr=sr_cfgs.lr,
                 weight_decay=float(sr_cfgs.get('weight_decay', 0.0) or 0.0),
             )
-            self.cost_critic_optimizer: optim.Optimizer = sr_optimizer
             self.sr_optimizer: optim.Optimizer = sr_optimizer
             self.reward_critic_optimizer: optim.Optimizer
-            if self._sr_cost_only:
+            self.cost_critic_optimizer: optim.Optimizer
+
+            def _plain_critic_optimizer(critic: Critic) -> optim.Optimizer | None:
                 # Trained the normal way, on the standard critic learning rate -- not sr_cfgs.lr,
-                # which governs the SR trunk/cost-critic optimizer above. AdamW for the same
-                # decoupled-weight-decay reason as sr_optimizer above.
-                if model_cfgs.critic.lr is not None:
-                    self.reward_critic_optimizer = optim.AdamW(
-                        self.reward_critic.parameters(),
-                        lr=model_cfgs.critic.lr,
-                        weight_decay=float(model_cfgs.critic.get('weight_decay', 0.0) or 0.0),
-                    )
-            else:
-                self.reward_critic_optimizer = sr_optimizer
+                # which governs the SR trunk's optimizer above. AdamW for the same
+                # decoupled-weight-decay reason as sr_optimizer.
+                if model_cfgs.critic.lr is None:
+                    return None
+                return optim.AdamW(
+                    critic.parameters(),
+                    lr=model_cfgs.critic.lr,
+                    weight_decay=float(model_cfgs.critic.get('weight_decay', 0.0) or 0.0),
+                )
+
+            self.reward_critic_optimizer = sr_optimizer
+            self.cost_critic_optimizer = sr_optimizer
+            if self._sr_cost_only:
+                optimizer = _plain_critic_optimizer(self.reward_critic)
+                if optimizer is not None:
+                    self.reward_critic_optimizer = optimizer
+            elif self._sr_reward_only:
+                optimizer = _plain_critic_optimizer(self.cost_critic)
+                if optimizer is not None:
+                    self.cost_critic_optimizer = optimizer
             # Under readout='sgd', w_r / w_c get their own optimizer so their regression loss
             # never shares Adam state with (or steps) the representation parameters. Its
             # weight_decay is the SGD analogue of the ridge kappa -- explicit L2 on w_r / w_c.

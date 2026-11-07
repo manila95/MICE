@@ -124,6 +124,16 @@ class ConstraintActorQCritic(ActorQCritic):
         self._sr_cost_only: bool = (
             bool(model_cfgs.sr_cfgs.get('cost_only', False)) if self._use_sr else False
         )
+        # reward_only is the on-policy mirror of cost_only (see ConstraintActorCritic). It is
+        # not implemented for the Q-critic path, where it would also have to mirror the psi-head
+        # count, the target-network deepcopy wiring and the polyak dedup -- so it raises here
+        # rather than being silently ignored by a run that asked for it.
+        if bool(model_cfgs.sr_cfgs.get('reward_only', False)) if self._use_sr else False:
+            raise NotImplementedError(
+                'model_cfgs.sr_cfgs.reward_only is implemented for the on-policy actor-critic '
+                'only; this off-policy (Q-critic) path supports cost_only. Use cost_only, or '
+                'ask for reward_only to be mirrored here.',
+            )
         if self._sr_cost_only and self._sr_mode != 'td_ridge':
             raise NotImplementedError(
                 'model_cfgs.sr_cfgs.cost_only is only supported under sr_mode == "td_ridge", '

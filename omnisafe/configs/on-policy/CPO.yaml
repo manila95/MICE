@@ -444,6 +444,11 @@ defaults:
       # non-cost_only run; it is simply never read out into an actual critic. Ignored (raises)
       # under sr_mode: 'shared_trunk'.
       cost_only: false
+      # the mirror image of cost_only: train the *cost* critic the normal way and give the SR
+      # trunk to the reward critic alone. Mutually exclusive with cost_only -- each asks for the
+      # other stream to be the plain critic, so together they would leave the successor
+      # representation backing neither. Ignored (raises) under sr_mode: 'shared_trunk'.
+      reward_only: false
       # dimensionality of the shared successor-feature vector
       sr_dim: 64
       # hidden layer sizes of the shared trunk / psi network. Sets the trunk's own hidden
