@@ -381,6 +381,7 @@ def collect_on_policy_snapshots(
     env,
     trigger_steps,
     base_seed: int = 0,
+    transition_steps=None,
 ) -> dict[int, list[dict]]:
     """Roll out ``env`` (vectorized, ``num_envs = N``) with the current stochastic policy,
     capturing a snapshot from every env slot at every step index in ``trigger_steps``.
@@ -409,6 +410,11 @@ def collect_on_policy_snapshots(
             behavior -- there's no sync parameter here since that only needs doing once, not per
             collection call, and the caller already owns that env's lifecycle.
         trigger_steps: The within-episode step indices to snapshot at.
+        transition_steps: Step indices whose outgoing transition's reward and cost should also
+        be returned, for the one-step advantage study. When non-empty the return value becomes
+        ``(collected, transitions)``, where ``transitions[t]['reward'][i]`` is the reward env
+        slot ``i`` received acting from its step-``t`` state. Empty (the default) keeps the
+        original single return value.
         base_seed: First of N consecutive seeds used to reset the N parallel episodes
             (``base_seed .. base_seed + N - 1``). Vary this per call (e.g. by epoch) for a fresh
             batch of on-policy states each time.
@@ -422,11 +428,25 @@ def collect_on_policy_snapshots(
     n_envs = env.num_envs
     max_t = max(trigger_steps)
 
+    # The reward and cost of the transition *out of* each requested step, which a one-step
+    # advantage needs alongside the values at s_t and s_{t+1}. Taken from this reference rollout
+    # rather than re-sampled: the advantage is of the action actually taken at s_t, and it is the
+    # same action that leads to the s_{t+1} snapshot, so the triple stays consistent.
+    transition_steps = set() if transition_steps is None else set(transition_steps)
+    transitions: dict[int, dict[str, list[float]]] = {
+        t: {'reward': [0.0] * n_envs, 'cost': [0.0] * n_envs} for t in transition_steps
+    }
+
     obs, _ = env.reset(seed=list(range(base_seed, base_seed + n_envs)))
     collected: dict[int, list[dict | None]] = {t: [None] * n_envs for t in trigger_steps}
     for t in range(max_t):
         act, _, _, _ = agent.step(obs)
-        obs, _, _, _, _, info = env.step(act)
+        obs, reward, cost, _, _, info = env.step(act)
+        if t in transitions:
+            # obs entering this iteration was s_t, so this is r_t / c_t -- the step that lands on
+            # the s_{t+1} snapshot captured below.
+            transitions[t]['reward'] = reward.reshape(-1).detach().cpu().tolist()
+            transitions[t]['cost'] = cost.reshape(-1).detach().cpu().tolist()
         if 'state_snapshot' in info:
             # builder.steps == t + 1 for every slot here (lockstep assumption, see docstring) --
             # trust that rather than anything in `info`, which doesn't itself say which trigger
@@ -447,4 +467,6 @@ def collect_on_policy_snapshots(
                 'docstring), or configure_snapshot_triggers/enable_state_snapshots was not set '
                 'up correctly for this env.',
             )
+    if transition_steps:
+        return collected, transitions  # type: ignore[return-value]
     return collected  # type: ignore[return-value]

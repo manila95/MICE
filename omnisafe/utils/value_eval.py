@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import numpy as np
 import torch
@@ -1225,6 +1226,93 @@ def estimate_value_from_snapshots(
         },
     }
     return stats, raw
+
+
+def estimate_advantage_from_snapshots(
+    raw_at: dict,
+    raw_next: dict,
+    transition: dict,
+    discount_r: float,
+    discount_c: float,
+    mc_repeats: int,
+    prefix: str = '',
+) -> tuple[dict, dict]:
+    r"""Score the one-step advantage against a Monte-Carlo reference, probe by probe.
+
+    ``plain`` (and ``td_zero``) weight the policy gradient by
+
+    .. math:: A_t = r_t + \gamma V(s_{t+1}) - V(s_t)
+
+    so how good that advantage is depends on the critic at *two* states, not one, and the errors
+    can cancel or compound. A critic that is badly calibrated in level but consistently so is
+    fine here -- the bias cancels in the difference -- while one that is accurate on average but
+    noisy between neighbouring states is not. Neither shows up in the value study, which scores
+    each state alone.
+
+    The reference substitutes the Monte-Carlo value for the critic at both ends, keeping the
+    reward from the reference rollout (the advantage is of the action actually taken, and it is
+    that same action that leads to the ``s_{t+1}`` snapshot):
+
+    .. math:: \hat{A}_t = r_t + \gamma V_{MC}(s_{t+1}) - V_{MC}(s_t)
+
+    Args:
+        raw_at: ``return_raw`` output of :func:`estimate_value_from_snapshots` at ``s_t``.
+        raw_next: the same at ``s_{t+1}``. Probes are in env-slot order in both, so index ``i``
+        is the same trajectory on both sides.
+        transition: ``{'reward': [...], 'cost': [...]}`` for the step out of each ``s_t``.
+        discount_r (float): Reward discount.
+        discount_c (float): Cost discount.
+        mc_repeats (int): Rollouts averaged per probe, for the record.
+        prefix (str): Prepended to every statistic's name.
+
+    Returns:
+        ``(stats, raw)`` in the same shape the value study returns, so the same logging and
+        dump code handles both.
+    """
+    stats: dict[str, float] = {}
+    raw: dict[str, Any] = {'probe_seeds': list(raw_at.get('probe_seeds', []))}
+    for stream, discount, signal in (('r', discount_r, 'reward'), ('c', discount_c, 'cost')):
+        step_signal = np.asarray(transition[signal], dtype=np.float64)
+        pred_at = np.asarray(raw_at[stream]['pred'], dtype=np.float64)
+        pred_next = np.asarray(raw_next[stream]['pred'], dtype=np.float64)
+        true_at = np.asarray(raw_at[stream]['mc_mean'], dtype=np.float64)
+        true_next = np.asarray(raw_next[stream]['mc_mean'], dtype=np.float64)
+        n = min(len(step_signal), len(pred_at), len(pred_next))
+        adv_pred = step_signal[:n] + discount * pred_next[:n] - pred_at[:n]
+        adv_true = step_signal[:n] + discount * true_next[:n] - true_at[:n]
+
+        pred_t = torch.tensor(adv_pred, dtype=torch.float32)
+        true_t = torch.tensor(adv_true, dtype=torch.float32)
+        stats[f'{prefix}EstimationError_{stream}'] = (true_t - pred_t).mean().item()
+        stats[f'{prefix}Correlation_{stream}'] = _corr_pair(pred_t, true_t)
+        stats[f'{prefix}MeanTrue_{stream}'] = true_t.mean().item()
+        stats[f'{prefix}MeanPred_{stream}'] = pred_t.mean().item()
+        # The two Monte-Carlo estimates are independent rollouts, so the variance of their
+        # difference is the sum of theirs -- the noise floor this correlation is measured
+        # against, and it is strictly larger than either value study's on its own.
+        var_at = np.asarray(raw_at[stream]['mc_var'], dtype=np.float64)[:n]
+        var_next = np.asarray(raw_next[stream]['mc_var'], dtype=np.float64)[:n]
+        stats[f'{prefix}MeanVar_{stream}'] = float(np.mean(var_at + (discount**2) * var_next))
+        raw[stream] = {
+            'pred': adv_pred.tolist(),
+            'mc_mean': adv_true.tolist(),
+            'mc_var': (var_at + (discount**2) * var_next).tolist(),
+            'value_pred_at': pred_at[:n].tolist(),
+            'value_pred_next': pred_next[:n].tolist(),
+            'value_true_at': true_at[:n].tolist(),
+            'value_true_next': true_next[:n].tolist(),
+            signal: step_signal[:n].tolist(),
+        }
+    stats[f'{prefix}NumProbes'] = float(len(raw['r']['pred']))
+    stats[f'{prefix}MCRepeats'] = float(mc_repeats)
+    return stats, raw
+
+
+def _corr_pair(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Pearson correlation, nan when either side is constant or there is nothing to correlate."""
+    if a.numel() < 2 or a.std() <= 0 or b.std() <= 0:
+        return float('nan')
+    return torch.corrcoef(torch.stack([a, b]))[0, 1].item()
 
 
 def pool_correlation_stats(raw_list: list[dict], prefix: str = '') -> tuple[dict, dict]:

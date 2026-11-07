@@ -205,6 +205,14 @@ defaults:
     # repeats extra partial episodes), like mc_value_study. Enabled by default here.
     # within-episode step indices to snapshot at (steps elapsed so far in that episode) --
     # evenly-spaced by default to cover the whole episode timeline, not just its start
+    # Score the one-step advantage A_t = r_t + gamma V(s_{t+1}) - V(s_t) against the same
+    # Monte-Carlo reference the value study uses, at each intermediate_state_study_positions
+    # probe. This is what 'plain'/'td_zero' advantage estimation actually weights the policy
+    # gradient by, and it depends on the critic at two neighbouring states, so a critic that is
+    # biased but consistently so scores well here while a locally noisy one does not -- neither
+    # of which the per-state value study can see. Roughly doubles the intermediate study's cost,
+    # since every probe position is also evaluated at pos + 1.
+    eval_advantage: False
     intermediate_state_study_positions: [0.1, 0.3, 0.5, 0.7, 0.9]
     # Fallback rollout cap for the isolated eval path, used only when the environment
     # declares no horizon of its own in env_cfgs; unused elsewhere.

@@ -57,6 +57,7 @@ from omnisafe.utils.isolated_eval import (
 )
 from omnisafe.utils.value_eval import (
     _find_obs_normalizer,
+    estimate_advantage_from_snapshots,
     estimate_true_value,
     compute_gradient_alignment,
     estimate_true_value_same_state_mc,
@@ -706,6 +707,16 @@ class PolicyGradient(BaseAlgo):
                     self._logger.register_key(f'IntermediateMC/pos{pos}/MeanTarget_{stream}')
                 self._logger.register_key(f'IntermediateMC/pos{pos}/NumProbes')
                 self._logger.register_key(f'IntermediateMC/pos{pos}/MCRepeats')
+                if bool(getattr(self._cfgs.algo_cfgs, 'eval_advantage', False)):
+                    # The one-step advantage at this position, scored against the same
+                    # Monte-Carlo reference -- see estimate_advantage_from_snapshots.
+                    for stream in ('r', 'c'):
+                        for key in (
+                            'EstimationError', 'Correlation', 'MeanTrue', 'MeanPred', 'MeanVar',
+                        ):
+                            self._logger.register_key(f'IntermediateAdv/pos{pos}/{key}_{stream}')
+                    self._logger.register_key(f'IntermediateAdv/pos{pos}/NumProbes')
+                    self._logger.register_key(f'IntermediateAdv/pos{pos}/MCRepeats')
 
             # Pooled diversity correlation: s0 (if mc_value_study is also on) plus every
             # intermediate position, pooled into one correlation -- see
@@ -1227,11 +1238,29 @@ class PolicyGradient(BaseAlgo):
                     f'{self._intermediate_positions_limit}-step episode limit); using {positions}.',
                 )
             base_seed = 700_000 + epoch * n_probes
-            collected = collect_on_policy_snapshots(
-                self._actor_critic, interm_env, positions, base_seed=base_seed,
-            )
+            # One-step advantage study: scoring A_t = r_t + gamma V(s_{t+1}) - V(s_t) needs the
+            # value at the *next* state as well, so each probe position is snapshotted twice --
+            # at pos and at pos + 1 -- and the reference rollout's own reward for the step
+            # between them comes back alongside.
+            eval_advantage = bool(getattr(self._cfgs.algo_cfgs, 'eval_advantage', False))
+            if eval_advantage:
+                collected, transitions = collect_on_policy_snapshots(
+                    self._actor_critic,
+                    interm_env,
+                    sorted(set(positions) | {pos + 1 for pos in positions}),
+                    base_seed=base_seed,
+                    transition_steps=positions,
+                )
+            else:
+                collected = collect_on_policy_snapshots(
+                    self._actor_critic, interm_env, positions, base_seed=base_seed,
+                )
+                transitions = {}
             eval_data_bundle['intermediate_study'] = {}
-            for pos in positions:
+            if eval_advantage:
+                eval_data_bundle['advantage_study'] = {}
+            value_raw_by_pos: dict[int, dict] = {}
+            for pos in sorted(set(positions) | ({p + 1 for p in positions} if eval_advantage else set())):
                 pos_stats, pos_raw = estimate_value_from_snapshots(
                     agent=self._actor_critic,
                     env=interm_env,
@@ -1253,11 +1282,36 @@ class PolicyGradient(BaseAlgo):
                     bootstrap_threshold=getattr(self._cfgs.algo_cfgs, 'mc_eval_bootstrap_threshold', None),
                     tail_mode=getattr(self._cfgs.algo_cfgs, 'mc_eval_tail', None),
                 )
+                value_raw_by_pos[pos] = pos_raw
+                if pos not in positions:
+                    # A pos + 1 probe exists only to give the advantage its next-state value; it
+                    # is not one of the configured study positions and gets no column of its own.
+                    continue
                 self._logger.store(
                     {f'IntermediateMC/pos{pos}/{k}': v for k, v in pos_stats.items()},
                 )
                 eval_data_bundle['intermediate_study'][pos] = {
                     'stats': pos_stats, 'raw': pos_raw,
+                }
+
+            for pos in positions:
+                if not eval_advantage or pos + 1 not in value_raw_by_pos:
+                    continue
+                adv_stats, adv_raw = estimate_advantage_from_snapshots(
+                    raw_at=value_raw_by_pos[pos],
+                    raw_next=value_raw_by_pos[pos + 1],
+                    transition=transitions[pos],
+                    discount_r=self._cfgs.algo_cfgs.gamma,
+                    discount_c=getattr(
+                        self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma,
+                    ),
+                    mc_repeats=repeats,
+                )
+                self._logger.store(
+                    {f'IntermediateAdv/pos{pos}/{k}': v for k, v in adv_stats.items()},
+                )
+                eval_data_bundle['advantage_study'][pos] = {
+                    'stats': adv_stats, 'raw': adv_raw,
                 }
         # Pooling, gradient alignment and the scatter quick-look read only what the two studies
         # above filed in eval_data_bundle, so they run for whichever path produced it.
