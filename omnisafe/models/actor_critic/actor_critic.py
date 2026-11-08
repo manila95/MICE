@@ -103,6 +103,7 @@ class ActorCritic(nn.Module):
             ensemble_method=ensemble_method,
             stream='r',
             beta_init=beta_init,
+            num_quantiles=int(model_cfgs.critic.get('num_quantiles', 0) or 0),
         ).build_critic(critic_type='v')
         self.add_module('actor', self.actor)
         self.add_module('reward_critic', self.reward_critic)

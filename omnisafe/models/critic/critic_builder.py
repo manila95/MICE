@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from omnisafe.models.base import Critic
 from omnisafe.models.critic.q_critic import QCritic
+from omnisafe.models.critic.quantile_v_critic import QuantileVCritic
 from omnisafe.models.critic.v_critic import VCritic
 from omnisafe.typing import Activation, CriticType, InitFunction, OmnisafeSpace
 
@@ -71,6 +72,7 @@ class CriticBuilder:
         ensemble_method: str = 'none',
         stream: str = 'r',
         beta_init: float = 0.0,
+        num_quantiles: int = 0,
     ) -> None:
         """Initialize an instance of :class:`CriticBuilder`."""
         self._obs_space: OmnisafeSpace = obs_space
@@ -89,6 +91,9 @@ class CriticBuilder:
         self._ensemble_method: str = ensemble_method
         self._stream: str = stream
         self._beta_init: float = beta_init
+        # > 0 builds a distributional (quantile-regression) v critic instead of a scalar one;
+        # see QuantileVCritic. Ignored by the q critic.
+        self._num_quantiles: int = num_quantiles
 
     def build_critic(
         self,
@@ -117,6 +122,18 @@ class CriticBuilder:
                 weight_initialization_mode=self._weight_initialization_mode,
                 num_critics=self._num_critics,
                 use_obs_encoder=self._use_obs_encoder,
+            )
+        if critic_type == 'v' and self._num_quantiles > 0:
+            return QuantileVCritic(
+                obs_space=self._obs_space,
+                act_space=self._act_space,
+                hidden_sizes=self._hidden_sizes,
+                activation=self._activation,
+                weight_initialization_mode=self._weight_initialization_mode,
+                num_quantiles=self._num_quantiles,
+                dropout=self._dropout,
+                use_layer_norm=self._use_layer_norm,
+                use_spectral_norm=self._use_spectral_norm,
             )
         if critic_type == 'v':
             return VCritic(

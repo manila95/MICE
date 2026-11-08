@@ -259,6 +259,9 @@ defaults:
     # of which the per-state value study can see. Roughly doubles the intermediate study's cost,
     # since every probe position is also evaluated at pos + 1.
     eval_advantage: False
+    # Huber threshold inside the quantile regression loss; 0 gives the plain pinball loss.
+    # Unused unless model_cfgs.critic.num_quantiles > 0.
+    quantile_huber_kappa: 1.0
     intermediate_state_study_positions: [0.1, 0.3, 0.5, 0.7, 0.9]
     # Fallback rollout cap for the isolated eval path, used only when the environment
     # declares no horizon of its own in env_cfgs; unused elsewhere.
@@ -307,6 +310,18 @@ defaults:
       lr: ~
     critic:
       # hidden layer sizes
+      # Distributional critic: predict this many quantiles of the return instead of its mean,
+      # trained by quantile regression. 0 (the default) is the ordinary scalar critic. forward()
+      # still returns the mean, so the advantage, the constraint and the value studies are
+      # unchanged -- the distribution is extra information, reachable via .quantiles()/.cvar().
+      # Requires a value target that is a return sample (value_target: mc, which
+      # adv_estimation_method 'plain' and 'reinforce' both resolve to); anything bootstrapped
+      # raises, since quantile regression would then describe the target's mixture, not the
+      # return.
+      num_quantiles: 0
+      # cost-side override, null-falling back to the shared value above -- same convention as
+      # dropout / use_layer_norm / weight_decay.
+      num_quantiles_cost: ~
       hidden_sizes: [64, 64]
       # activation function
       activation: tanh

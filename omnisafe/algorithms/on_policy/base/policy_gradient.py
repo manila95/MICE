@@ -37,6 +37,8 @@ from omnisafe.common.logger import Logger
 from omnisafe.envs.core import make as make_env
 from omnisafe.envs.wrapper import ActionScale, AutoReset, ObsNormalize, TimeLimit, Unsqueeze
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
+from omnisafe.utils.gae import resolve_adv_and_target
+from omnisafe.models.critic.quantile_v_critic import QuantileVCritic, quantile_huber_loss
 from omnisafe.utils import clearning, contrastive, distributed, laplacian, sr_diagnostics
 from omnisafe.utils.critic_ensemble import GPLBetaAdapter, TOPBanditAdapter
 from omnisafe.utils.eval_data_dump import (
@@ -317,6 +319,23 @@ class PolicyGradient(BaseAlgo):
             >>> def _init_model(self) -> None:
             ...     self._actor_critic = CustomActorCritic()
         """
+        # Quantile regression learns the quantiles of whatever distribution its targets are
+        # drawn from. Only an 'mc' value target is a sample of the return; a bootstrapped one is
+        # a critic-dependent mixture, and the learned quantiles would describe that instead --
+        # silently answering a different question. Refuse rather than fit the wrong thing.
+        if int(self._cfgs.model_cfgs.critic.get('num_quantiles', 0) or 0) > 0:
+            _, value_target = resolve_adv_and_target(
+                self._cfgs.algo_cfgs.adv_estimation_method,
+                getattr(self._cfgs.algo_cfgs, 'value_target', None),
+            )
+            if value_target != 'mc':
+                raise ValueError(
+                    'model_cfgs.critic.num_quantiles needs a value target that is a sample of '
+                    f'the return, i.e. value_target "mc", but this run resolves to '
+                    f'"{value_target}" (from adv_estimation_method '
+                    f'"{self._cfgs.algo_cfgs.adv_estimation_method}"). Use adv_estimation_method '
+                    "'plain' or 'reinforce', or set value_target: mc explicitly.",
+                )
         self._actor_critic: ConstraintActorCritic = ConstraintActorCritic(
             obs_space=self._env.observation_space,
             act_space=self._env.action_space,
@@ -2335,12 +2354,24 @@ class PolicyGradient(BaseAlgo):
         # ensemble bias-correction and the Huber-loss option stack rather than one silently
         # bypassing the other; under ensemble_method='none' (default) this is exactly the old
         # single-member loss.
-        loss = torch.stack(
-            [
-                self._critic_loss(v, target_value_r, stream='r')
-                for v in self._actor_critic.reward_critic.raw_values(obs)
-            ],
-        ).mean()
+        critic = self._actor_critic.reward_critic
+        if isinstance(critic, QuantileVCritic):
+            # Quantile regression against the target, which under value_target='mc' is a sample
+            # of the return -- see QuantileVCritic's module docstring. Replaces the scalar
+            # MSE/Huber rather than supplementing it: there is no mean head to regress.
+            loss = quantile_huber_loss(
+                critic.quantiles(obs),
+                target_value_r,
+                critic.tau,
+                kappa=float(getattr(self._cfgs.algo_cfgs, 'quantile_huber_kappa', 1.0)),
+            )
+        else:
+            loss = torch.stack(
+                [
+                    self._critic_loss(v, target_value_r, stream='r')
+                    for v in critic.raw_values(obs)
+                ],
+            ).mean()
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             excluded_ids = getattr(self._actor_critic, '_sr_critic_norm_excluded_ids', set())
@@ -2394,12 +2425,24 @@ class PolicyGradient(BaseAlgo):
         # See _update_reward_critic's matching comment: raw_values() (every ensemble member's own
         # raw prediction, each trained independently) not the aggregated conservative read, with
         # each member's loss still going through _critic_loss for the MSE/Huber choice.
-        loss = torch.stack(
-            [
-                self._critic_loss(v, target_value_c, stream='c')
-                for v in self._actor_critic.cost_critic.raw_values(obs)
-            ],
-        ).mean()
+        critic = self._actor_critic.cost_critic
+        if isinstance(critic, QuantileVCritic):
+            # Quantile regression against the target, which under value_target='mc' is a sample
+            # of the return -- see QuantileVCritic's module docstring. Replaces the scalar
+            # MSE/Huber rather than supplementing it: there is no mean head to regress.
+            loss = quantile_huber_loss(
+                critic.quantiles(obs),
+                target_value_c,
+                critic.tau,
+                kappa=float(getattr(self._cfgs.algo_cfgs, 'quantile_huber_kappa', 1.0)),
+            )
+        else:
+            loss = torch.stack(
+                [
+                    self._critic_loss(v, target_value_c, stream='c')
+                    for v in critic.raw_values(obs)
+                ],
+            ).mean()
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             # Cost gets its own coefficient (null falls back to critic_norm_coef), the same

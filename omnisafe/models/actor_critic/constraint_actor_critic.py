@@ -138,6 +138,7 @@ class ConstraintActorCritic(ActorCritic):
                 ensemble_method=ensemble_method,
                 stream='c',
                 beta_init=beta_init,
+                num_quantiles=int(_cost_or_shared('num_quantiles', 0) or 0),
             ).build_critic('v')
             self.add_module('cost_critic', self.cost_critic)
             # See ActorCritic.__init__'s matching call for why this defaults to eval() and is
