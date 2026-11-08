@@ -49,6 +49,16 @@ class PPOLag(PPO):
         super()._init_log()
         self._logger.register_key('Metrics/LagrangeMultiplier', min_and_max=True)
 
+    def _constraint_value(self) -> float:
+        """The measured constraint value the multiplier is updated against.
+
+        The mean episodic cost, which is what ``cost_limit`` is conventionally compared to. A
+        seam rather than an inline read so a subclass can constrain a different functional of
+        the same episodes -- see :class:`~omnisafe.algorithms.on_policy.worst_case.wcpg.WCPG`,
+        which constrains their upper tail instead.
+        """
+        return float(self._logger.get_stats('Metrics/EpCost')[0])
+
     def _update(self) -> None:
         r"""Update actor, critic, as we used in the :class:`PolicyGradient` algorithm.
 
@@ -70,7 +80,7 @@ class PPOLag(PPO):
             where :math:`\lambda` is the Lagrange multiplier parameter.
         """
         # note that logger already uses MPI statistics across all processes..
-        Jc = self._logger.get_stats('Metrics/EpCost')[0]
+        Jc = self._constraint_value()
         assert not np.isnan(Jc), 'cost for updating lagrange multiplier is nan'
         # first update Lagrange multiplier parameter
         self._lagrange.update_lagrange_multiplier(Jc)

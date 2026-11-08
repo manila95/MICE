@@ -56,6 +56,8 @@ class QuantileVCritic(Critic):
         activation: Activation = 'relu',
         weight_initialization_mode: InitFunction = 'kaiming_uniform',
         num_quantiles: int = 32,
+        risk_measure: str | None = None,
+        risk_alpha: float = 0.1,
         dropout: float = 0.0,
         use_layer_norm: bool = False,
         use_spectral_norm: bool = False,
@@ -73,6 +75,13 @@ class QuantileVCritic(Critic):
         if num_quantiles < 2:
             raise ValueError(f'num_quantiles must be at least 2, got {num_quantiles}.')
         self._num_quantiles = num_quantiles
+        if risk_measure not in (None, 'mean', 'cvar'):
+            raise ValueError(f"risk_measure must be None, 'mean' or 'cvar', got {risk_measure!r}.")
+        # What forward() reports. 'mean' (the default) keeps this a drop-in for the scalar
+        # critic; 'cvar' makes the *value function itself* the upper tail, which is what a
+        # tail-constrained algorithm wants its cost advantages built from.
+        self._risk_measure = risk_measure or 'mean'
+        self._risk_alpha = risk_alpha
         self.net: nn.Module = build_mlp_network(
             sizes=[self._obs_dim, *self._hidden_sizes, num_quantiles],
             activation=activation,
@@ -124,11 +133,20 @@ class QuantileVCritic(Critic):
     def forward(self, obs: torch.Tensor) -> list[torch.Tensor]:
         """The mean of the predicted quantiles, in :class:`Critic`'s list-of-one form.
 
-        Deliberately the mean and not a risk-adjusted statistic: this is what GAE, the
-        advantages and the value studies consume, and keeping it the plain expectation is what
-        makes a distributional run comparable to its non-distributional counterpart. Anything
-        wanting the tail asks for it explicitly via :meth:`cvar` or :meth:`quantiles`.
+        The mean by default: that is what GAE, the advantages and the value studies consume,
+        and keeping it the plain expectation is what makes a distributional run comparable to
+        its non-distributional counterpart. Anything wanting the tail asks for it explicitly
+        via :meth:`cvar` or :meth:`quantiles`.
+
+        Under ``risk_measure='cvar'`` this returns the upper tail instead, which makes every
+        downstream consumer -- the advantages above all -- operate on the tail rather than the
+        mean. That is the point for a tail-constrained algorithm, but note it is no longer a
+        value function in the Bellman sense (CVaR does not obey the expectation recursion), so
+        the TD residuals built from it are a heuristic, and a Monte-Carlo *mean* reference
+        would be scoring the wrong quantity against it.
         """
+        if self._risk_measure == 'cvar':
+            return [self.cvar(obs, self._risk_alpha, upper=True)]
         return [self.quantiles(obs).mean(dim=-1)]
 
 

@@ -520,6 +520,24 @@ class Logger:  # pylint: disable=too-many-instance-attributes
             if self._headers_windows[key] is None:
                 self._data[key] = []
 
+    def get_values(self, key: str) -> list[float]:
+        """The raw values stored for ``key``, not reduced to a statistic.
+
+        :meth:`get_stats` answers "what is the mean", which is all most consumers want. A
+        caller computing its own functional -- a tail, a quantile, a histogram -- needs the
+        values themselves, and reaching into the private store to get them is the kind of thing
+        that breaks quietly when the store changes.
+
+        Args:
+            key (str): A registered key.
+
+        Returns:
+            The stored values, over whatever window the key was registered with.
+        """
+        assert key in self._current_row, f'Key {key} has not been registered'
+        vals = self._data[key]
+        return list(vals) if isinstance(vals, deque) else list(vals)
+
     def get_stats(
         self,
         key: str,

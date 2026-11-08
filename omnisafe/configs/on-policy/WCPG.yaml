@@ -1,0 +1,759 @@
+# Copyright 2023 OmniSafe Team. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+defaults:
+  # seed for random number generator
+  seed: 0
+  # training configurations
+  train_cfgs:
+    # device to use for training, options: cpu, cuda, cuda:0, cuda:0,1, etc.
+    device: cpu
+    # number of threads for torch
+    torch_threads: 16
+    # number of vectorized environments
+    vector_env_nums: 1
+    # number of parallel agent, similar to a3c
+    parallel: 1
+    # total number of steps to train
+    total_steps: 10000000
+  # algorithm configurations
+  algo_cfgs:
+    # number of steps to update the policy
+    steps_per_epoch: 20000
+    # number of iterations to update the policy
+    update_iters: 40
+    # batch size for each iteration
+    batch_size: 64
+    # target kl divergence
+    target_kl: 0.02
+    # entropy coefficient
+    entropy_coef: 0.0
+    # normalize reward
+    reward_normalize: False
+    # normalize cost
+    cost_normalize: False
+    # normalize observation
+    obs_normalize: True
+    # early stop when kl divergence is bigger than target kl
+    kl_early_stop: True
+    # use max gradient norm
+    use_max_grad_norm: True
+    # max gradient norm
+    max_grad_norm: 40.0
+    # use critic norm
+    use_critic_norm: True
+    # critic norm coefficient
+    critic_norm_coef: 0.001
+    # critic norm coefficient for the cost critic only; null = reuse critic_norm_coef. Same
+    # null-fallback convention as sr_cfgs.ridge_kappa_cost / w_weight_decay_cost.
+    critic_norm_coef_cost: ~
+    # reward discount factor
+    gamma: 0.99
+    # cost discount factor
+    cost_gamma: 0.99
+    # lambda for gae
+    lam: 0.95
+    # lambda for cost gae
+    lam_c: 0.95
+    # clip ratio
+    clip: 0.2
+    # advantage estimation method, options: gae, retrace
+    adv_estimation_method: plain
+    cost_adv_estimation_method: ~
+    # The critic's regression target, chosen INDEPENDENTLY of the advantage above.
+    # 'td_lambda' | 'mc' | 'td_zero' | 'vtrace'; null keeps the legacy coupling where
+    # adv_estimation_method picked both axes at once (see omnisafe.utils.gae.ADV_TARGET_PRESETS:
+    # gae -> td_lambda, plain -> mc, td_zero -> td_zero, gae-rtg -> mc, reinforce -> mc).
+    #
+    # Why this exists: those two choices were welded together, so only 6 of the 3x3 combinations
+    # were reachable -- "TD(0) advantage with a TD(lambda) target" could not be expressed at all.
+    # Worse for experiments, comparing two estimators silently varied BOTH axes: plain vs gae is
+    # (TD(0) adv, MC target) vs (GAE adv, TD(lambda) target), so a difference between them cannot
+    # be attributed to either one. Setting this pins the target while adv_estimation_method
+    # varies, or vice versa.
+    value_target_method: ~
+    # Cost-side override; null falls back to value_target_method -- same convention as
+    # cost_gamma / lam_c / cost_adv_estimation_method. Note the cost target uses cost_gamma and
+    # lam_c, not gamma/lam.
+    cost_value_target_method: ~
+    n_val_episodes: 0
+    # standardize reward advantage
+    standardized_rew_adv: True
+    # standardize cost advantage
+    standardized_cost_adv: True
+    # penalty coefficient
+    penalty_coef: 0.0
+    # use cost
+    use_cost: True
+    # eval frequency for the first 100 epochs (higher cadence for early monitoring)
+    early_eval_freq: 5
+    # width of the early_eval_freq window: epochs below this use early_eval_freq, epochs at or
+    # above it use value_eval_freq. Was hard-coded to 100. An eval epoch costs ~240 s against a
+    # ~9 s training epoch, so this is a direct lever on total eval cost that, unlike cutting
+    # repeats/positions, leaves every individual measurement exactly as trustworthy.
+    early_eval_epochs: 50
+    value_eval_freq: 50
+    # whether to run the full-episode true-vs-estimated value calibration rollout
+    # (see omnisafe.utils.value_eval.estimate_true_value). Off by default: it's a one-sample-
+    # per-state proxy (a single fresh rollout per probe, freshly reset each eval epoch) that
+    # mc_value_study/intermediate_state_study superseded with a genuine MC-repeated estimate on
+    # fixed/on-policy probes -- see their own comments below. Running both (the old way and the
+    # new way) was useful for validating the new studies against the old baseline; now that
+    # that's done, this just triples eval-epoch cost (Eval_s0/Eval_all's own eval_episodes
+    # rollouts, on top of the MC studies') for numbers the MC studies already supersede.
+    test_estimate: False
+    # number of full episodes rolled out per calibration eval (see test_estimate above)
+    value_eval_episodes: 100
+    # same-layout Monte-Carlo value study (see omnisafe.utils.value_eval.
+    # estimate_true_value_same_state_mc): compares the critic against a genuine MC estimate --
+    # mc_value_study_repeats independent same-seed (same procedurally-generated layout) rollouts
+    # per probe state, rather than estimate_true_value's one-sample-per-state proxy. Off by
+    # default: it is len(mc_value_study_probes) * mc_value_study_repeats extra full episodes on
+    # every eval epoch, on top of test_estimate's own eval_episodes. Enabled by default here.
+    # Master switch for ALL critic evaluation. True/False turns on/off, together:
+    #   - the same-layout Monte-Carlo s0 study (fresh probe rollouts),
+    #   - the on-policy intermediate-state study (snapshot/restore rollouts),
+    #   - the critic diagnostics computed on the training batch itself (Value/Train/*,
+    #     Value/Val/*, the BeforeUpdate/AfterUpdate scatter plots), and with them the SR
+    #     diagnostics under sr_mode: 'td_ridge' (phi/psi ranks, ridge R^2, explained variance).
+    # These were separate switches; nothing ever wanted some and not others, and "evaluation off"
+    # that still wrote Value/Train/* was a trap. The per-study *settings* below
+    # (probes/repeats/positions/...) are unchanged and still tune each one independently.
+    #
+    # This is what a run's wall-clock is mostly made of: an eval epoch costs ~240 s against a ~9 s
+    # training epoch, so False takes a 500-epoch run from ~2.6 h to ~1.3 h. (test_estimate is a
+    # separate, superseded diagnostic and has its own flag.)
+    eval_critic: True
+    # number of fixed probe states (env reset seeds), held constant for the whole run
+    mc_value_study_probes: 17
+    # independent same-layout rollouts averaged per probe state -- 10 (not the original 5): the
+    # split-half reliability analysis (see the session history / git log around
+    # mc_eval_bootstrap_threshold) found n=5 badly under-samples cost specifically (split-half
+    # correlation as low as ~0.6-0.9 per category, sometimes literally undefined at bursty/rare-
+    # cost positions), while n=10 combined with mc_eval_bootstrap_threshold=0.01 costs about the
+    # same wall-clock as the old n=5/no-truncation default.
+    mc_value_study_repeats: 10
+    # base offset for the probe seeds (probes use seed_offset .. seed_offset+probes-1), chosen
+    # well outside the training seed range so probe layouts never coincide with a training seed
+    mc_value_study_seed_offset: 100000
+    # number of probe rollouts run concurrently (subprocess-parallel vectorized env), instead of
+    # the mc_value_study_probes * mc_value_study_repeats rollouts running one at a time on a
+    # single env -- this was ~80% of wall-clock in the value-function estimation study. Each
+    # probe still gets its own independent reset(seed=X); this only parallelizes across probes,
+    # it does not change what's computed. Set to 1 to fall back to the original sequential
+    # behavior. Pick based on free CPU cores, accounting for train_cfgs.vector_env_nums and
+    # however many other runs share the machine -- e.g. 20 (giving a clean 500/20=25 waves at the
+    # defaults above) on a lightly-loaded 16+-core box.
+    mc_value_study_vector_envs: 5
+    # How the truncated tail is handled when mc_eval_bootstrap_threshold is set (it is, by
+    # default). Required then; null makes a non-null threshold raise rather than silently
+    # biasing every value.
+    #   'drop'      -- stop accumulating. The value is the exact truncated discounted sum, low by
+    #                  at most bootstrap_threshold of its own scale (1% at 0.01), one-sided and
+    #                  analytically known. Stays simulation-only, so a cost value is still
+    #                  non-negative, and the critic -- the thing these studies validate -- never
+    #                  enters the "ground truth".
+    #   'bootstrap' -- estimate the tail with the critic's own value there. Unbiased in principle,
+    #                  circular in practice: an untrained V_c made 14.4% of per-rollout cost
+    #                  returns negative, which a non-negative cost signal cannot produce. This is
+    #                  what commit abf5ff3 turned off by default.
+    # Ignored when bootstrap_threshold is null (full horizon, no approximation).
+    mc_eval_tail: drop
+    # Truncate mc_value_study/intermediate_state_study rollouts early once both streams'
+    # discounted tail contribution drops below this fraction (see
+    # omnisafe.utils.value_eval._effective_rollout_horizon). At gamma=0.99, 0.01 stops at step
+    # 459 of 1000 -- 2.18x fewer simulated steps, and eval is ~85% of a run's wall-clock.
+    #
+    # What the default 0.01 costs, paired with mc_eval_tail: drop above: every "true" MC value is
+    # low by at most 1% of its own scale. That bias is one-sided and analytically known (it is
+    # exactly the dropped geometric tail), not noise -- so it does NOT average out across seeds.
+    # It shifts EstimationError_* by ~1% of the true value; Correlation_* is near-untouched,
+    # being close to a monotone rescaling.
+    #
+    # Set to null for the exact, bias-free quantity these studies mean to measure, at ~2.2x the
+    # eval wall-clock. Prefer that when an absolute value level is the result being reported;
+    # 0.01 is the right default when the questions are about calibration trends and correlations.
+    mc_eval_bootstrap_threshold: 0.01
+    # On-policy intermediate-state value study (see omnisafe.utils.value_eval.
+    # estimate_value_from_snapshots and omnisafe.utils.state_snapshot): the same same-state MC
+    # trick mc_value_study uses for s0, but for states the CURRENT policy actually visits
+    # mid-episode -- captured via an exact simulator-state snapshot/restore (not just a re-seeded
+    # reset, since these states aren't reachable that way), from a dedicated on-policy collection
+    # rollout run fresh every eval epoch. Adds meaningful eval-epoch cost (positions * probes *
+    # repeats extra partial episodes), like mc_value_study. Enabled by default here.
+    # within-episode step indices to snapshot at (steps elapsed so far in that episode) --
+    # evenly-spaced by default to cover the whole episode timeline, not just its start
+    # Score the one-step advantage A_t = r_t + gamma V(s_{t+1}) - V(s_t) against the same
+    # Monte-Carlo reference the value study uses, at each intermediate_state_study_positions
+    # probe. This is what 'plain'/'td_zero' advantage estimation actually weights the policy
+    # gradient by, and it depends on the critic at two neighbouring states, so a critic that is
+    # biased but consistently so scores well here while a locally noisy one does not -- neither
+    # of which the per-state value study can see. Roughly doubles the intermediate study's cost,
+    # since every probe position is also evaluated at pos + 1.
+    eval_advantage: False
+    # WCPG: the constraint is the mean of the worst cvar_alpha fraction of episodes, not the
+    # mean of all of them. 1.0 recovers the ordinary mean constraint; 0.1 is "the worst 10% of
+    # episodes must satisfy cost_limit". Fewer episodes in the logging window than 1 / alpha
+    # means the tail is a single episode, so read early epochs with that in mind.
+    cvar_alpha: 0.1
+    # Which episodes the tail is taken over: 'epoch' (this epoch's, the default) or 'logger'
+    # (the same rolling window the mean constraint uses). A tail over the window selects the
+    # worst episodes of the oldest policy in it, so it lags; 'logger' is there for comparing
+    # like with like against the mean-constrained baselines.
+    cvar_window: epoch
+    # Huber threshold inside the quantile regression loss; 0 gives the plain pinball loss.
+    # Unused unless model_cfgs.critic.num_quantiles > 0.
+    quantile_huber_kappa: 1.0
+    intermediate_state_study_positions: [0.1, 0.3, 0.5, 0.7, 0.9]
+    # Fallback rollout cap for the isolated eval path, used only when the environment
+    # declares no horizon of its own in env_cfgs; unused elsewhere.
+    isolated_eval_episode_cap: 1500
+    # on-policy states captured per position, per eval epoch (also sets this env's
+    # num_envs -- one collection rollout produces exactly this many probes per position in a
+    # single pass, no waves needed for collection itself, only for scoring)
+    intermediate_state_study_probes: 17
+    # independent restore-and-rollout repeats averaged per probe state (same role, same n=10
+    # rationale, as mc_value_study_repeats above)
+    intermediate_state_study_repeats: 10
+  # logger configurations
+  logger_cfgs:
+    # use wandb for logging
+    use_wandb: True
+    # wandb project name
+    wandb_project: omnisafe
+    # use tensorboard for logging
+    use_tensorboard: True
+    # save model frequency
+    save_model_freq: 100
+    # save logger path
+    log_dir: "./runs"
+    # save model path
+    window_lens: 100
+  # model configurations
+  model_cfgs:
+    # weight initialization mode
+    weight_initialization_mode: "kaiming_uniform"
+    # actor type, options: gaussian, gaussian_learning
+    actor_type: gaussian_learning
+    # linear learning rate decay
+    linear_lr_decay: True
+    # exploration noise anneal
+    exploration_noise_anneal: False
+    # std upper bound, and lower bound
+    std_range: [0.5, 0.1]
+    # actor network configurations
+    actor:
+      # hidden layer sizes
+      hidden_sizes: [64, 64]
+      # activation function
+      activation: tanh
+      # out_activation: tanh
+      # learning rate
+      lr: 0.0003
+    critic:
+      # hidden layer sizes
+      # Distributional critic: predict this many quantiles of the return instead of its mean,
+      # trained by quantile regression. 0 (the default) is the ordinary scalar critic. forward()
+      # still returns the mean, so the advantage, the constraint and the value studies are
+      # unchanged -- the distribution is extra information, reachable via .quantiles()/.cvar().
+      # Requires a value target that is a return sample (value_target: mc, which
+      # adv_estimation_method 'plain' and 'reinforce' both resolve to); anything bootstrapped
+      # raises, since quantile regression would then describe the target's mixture, not the
+      # return.
+      num_quantiles: 0
+      # cost-side override, null-falling back to the shared value above -- same convention as
+      # dropout / use_layer_norm / weight_decay.
+      num_quantiles_cost: 32
+      hidden_sizes: [64, 64]
+      # activation function
+      activation: tanh
+      # learning rate
+      lr: 0.0003
+    # whether to use a shared successor-representation value function for reward and cost,
+    # instead of two independent critics
+    use_successor_representation: False
+    # successor representation configurations, only used when use_successor_representation is True
+    sr_cfgs:
+      # 'shared_trunk': shared feature trunk + linear reward/cost read-out heads, trained
+      # end-to-end by the ordinary value-target MSE loss (reuses the stock GAE / GAE-RTG /
+      # V-trace / Plain value-target code exactly).
+      # 'td_ridge': literal successor representation -- phi/psi trained by TD (using the same
+      # estimator machinery above, applied to a vector feature stream), with the reward/cost
+      # read-out weights solved by closed-form ridge regression each update.
+      sr_mode: shared_trunk
+      # when sr_mode is 'td_ridge', train the reward critic the normal way -- a plain MLP
+      # Q/V critic with its own optimizer, independent of the SR trunk -- and use the SR trunk
+      # for the cost critic only (a single psi head off-policy; no change on-policy, which
+      # already has one). The trunk still fits w_r each update for diagnostic parity with the
+      # non-cost_only run; it is simply never read out into an actual critic. Ignored (raises)
+      # under sr_mode: 'shared_trunk'.
+      cost_only: false
+      # dimensionality of the shared successor-feature vector
+      sr_dim: 64
+      # hidden layer sizes of the shared trunk / psi network. Sets the trunk's own hidden
+      # widths verbatim -- independent of sr_dim, which only sets the final phi/psi
+      # projection's output width. Keep the last width >= sr_dim unless a deliberate
+      # bottleneck is wanted: that final phi/psi layer has no nonlinearity, so it can't
+      # raise rank above hidden_sizes[-1] (wasted capacity in shared_trunk mode; a
+      # rank-deficient, singular-without-regularization ridge Gram matrix in td_ridge mode).
+      hidden_sizes: [64, 64]
+      # activation function of the trunk
+      activation: tanh
+      # learning rate for the trunk (shared_trunk mode) or the psi network (td_ridge mode)
+      lr: 0.0003
+      # lambda for the successor-feature TD target (td_ridge mode only); mirrors lam_c
+      lam_sr: 0.95
+      # discount factor for the successor-feature TD recursion (td_ridge mode only);
+      # defaults to algo_cfgs.gamma when null
+      gamma_sr: ~
+      # ridge regression L2 regularization coefficient for solving w_r / w_c (td_ridge mode only)
+      ridge_kappa: 0.001
+      # ridge L2 coefficient for the COST read-out only (td_ridge mode); null = reuse
+      # ridge_kappa. Split because the MSE-optimal shrinkage scales with a target's
+      # noise-to-signal ratio, and a sparse cost generalizes far worse than a dense reward
+      # at the same kappa -- measured train-minus-val RidgeR2 gap on SafetyPointGoal1-v0 was
+      # 1.19 for cost against 0.05 for reward, i.e. one shared kappa cannot suit both.
+      ridge_kappa_cost: ~
+      # EMA smoothing coefficient for w_r / w_c across iterations, 1.0 = no smoothing (td_ridge mode only)
+      ema_tau: 1.0
+      # read-out weight learning (td_ridge mode): 'ridge' (closed-form each epoch) or 'sgd'
+      # (gradient descent over a persistent cross-epoch replay buffer; principled with a frozen
+      # phi_source: random / separate). On-policy 'sgd' keeps its own buffer since the rollout
+      # buffer is wiped every epoch, so w is still fit over all past experience.
+      readout: ridge
+      # what the closed-form ridge regresses (readout: ridge only).
+      #   'phi' (default): phi(s).w ~= one-step reward/cost -- the original successor-feature
+      #                 factorization; w is policy-independent since the immediate reward/cost
+      #                 doesn't depend on the return.
+      #   'psi'         : psi(s).w ~= the true discounted return (discounted_ret /
+      #                 discounted_cost_ret), an ordinary linear value-function regression on top
+      #                 of psi as a learned feature extractor rather than a literal successor
+      #                 measure. Requires ridge_data: 'epoch'. Motivated by phi_source: 'trunk'
+      #                 specifically: phi_head never receives a gradient there (every trainable
+      #                 loss reads out through psi, never phi), so regressing against the
+      #                 gradient-shaped psi instead of the frozen-random phi measured a large,
+      #                 held-out-verified improvement in both correlation and absolute scale
+      #                 against the true cost-to-go on Ant-v4/CPO -- see WOracleCostCorr /
+      #                 WOracleCostR2 in PolicyGradient._sr_split_scalars, the diagnostic this
+      #                 mode makes real.
+      w_source: phi
+      # which transitions the closed-form ridge is solved on (readout: ridge only).
+      #   'epoch'       : the fresh epoch's training split (the rollout's own phi).
+      #   'buffer'      : the persistent cross-epoch history, recomputing phi under the current
+      #                   basis. Valid because the read-out r(s) ~= phi(s).w is policy-independent;
+      #                   widens the state coverage the Gram is built from, which is what
+      #                   conditions the solve when phi is rank-deficient (phi_source: random).
+      #                   Held-out val episodes are never added, so SR/Gap/RidgeR2* stays a
+      #                   genuine generalization test.
+      #   'cost_replay' : the fresh epoch plus an equal number of past cost-inducing (cost > 0)
+      #                   transitions resampled from a dedicated replay buffer -- e.g. at
+      #                   steps_per_epoch=5000, tries for 5000 fresh + 5000 replayed rows. Costs
+      #                   are typically sparse, so an 'epoch'-only fit rarely sees enough
+      #                   cost-positive rows; this concentrates the replay on exactly those rows
+      #                   instead of diluting it with 'buffer''s whole (mostly cost-zero) history.
+      #                   Both w_r and w_c are solved on the same combined design matrix.
+      ridge_data: epoch
+      # how many buffered transitions to draw for the solve (ridge_data: buffer only);
+      # null = use the entire buffer. Cost is O(N * sr_dim^2), linear in N.
+      ridge_buffer_samples: ~
+      # capacity of the persistent cost-inducing replay buffer (ridge_data: cost_replay only)
+      cost_replay_buffer_size: 1000000
+      # learning rate for the sgd read-out weights (readout: sgd only); null = reuse sr_cfgs.lr
+      w_lr: ~
+      # capacity of the persistent sgd read-out replay buffer (readout: sgd only)
+      readout_buffer_size: 1000000
+      # gradient steps taken on w_r / w_c per epoch (readout: sgd only)
+      readout_grad_steps: 50
+      # L2 weight decay on the sgd read-out weights (readout: sgd only) -- the SGD analogue of the
+      # ridge kappa; raise it if w_r / w_c overfit (e.g. rank-deficient phi under phi_source: random)
+      w_weight_decay: 0.0
+      # L2 weight decay on the sgd COST read-out weight only (readout: sgd only); null =
+      # reuse w_weight_decay. The SGD analogue of ridge_kappa_cost above.
+      w_weight_decay_cost: ~
+      # minibatch size for the sgd read-out regression (readout: sgd only), sampled from the
+      # persistent buffer independently of the policy update; null = reuse algo_cfgs.batch_size
+      readout_batch_size: ~
+      # where phi comes from (td_ridge mode only). In the off-policy Q flavors "s" below is
+      # really the raw (obs, act) pair, since the ridge regresses the immediate reward onto phi.
+      #   'trunk'    : phi = normalize(Linear(trunk(s))), a read-out of the same trunk psi is
+      #                read from. Nothing optimizes phi, but it drifts anyway because the trunk
+      #                beneath it is trained by the psi TD loss and the value losses -- so psi is
+      #                fit against a feature stream that moves during the fit, and the ridge
+      #                basis shifts out from under the w_r / w_c solved on it.
+      #   'random'   : phi = normalize(Linear(s)), frozen at init -- a fixed random projection of
+      #                the raw input. Stationary, but an affine map cannot raise rank: phi's
+      #                effective rank is capped at obs_dim + 1 however large sr_dim is (measured
+      #                18 of 64 on a 17-dim obs), and the ridge can only fit near-affine
+      #                rewards/costs. A lower-bound baseline; 'separate' is the full-rank
+      #                nonlinear version of the same stationarity idea.
+      #   'separate' : phi = normalize(MLP(s)) on the raw input, frozen at init -- fixed deep
+      #                random features. Stationary like 'random' but nonlinear, and its depth is
+      #                set independently of the trunk's (which 'trunk' mode cannot do, since phi
+      #                and psi are both single read-outs of one shared body there).
+      #   'rff'      : phi = normalize(cos(Linear(s))), Random Fourier Features approximating a
+      #                Gaussian/RBF kernel of bandwidth phi_rff_bandwidth. Frozen like 'random' /
+      #                'separate', but unlike 'separate' its capacity is one interpretable knob
+      #                (the bandwidth) instead of an architecture search, and unlike 'random' it
+      #                escapes the affine rank cap via the cos nonlinearity.
+      #   'ensemble' : concatenates several independent frozen sub-bases (phi_ensemble_sources,
+      #                each one of 'random' / 'separate' / 'rff') into one sr_dim-wide phi,
+      #                splitting sr_dim evenly across members. Trades one arbitrary random draw
+      #                for an average over several; also useful as a diagnostic (via
+      #                sr_diagnostics) for which family actually fits the reward/cost signal.
+      #   'contrastive': phi = normalize(MLP(s)), same architecture as 'separate' but NOT frozen
+      #                -- trained by a time-contrastive InfoNCE loss (see the block below) that
+      #                pulls together states visited close in time within an episode and pushes
+      #                apart temporally-distant / other-episode ones. Pretrained at epoch 0,
+      #                before the first psi TD update / ridge solve ever see it, then continually
+      #                fine-tuned every epoch after. On-policy (V flavor) only.
+      #   'laplacian': phi = MLP(s) -- same architecture as 'separate' / 'contrastive', trained
+      #                by the Augmented Lagrangian Laplacian Objective (ALLO; see the block
+      #                below) to be the bottom sr_dim eigenvectors of the transition graph's
+      #                Laplacian. Where 'contrastive' asks only that temporally-adjacent states
+      #                be close, this asks for the property td_ridge actually needs: those
+      #                eigenvectors are, by the variational characterization of the eigenvalue
+      #                problem, the sr_dim-dimensional basis in which an arbitrary state signal
+      #                is best approximated LINEARLY -- and w_r / w_c are exactly two such linear
+      #                approximations. Same cadence as 'contrastive' (pretrained at epoch 0,
+      #                fine-tuned every epoch after) and likewise on-policy (V flavor) only.
+      #                NOTE: alone among the sources its phi is NOT l2-normalized -- the
+      #                orthonormality constraint sets the scale instead, and satisfying it is
+      #                what hands the ridge solve an N * I Gram matrix (watch Misc/GramCond).
+      #   'joint'    : phi = MLP(s) -- trainable and unnormalized like 'laplacian', but with NO
+      #                objective of its own: it is one factor of the bilinear successor-measure
+      #                critic psi(s).phi(g) that psi_objective: 'contrastive' fits, so it is
+      #                trained by the same loss, optimizer and step as psi. Only meaningful
+      #                together with that psi_objective, and validated against it at startup.
+      phi_source: trunk
+      # hidden layer sizes of the standalone phi network (phi_source: 'separate' /
+      # 'contrastive' / 'laplacian' only, and any such entries of phi_ensemble_sources). Sets
+      # its hidden widths verbatim, independent of sr_dim (which only sets its output width) and of
+      # sr_cfgs.hidden_sizes (its depth and width are its own, which is the point of this mode).
+      phi_hidden_sizes: [64, 64]
+      # draw phi_source: 'random' / 'separate' (and any such phi_ensemble_sources entries) with
+      # an orthogonal rather than i.i.d. random first-layer weight matrix (Orthogonal Random
+      # Features) -- reduces the variance of the random projection and improves effective-rank
+      # utilization of sr_dim for the same obs_dim, at ~zero cost since phi is always
+      # re-normalized, so only the projection's directions matter, not its raw scale
+      phi_orthogonal_init: false
+      # RBF kernel bandwidth (sigma) for phi_source: 'rff' (and any such phi_ensemble_sources
+      # entries); larger = smoother/lower-frequency features, smaller = higher-frequency
+      phi_rff_bandwidth: 1.0
+      # sub-basis families for phi_source: 'ensemble', each one of 'random' / 'separate' / 'rff';
+      # null falls back to one of each ['random', 'separate', 'rff']. Ignored unless
+      # phi_source: 'ensemble'
+      phi_ensemble_sources: ~
+      # --- Time-contrastive phi learning (phi_source: 'contrastive' only) ---------------------
+      # temperature for the InfoNCE / NT-Xent similarity scaling; lower = sharper, more
+      # discriminative positive/negative separation
+      phi_contrastive_temperature: 0.1
+      # max |timestep offset| within an episode a state pair may be sampled as a positive; both
+      # directions (past and future) count, i.e. the true window is +/- this many steps
+      phi_contrastive_horizon: 5
+      # gradient steps taken on phi at epoch 0, before the first psi TD update / ridge solve --
+      # gets phi out of its random-init regime before anything downstream is fit against it
+      phi_contrastive_pretrain_steps: 500
+      # gradient steps taken on phi every epoch after epoch 0 -- phi is trained continually,
+      # never frozen once pretrained
+      phi_contrastive_steps_per_epoch: 50
+      # minibatch size for the contrastive loss's in-batch-negative InfoNCE; null = reuse
+      # algo_cfgs.batch_size
+      phi_contrastive_batch_size: ~
+      # learning rate for phi's dedicated optimizer (the trained phi sources 'contrastive' /
+      # 'laplacian' only); null = reuse sr_cfgs.lr
+      phi_lr: ~
+      # --- Laplacian phi learning, ALLO (phi_source: 'laplacian' only) ------------------------
+      # quadratic barrier coefficient b of the augmented Lagrangian. Unlike the fixed-penalty
+      # methods ALLO replaces -- whose equilibrium, and therefore whose recovered features, are an
+      # artifact of this coefficient -- the solution here does NOT depend on it: the dual
+      # variables below are what make the constraint exact. It only conditions the descent.
+      phi_laplacian_barrier: 2.0
+      # dual-ascent step size for the Lagrange multipliers enforcing E_rho[phi phi^T] = I. Too
+      # large and the multipliers oscillate; too small and phi spends the run with an unsatisfied
+      # constraint. Watch Misc/LaplacianOffDiagErr (are the coordinates decorrelating?) against
+      # Misc/LaplacianDualNorm (are the multipliers still growing, or have they settled?).
+      phi_laplacian_dual_lr: 0.01
+      # minibatch size for the objective, deliberately larger than algo_cfgs.batch_size: the
+      # constraint is on an sr_dim x sr_dim second moment, so a batch that does not comfortably
+      # exceed sr_dim leaves the residual dominated by estimation noise rather than by real
+      # correlation. Cheap -- it is a small MLP over states already in memory. Each step draws two
+      # independent batches this size (needed for an unbiased barrier gradient) plus one batch of
+      # graph edges. null = reuse algo_cfgs.batch_size.
+      phi_laplacian_batch_size: 1024
+      # learning rate for phi under this objective, overriding phi_lr / sr_cfgs.lr. Deliberately
+      # ~10x the trunk's: ALLO has an orthonormality constraint to satisfy from scratch, and at
+      # sr_cfgs.lr (3e-4) it simply does not get there within any sane pretrain budget.
+      phi_laplacian_lr: 0.003
+      # gradient steps taken on phi at epoch 0, before the first psi TD update / ridge solve --
+      # gets phi out of its random-init regime before anything downstream is fit against it.
+      # Measured on Simple-v0 at sr_dim 16 (LaplacianDiagErr / OffDiagErr / GramCond after the
+      # burst): 500 steps at 3e-4 leaves 0.28 / 0.30 / ~4000 -- i.e. no better conditioned than
+      # phi_source: trunk -- while 2000 at 3e-3 reaches 0.07 / 0.08 / ~3, which is the N * I Gram
+      # this basis exists to produce. 5000 steps buys nothing more. If GramCond is not falling to
+      # single digits within a few epochs, this and phi_laplacian_lr are the two knobs to raise.
+      phi_laplacian_pretrain_steps: 2000
+      # gradient steps taken on phi every epoch after epoch 0 -- phi keeps adapting as the
+      # on-policy state distribution shifts, rather than being frozen once pretrained
+      phi_laplacian_steps_per_epoch: 50
+      # --- How psi is fitted (td_ridge mode only) ---------------------------------------------
+      #   'td'          : bootstrap psi against the discounted lambda-target of the phi stream
+      #                   (lam_sr / gamma_sr above), the same estimator machinery the scalar
+      #                   reward/cost value targets use. The original and the default.
+      #   'contrastive' : C-learning / contrastive RL. Drop the bootstrap: fit phi and psi
+      #                   *jointly* as the two factors of one bilinear critic psi(s).phi(g),
+      #                   trained to be the density ratio of the discounted successor measure
+      #                   against the visitation distribution -- positives drawn from each
+      #                   anchor's own geometrically-discounted future, negatives from the batch.
+      #                   Removes the moving-target problem outright: psi's TD target refers to
+      #                   phi, so under any phi that is still training psi chases a feature map
+      #                   that moves under it, and here there is no target at all. The ridge
+      #                   read-out is unchanged and in fact becomes exactly right, since
+      #                   sum_t gamma^t r(s_t) = psi(s) . E_rho[phi(g) r(g)] -- note this needs
+      #                   the ratio in its LINEAR scale, which is why the loss is a least-squares
+      #                   density-ratio fit and not an InfoNCE whose inner product is a logit.
+      #                   Requires phi_source: 'joint'. On-policy (V flavor) only.
+      psi_objective: td
+      # gradient steps on the joint phi/psi critic at epoch 0 (psi_objective: 'contrastive' only).
+      # Larger than the per-epoch budget because epoch 0 builds the representation from scratch
+      # with nothing downstream yet fitted against it.
+      psi_contrastive_pretrain_steps: 2000
+      # gradient steps on the joint phi/psi critic every epoch after epoch 0. Roughly matches what
+      # the 'td' path spends on psi (update_iters * minibatches per epoch), so the two objectives
+      # are compared at comparable budget rather than at comparable wall-clock.
+      psi_contrastive_steps_per_epoch: 300
+      # minibatch size for the joint critic. The negatives ARE the rho sample the E_rho term is
+      # estimated over, and all anchor-negative pairs are used at once (a batch of M anchors
+      # contributes M^2 samples via one matmul), so this is the knob that sets that estimate's
+      # quality. null = reuse algo_cfgs.batch_size.
+      psi_contrastive_batch_size: 1024
+      # --- SR diagnostics (td_ridge mode only; see PolicyGradient._log_sr_diagnostics) ---
+      # number of observations in each phi/psi drift probe set. One probe is drawn once and held
+      # for the whole run (drift with the input distribution held constant), the other is redrawn
+      # from each epoch's rollout (drift on the states the current policy actually visits).
+      probe_size: 512
+      # cap on the rows used per split by the diagnostic pass, which runs SVDs and ridge solves
+      # over the epoch batch; the metrics are all per-row averages, so subsampling only costs
+      # precision, never bias
+      diag_max_samples: 4096
+  # lagrangian configurations
+  lagrange_cfgs:
+    # Tolerance of constraint violation
+    cost_limit: 25.0
+    # Initial value of lagrangian multiplier
+    lagrangian_multiplier_init: 0.001
+    # Learning rate of lagrangian multiplier
+    lambda_lr: 0.035
+    # Type of lagrangian optimizer
+    lambda_optimizer: "Adam"
+  # environment specific configurations
+  env_cfgs:
+    lidar_num_bins: ~
+    # Number of hazards, for the *GoalHazards* envs only (SafetyPointGoalHazards1-v0 etc.).
+    # null keeps the task's own default (8). Travels inside the env `config`, which
+    # safety_gymnasium.make merges into the registered spec, so it is applied when each env is
+    # constructed -- including inside async vector workers, which a parent-side patch cannot
+    # reach. That is why, unlike lidar_num_bins, it does not force synchronous vector envs.
+    hazards_num: ~
+ShadowHandCatchOver2UnderarmSafeFinger:
+  # training configurations
+  train_cfgs:
+    # number of vectorized environments
+    vector_env_nums: 256
+    # total number of steps to train
+    total_steps: 100000000
+  # algorithm configurations
+  algo_cfgs:
+    # number of steps to update the policy
+    steps_per_epoch: 38400
+    # number of iterations to update the policy
+    update_iters: 8
+    # batch size for each iteration
+    batch_size: 8192
+    # target kl divergence
+    target_kl: 0.016
+    # max gradient norm
+    max_grad_norm: 1.0
+    # use critic norm
+    use_critic_norm: False
+    # reward discount factor
+    gamma: 0.96
+    # normalize reward
+    reward_normalize: False
+    # normalize cost
+    cost_normalize: False
+    # normalize observation
+    obs_normalize: False
+  # model configurations
+  model_cfgs:
+    # actor network configurations
+    actor:
+      # hidden layer sizes
+      hidden_sizes: [1024, 1024, 512]
+    critic:
+      # hidden layer sizes
+      hidden_sizes: [1024, 1024, 512]
+      # learning rate
+      lr: 0.0006
+
+ShadowHandOverSafeFinger:
+  # training configurations
+  train_cfgs:
+    # number of vectorized environments
+    vector_env_nums: 256
+    # total number of steps to train
+    total_steps: 100000000
+  # algorithm configurations
+  algo_cfgs:
+    # number of steps to update the policy
+    steps_per_epoch: 38400
+    # number of iterations to update the policy
+    update_iters: 8
+    # batch size for each iteration
+    batch_size: 8192
+    # target kl divergence
+    target_kl: 0.016
+    # max gradient norm
+    max_grad_norm: 1.0
+    # use critic norm
+    use_critic_norm: False
+    # reward discount factor
+    gamma: 0.96
+    # normalize observation
+    obs_normalize: False
+  # model configurations
+  model_cfgs:
+    # actor network configurations
+    actor:
+      # hidden layer sizes
+      hidden_sizes: [1024, 1024, 512]
+    critic:
+      # hidden layer sizes
+      hidden_sizes: [1024, 1024, 512]
+      # learning rate
+      lr: 0.0006
+
+ShadowHandCatchOver2UnderarmSafeJoint:
+  # training configurations
+  train_cfgs:
+    # number of vectorized environments
+    vector_env_nums: 256
+    # total number of steps to train
+    total_steps: 100000000
+  # algorithm configurations
+  algo_cfgs:
+    # number of steps to update the policy
+    steps_per_epoch: 38400
+    # number of iterations to update the policy
+    update_iters: 8
+    # batch size for each iteration
+    batch_size: 8192
+    # target kl divergence
+    target_kl: 0.016
+    # max gradient norm
+    max_grad_norm: 1.0
+    # use critic norm
+    use_critic_norm: False
+    # reward discount factor
+    gamma: 0.96
+    # normalize reward
+    reward_normalize: False
+    # normalize cost
+    cost_normalize: False
+    # normalize observation
+    obs_normalize: False
+  # model configurations
+  model_cfgs:
+    # actor network configurations
+    actor:
+      # hidden layer sizes
+      hidden_sizes: [1024, 1024, 512]
+    critic:
+      # hidden layer sizes
+      hidden_sizes: [1024, 1024, 512]
+      # learning rate
+      lr: 0.0006
+
+ShadowHandOverSafeJoint:
+  # training configurations
+  train_cfgs:
+    # number of vectorized environments
+    vector_env_nums: 256
+    # total number of steps to train
+    total_steps: 100000000
+  # algorithm configurations
+  algo_cfgs:
+    # number of steps to update the policy
+    steps_per_epoch: 38400
+    # number of iterations to update the policy
+    update_iters: 8
+    # batch size for each iteration
+    batch_size: 8192
+    # target kl divergence
+    target_kl: 0.016
+    # max gradient norm
+    max_grad_norm: 1.0
+    # use critic norm
+    use_critic_norm: False
+    # reward discount factor
+    gamma: 0.96
+    # normalize observation
+    obs_normalize: False
+  # model configurations
+  model_cfgs:
+    # actor network configurations
+    actor:
+      # hidden layer sizes
+      hidden_sizes: [1024, 1024, 512]
+    critic:
+      # hidden layer sizes
+      hidden_sizes: [1024, 1024, 512]
+      # learning rate
+      lr: 0.0006
+
+SafeMetaDrive:
+  # training configurations
+  train_cfgs:
+    torch_threads: 4
+    total_steps: 500000
+  logger_cfgs:
+    save_model_freq: 15
+  algo_cfgs:
+    batch_size: 256
+    entropy_coef: 0.01
+    steps_per_epoch: 3000
+    update_iters: 40
+    reward_normalize: false
+    cost_normalize: true
+    obs_normalize: false
+    max_grad_norm: 0.05
+  model_cfgs:
+    actor:
+      hidden_sizes: [256, 256]
+      lr: 5.0e-05
+    critic:
+      hidden_sizes: [256, 256]
+      lr: 5.0e-05
+  env_cfgs:
+    meta_drive_config:
+      horizon: 1500
+      random_traffic: false
+      crash_vehicle_penalty: 1.0
+      crash_object_penalty: 0.5
+      out_of_road_penalty: 1.0
+  lagrange_cfgs:
+    cost_limit: 0.0
+    lagrangian_multiplier_init: 0.01
+    lambda_lr: 0.01
+    lambda_optimizer: Adam

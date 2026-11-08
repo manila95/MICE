@@ -54,6 +54,9 @@ class OnPolicyAdapter(OnlineAdapter):
         """Initialize an instance of :class:`OnPolicyAdapter`."""
         super().__init__(env_id, num_envs, seed, cfgs)
         self._epoch_cost_sum: float = 0.0
+        # Every episode's own cost, for this epoch only -- a tail statistic over the
+        # logger's rolling window would select the worst episodes of several epochs ago.
+        self._epoch_ep_costs: list[float] = []
         self._reset_log()
 
     @property
@@ -91,6 +94,7 @@ class OnPolicyAdapter(OnlineAdapter):
         """
         self._reset_log()
         self._epoch_cost_sum = 0.0
+        self._epoch_ep_costs = []
 
         obs, _ = self.reset()
         for step in track(
@@ -197,6 +201,7 @@ class OnPolicyAdapter(OnlineAdapter):
         """
         if hasattr(self._env, 'spec_log'):
             self._env.spec_log(logger)
+        self._epoch_ep_costs.append(float(self._ep_cost[idx]))
         logger.store(
             {
                 'Metrics/EpRet': self._ep_ret[idx],
