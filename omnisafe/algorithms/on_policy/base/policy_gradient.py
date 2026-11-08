@@ -324,7 +324,15 @@ class PolicyGradient(BaseAlgo):
         # drawn from. Only an 'mc' value target is a sample of the return; a bootstrapped one is
         # a critic-dependent mixture, and the learned quantiles would describe that instead --
         # silently answering a different question. Refuse rather than fit the wrong thing.
-        if int(self._cfgs.model_cfgs.critic.get('num_quantiles', 0) or 0) > 0:
+        _critic_cfgs = self._cfgs.model_cfgs.critic
+        # Either stream being distributional is enough to need a return-sample target: the cost
+        # critic can be turned on alone via num_quantiles_cost, and checking only the shared key
+        # would let that run fit quantiles to a bootstrapped target in silence.
+        _quantile_streams = max(
+            int(_critic_cfgs.get('num_quantiles', 0) or 0),
+            int(_critic_cfgs.get('num_quantiles_cost', 0) or 0),
+        )
+        if _quantile_streams > 0:
             _, value_target = resolve_adv_and_target(
                 self._cfgs.algo_cfgs.adv_estimation_method,
                 getattr(self._cfgs.algo_cfgs, 'value_target', None),
