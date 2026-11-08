@@ -59,6 +59,7 @@ from omnisafe.utils.isolated_eval import (
 )
 from omnisafe.utils.value_eval import (
     _find_obs_normalizer,
+    compute_advantage_gradient_alignment,
     estimate_advantage_from_snapshots,
     estimate_true_value,
     compute_gradient_alignment,
@@ -736,6 +737,14 @@ class PolicyGradient(BaseAlgo):
                             self._logger.register_key(f'IntermediateAdv/pos{pos}/{key}_{stream}')
                     self._logger.register_key(f'IntermediateAdv/pos{pos}/NumProbes')
                     self._logger.register_key(f'IntermediateAdv/pos{pos}/MCRepeats')
+            if bool(getattr(self._cfgs.algo_cfgs, 'eval_advantage', False)):
+                for stream in ('r', 'c'):
+                    for key in (
+                        'EstimationError', 'Correlation', 'MeanTrue', 'MeanPred',
+                        'GradientAlignment',
+                    ):
+                        self._logger.register_key(f'PooledAdv/{key}_{stream}')
+                self._logger.register_key('PooledAdv/NumProbes')
 
             # Pooled diversity correlation: s0 (if mc_value_study is also on) plus every
             # intermediate position, pooled into one correlation -- see
@@ -1348,6 +1357,29 @@ class PolicyGradient(BaseAlgo):
             )
             pooled_stats, pooled_raw = pool_correlation_stats(pooled_sources, prefix='PooledMC/')
             self._logger.store(pooled_stats)
+            # The same pooling for the one-step advantage: one number over every advantage probe,
+            # the directly comparable headline to PooledMC's. Pooled separately rather than
+            # folded in -- an advantage and a value are different quantities on different
+            # scales, and averaging a correlation across both would mean nothing.
+            adv_by_pos = eval_data_bundle.get('advantage_study') or {}
+            if adv_by_pos:
+                pooled_adv_stats, pooled_adv_raw = pool_correlation_stats(
+                    [blk['raw'] for blk in adv_by_pos.values()],
+                    prefix='PooledAdv/',
+                )
+                for stream in ('r', 'c'):
+                    # Under 'plain' the advantage *is* the policy gradient's weight, so this
+                    # asks the sharper version of PooledMC's question: not whether the critic
+                    # ranks states correctly, but whether its error rotates the update.
+                    pooled_adv_stats[f'PooledAdv/GradientAlignment_{stream}'] = (
+                        compute_advantage_gradient_alignment(
+                            self._actor_critic.actor, pooled_adv_raw, stream,
+                        )
+                    )
+                self._logger.store(pooled_adv_stats)
+                eval_data_bundle['pooled_advantage'] = {
+                    'stats': pooled_adv_stats, 'raw': pooled_adv_raw,
+                }
             # Gradient-alignment diagnostic (see compute_gradient_alignment's docstring) --
             # uses the exact same pooled (s, a, return, pred, mc_mean) samples the
             # correlation numbers above were just computed from, so it answers a directly

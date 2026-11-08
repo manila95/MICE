@@ -434,15 +434,22 @@ def collect_on_policy_snapshots(
     # same action that leads to the s_{t+1} snapshot, so the triple stays consistent.
     transition_steps = set() if transition_steps is None else set(transition_steps)
     transitions: dict[int, dict[str, list[float]]] = {
-        t: {'reward': [0.0] * n_envs, 'cost': [0.0] * n_envs} for t in transition_steps
+        t: {'reward': [0.0] * n_envs, 'cost': [0.0] * n_envs, 'action': [None] * n_envs}
+        for t in transition_steps
     }
 
     obs, _ = env.reset(seed=list(range(base_seed, base_seed + n_envs)))
     collected: dict[int, list[dict | None]] = {t: [None] * n_envs for t in trigger_steps}
     for t in range(max_t):
         act, _, _, _ = agent.step(obs)
+        prev_obs = obs
         obs, reward, cost, _, _, info = env.step(act)
         if t in transitions:
+            # The state the action was taken from, and the action itself -- the pair a
+            # policy-gradient term is built from, kept so the advantage study can ask whether
+            # critic error rotates that gradient.
+            transitions[t]['obs'] = [row.detach().cpu().clone() for row in prev_obs]
+            transitions[t]['action'] = [row.detach().cpu().clone() for row in act]
             # obs entering this iteration was s_t, so this is r_t / c_t -- the step that lands on
             # the s_{t+1} snapshot captured below.
             transitions[t]['reward'] = reward.reshape(-1).detach().cpu().tolist()

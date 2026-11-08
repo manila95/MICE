@@ -1271,6 +1271,11 @@ def estimate_advantage_from_snapshots(
     """
     stats: dict[str, float] = {}
     raw: dict[str, Any] = {'probe_seeds': list(raw_at.get('probe_seeds', []))}
+    # Probe-length lists of one-element lists, matching the value studies' (probe, repeat)
+    # nesting: there is exactly one reference transition per probe, not one per repeat.
+    if transition.get('obs') is not None and transition.get('action') is not None:
+        raw['obs'] = [[o] for o in transition['obs']]
+        raw['action'] = [[a] for a in transition['action']]
     for stream, discount, signal in (('r', discount_r, 'reward'), ('c', discount_c, 'cost')):
         step_signal = np.asarray(transition[signal], dtype=np.float64)
         pred_at = np.asarray(raw_at[stream]['pred'], dtype=np.float64)
@@ -1313,6 +1318,67 @@ def _corr_pair(a: torch.Tensor, b: torch.Tensor) -> float:
     if a.numel() < 2 or a.std() <= 0 or b.std() <= 0:
         return float('nan')
     return torch.corrcoef(torch.stack([a, b]))[0, 1].item()
+
+
+def compute_advantage_gradient_alignment(
+    actor,
+    raw: dict,
+    stream: str,
+    device: torch.device | None = None,
+) -> float:
+    r"""Cosine between the policy gradient built from the predicted advantage and from the true one.
+
+    The value study's :func:`compute_gradient_alignment` asks the same question for a *baseline*:
+    it weights :math:`\nabla \log \pi(a_t|s_t)` by :math:`R_t - b(s_t)` under the predicted and
+    the Monte-Carlo baseline. Under ``plain``/``td_zero`` the gradient is not weighted by a
+    baseline-corrected return at all but by the one-step advantage itself, so the directly
+    comparable quantity here is
+
+    .. math:: \cos\Big(\sum_t A^{pred}_t \nabla \log \pi(a_t|s_t),\;
+              \sum_t \hat{A}_t \nabla \log \pi(a_t|s_t)\Big)
+
+    with both sums over the same realized ``(s_t, a_t)`` pairs, so only the weighting differs.
+    1.0 means the critic's advantage error does not rotate the update at all, however wrong its
+    magnitudes are; a value near 0 means the gradient points somewhere else entirely.
+
+    Args:
+        actor: The policy, for ``\log \pi(a|s)`` with gradient.
+        raw: An ``estimate_advantage_from_snapshots`` raw dict (pooled or per-position), needing
+            ``'obs'``/``'action'`` and ``raw[stream]['pred']``/``'mc_mean'``.
+        stream (str): ``'r'`` or ``'c'``.
+        device: Device to compute on; inferred from the actor when omitted.
+
+    Returns:
+        Cosine similarity in ``[-1, 1]``, or ``nan`` when the pairs are missing or either
+        gradient vanishes (every advantage identically zero).
+    """
+    if 'obs' not in raw or 'action' not in raw:
+        return float('nan')
+    if device is None:
+        device = next(actor.parameters()).device
+    pred_list = raw[stream]['pred']
+    true_list = raw[stream]['mc_mean']
+    params = [p for p in actor.parameters() if p.requires_grad]
+    grad_pred = [torch.zeros_like(p) for p in params]
+    grad_true = [torch.zeros_like(p) for p in params]
+    for i, (obs_reps, act_reps) in enumerate(zip(raw['obs'], raw['action'])):
+        if i >= len(pred_list):
+            break
+        for obs_i, act_i in zip(obs_reps, act_reps):
+            actor.zero_grad(set_to_none=True)
+            dist = actor(obs_i.to(device).reshape(1, -1))
+            logp = dist.log_prob(act_i.to(device).reshape(1, -1)).sum()
+            grads = torch.autograd.grad(logp, params, retain_graph=False, allow_unused=True)
+            for acc_p, acc_t, g in zip(grad_pred, grad_true, grads):
+                if g is None:
+                    continue
+                acc_p += float(pred_list[i]) * g
+                acc_t += float(true_list[i]) * g
+    flat_pred = torch.cat([g.reshape(-1) for g in grad_pred])
+    flat_true = torch.cat([g.reshape(-1) for g in grad_true])
+    if flat_pred.norm() == 0 or flat_true.norm() == 0:
+        return float('nan')
+    return torch.nn.functional.cosine_similarity(flat_pred, flat_true, dim=0).item()
 
 
 def pool_correlation_stats(raw_list: list[dict], prefix: str = '') -> tuple[dict, dict]:
