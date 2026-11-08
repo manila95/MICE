@@ -124,6 +124,16 @@ class CriticBuilder:
                 use_obs_encoder=self._use_obs_encoder,
             )
         if critic_type == 'v' and self._num_quantiles > 0:
+            if self._ensemble_method != 'none':
+                # The quantile critic is a single network; it has no ensemble members to
+                # aggregate, so an ensemble setting here would be silently dropped and the run
+                # would quietly not be the one that was configured.
+                raise NotImplementedError(
+                    'model_cfgs.critic.ensemble_method is not supported together with '
+                    f'num_quantiles (got ensemble_method "{self._ensemble_method}"). The '
+                    'quantile critic already models the return distribution; an ensemble over '
+                    'it would be a different thing again and is not implemented.',
+                )
             return QuantileVCritic(
                 obs_space=self._obs_space,
                 act_space=self._act_space,
