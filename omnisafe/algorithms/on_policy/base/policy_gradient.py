@@ -38,6 +38,7 @@ from omnisafe.envs.core import make as make_env
 from omnisafe.envs.wrapper import ActionScale, AutoReset, ObsNormalize, TimeLimit, Unsqueeze
 from omnisafe.models.actor_critic.constraint_actor_critic import ConstraintActorCritic
 from omnisafe.utils.gae import resolve_adv_and_target
+from omnisafe.utils.tail_eval import tail_stats
 from omnisafe.models.critic.quantile_v_critic import QuantileVCritic, quantile_huber_loss
 from omnisafe.utils import clearning, contrastive, distributed, laplacian, sr_diagnostics
 from omnisafe.utils.critic_ensemble import GPLBetaAdapter, TOPBanditAdapter
@@ -717,6 +718,15 @@ class PolicyGradient(BaseAlgo):
                 self._logger.register_key(f'MCStudy/MeanTarget_{stream}')
             self._logger.register_key('MCStudy/NumProbes')
             self._logger.register_key('MCStudy/MCRepeats')
+            # Tail-scored counterparts, for a cost critic that predicts a tail rather than a
+            # mean (see omnisafe.utils.tail_eval). Registered whenever tail scoring could be on
+            # -- the keys must exist before the first dump, and _tail_eval_alpha depends on the
+            # critic, which is built by then.
+            if self._tail_eval_alpha() is not None:
+                for group in ('MCStudyTail/', 'PooledMCTail/'):
+                    for key in ('EstimationError_c', 'Correlation_c', 'MeanTrue_c',
+                                'MeanPred_c', 'NumProbes', 'TailSamples'):
+                        self._logger.register_key(f'{group}{key}')
 
         # On-policy intermediate-state value study (opt-in; see estimate_value_from_snapshots's
         # docstring and learn()'s call site). One block of keys per within-episode position, since
@@ -735,6 +745,10 @@ class PolicyGradient(BaseAlgo):
                     self._logger.register_key(f'IntermediateMC/pos{pos}/MeanTarget_{stream}')
                 self._logger.register_key(f'IntermediateMC/pos{pos}/NumProbes')
                 self._logger.register_key(f'IntermediateMC/pos{pos}/MCRepeats')
+                if self._tail_eval_alpha() is not None:
+                    for key in ('EstimationError_c', 'Correlation_c', 'MeanTrue_c',
+                                'MeanPred_c', 'NumProbes', 'TailSamples'):
+                        self._logger.register_key(f'IntermediateMCTail/pos{pos}/{key}')
                 if bool(getattr(self._cfgs.algo_cfgs, 'eval_advantage', False)):
                     # The one-step advantage at this position, scored against the same
                     # Monte-Carlo reference -- see estimate_advantage_from_snapshots.
@@ -1124,6 +1138,32 @@ class PolicyGradient(BaseAlgo):
                 f'{min(result["episode_lengths"])}-{max(result["episode_lengths"])}).',
             )
 
+    def _tail_eval_alpha(self) -> float | None:
+        """Tail fraction the cost critic should be scored at, or ``None`` for the mean.
+
+        Set it explicitly with ``algo_cfgs.eval_tail_alpha``; a risk-sensitive algorithm that
+        leaves it null gets its own ``cvar_alpha``, so the reference matches what the critic
+        predicts without having to be configured twice and kept in sync by hand.
+        """
+        explicit = getattr(self._cfgs.algo_cfgs, 'eval_tail_alpha', None)
+        if explicit is not None:
+            return float(explicit)
+        critic = getattr(self._actor_critic, 'cost_critic', None)
+        if getattr(critic, '_risk_measure', 'mean') == 'cvar':
+            return float(critic._risk_alpha)  # pylint: disable=protected-access
+        return None
+
+    def _store_tail_stats(self, raw: dict, prefix: str, bundle_key: str, bundle: dict) -> None:
+        """Score one study's cost predictions against the Monte-Carlo tail and file the result."""
+        alpha = self._tail_eval_alpha()
+        if alpha is None:
+            return
+        stats, tail_raw = tail_stats(raw, alpha, stream='c', prefix=prefix)
+        if not stats:
+            return
+        self._logger.store(stats)
+        bundle[bundle_key] = {'stats': stats, 'raw': tail_raw}
+
     def _run_eval_studies(self, epoch: int) -> None:
         """Run this epoch's value-function evaluation studies, if any are due.
 
@@ -1235,6 +1275,9 @@ class PolicyGradient(BaseAlgo):
             )
             self._logger.store(mc_stats)
             eval_data_bundle['mc_study'] = {'stats': mc_stats, 'raw': mc_raw}
+            self._store_tail_stats(
+                mc_raw, 'MCStudyTail/', 'mc_study_tail', eval_data_bundle,
+            )
         # On-policy intermediate-state value study (opt-in, default off -- see
         # estimate_value_from_snapshots's docstring). Asks the question the s0 study above
         # can't: is the critic accurate at states the CURRENT policy actually visits
@@ -1329,6 +1372,10 @@ class PolicyGradient(BaseAlgo):
                 eval_data_bundle['intermediate_study'][pos] = {
                     'stats': pos_stats, 'raw': pos_raw,
                 }
+                self._store_tail_stats(
+                    pos_raw, f'IntermediateMCTail/pos{pos}/', pos,
+                    eval_data_bundle.setdefault('intermediate_study_tail', {}),
+                )
 
             for pos in positions:
                 if not eval_advantage or pos + 1 not in value_raw_by_pos:
@@ -1398,6 +1445,9 @@ class PolicyGradient(BaseAlgo):
                 alignment = compute_gradient_alignment(self._actor_critic.actor, pooled_raw, stream)
                 self._logger.store({f'PooledMC/GradientAlignment_{stream}': alignment})
             eval_data_bundle['pooled'] = {'stats': pooled_stats, 'raw': pooled_raw}
+            self._store_tail_stats(
+                pooled_raw, 'PooledMCTail/', 'pooled_tail', eval_data_bundle,
+            )
         # Persist this epoch's eval data (raw + aggregates -- see eval_data_dump.py's
         # docstring for why this needs to exist separately from the online loggers) and save
         # a checkpoint, both on the exact same cadence as the eval blocks above. Note this

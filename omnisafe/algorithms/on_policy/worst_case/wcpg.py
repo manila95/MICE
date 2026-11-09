@@ -78,8 +78,9 @@ class WCPG(PPOLag):
                 'Monte-Carlo sample *mean*, but under WCPG that critic predicts the upper '
                 f'{self._cvar_alpha:.0%} tail. Its cost-side numbers (MCStudy/*_c, '
                 'IntermediateMC/*_c, PooledMC/*_c) compare two different quantities and are '
-                'not meaningful here; the reward side is unaffected. A tail reference is '
-                'needed for that and does not exist yet.',
+                'not meaningful here; the reward side is unaffected. Read the *Tail '
+                'counterparts instead -- MCStudyTail/, IntermediateMCTail/, PooledMCTail/ -- '
+                'which score the same predictions against the Monte-Carlo tail.',
             )
 
     def _constraint_value(self) -> float:

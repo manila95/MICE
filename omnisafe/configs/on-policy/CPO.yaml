@@ -259,6 +259,11 @@ defaults:
     # of which the per-state value study can see. Roughly doubles the intermediate study's cost,
     # since every probe position is also evaluated at pos + 1.
     eval_advantage: False
+    # Score the cost critic against the Monte-Carlo *tail* at this fraction instead of only the
+    # mean -- for a critic that predicts a tail, which the mean reference would mis-score. null
+    # means "the mean, unless the cost critic itself is risk-sensitive, in which case its own
+    # cvar_alpha". Costs no extra rollouts: it re-reduces returns the studies already collected.
+    eval_tail_alpha: ~
     # Huber threshold inside the quantile regression loss; 0 gives the plain pinball loss.
     # Unused unless model_cfgs.critic.num_quantiles > 0.
     quantile_huber_kappa: 1.0
