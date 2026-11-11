@@ -468,3 +468,36 @@ def correlation(vec_a: torch.Tensor, vec_b: torch.Tensor) -> float:
     if vec_a.numel() < 2 or vec_a.std() <= 0 or vec_b.std() <= 0:
         return float('nan')
     return torch.corrcoef(torch.stack([vec_a, vec_b]))[0, 1].item()
+
+
+def auroc_score(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    r"""Area under the ROC curve for a binary ``labels`` target, ``nan`` if degenerate.
+
+    Used by ``phi_source='predictive'``'s held-out diagnostics (see
+    :meth:`~omnisafe.algorithms.on_policy.base.policy_gradient.PolicyGradient._predictive_update_phi`)
+    to score the cost auxiliary head, where ``r2_score``'s scale-sensitivity is exactly the wrong
+    property: a sparse, imbalanced binary cost can have a near-0 (or negative) :math:`R^2` from
+    scale alone while still being well *separated*, which is what this metric measures instead.
+
+    Computed via the Mann-Whitney U statistic (the rank-sum form of AUROC: the probability a
+    uniformly-drawn positive scores higher than a uniformly-drawn negative), with no external
+    library dependency. Ties among predicted scores are not corrected for (unlike a library
+    implementation's tie-averaging) -- vanishingly unlikely for a continuous network output, so
+    not worth the extra complexity here.
+
+    Args:
+        scores (torch.Tensor): Predicted scores of shape ``(N,)``.
+        labels (torch.Tensor): Labels of shape ``(N,)``; any value ``> 0`` counts as positive.
+
+    Returns:
+        The AUROC, or ``nan`` if ``labels`` has no positives or no negatives.
+    """
+    scores, labels = scores.double().reshape(-1), labels.double().reshape(-1)
+    pos_mask = labels > 0
+    n_pos, n_neg = int(pos_mask.sum()), int((~pos_mask).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float('nan')
+    ranks = torch.argsort(torch.argsort(scores)).double() + 1.0
+    rank_sum_pos = ranks[pos_mask].sum()
+    u_stat = rank_sum_pos - n_pos * (n_pos + 1) / 2.0
+    return (u_stat / (n_pos * n_neg)).item()

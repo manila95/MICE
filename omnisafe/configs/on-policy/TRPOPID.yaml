@@ -564,6 +564,13 @@ defaults:
       #                NOTE: alone among the sources its phi is NOT l2-normalized -- the
       #                orthonormality constraint sets the scale instead, and satisfying it is
       #                what hands the ridge solve an N * I Gram matrix (watch Misc/GramCond).
+      #   'predictive': phi = normalize(MLP(s)), same architecture as 'contrastive', trained by a
+      #                supervised regression instead: two auxiliary heads (phi_aux_r / phi_aux_c)
+      #                ask phi to be directly linearly predictive of the one-step reward and cost
+      #                it will actually be ridge-read-out against. Unlike 'contrastive' and
+      #                'laplacian', this loss can be memorized, so it is fit and validated against
+      #                a persistent replay buffer with a genuine held-out split rather than the
+      #                current epoch alone -- see the block below and Predictive/HeldOutR2Cost.
       #   'joint'    : phi = MLP(s) -- trainable and unnormalized like 'laplacian', but with NO
       #                objective of its own: it is one factor of the bilinear successor-measure
       #                critic psi(s).phi(g) that psi_objective: 'contrastive' fits, so it is
@@ -571,9 +578,11 @@ defaults:
       #                together with that psi_objective, and validated against it at startup.
       phi_source: trunk
       # hidden layer sizes of the standalone phi network (phi_source: 'separate' /
-      # 'contrastive' / 'laplacian' only, and any such entries of phi_ensemble_sources). Sets
-      # its hidden widths verbatim, independent of sr_dim (which only sets its output width) and of
-      # sr_cfgs.hidden_sizes (its depth and width are its own, which is the point of this mode).
+      # 'contrastive' / 'laplacian' / 'predictive' only, and any such entries of
+      # phi_ensemble_sources). Sets its hidden widths verbatim, independent of sr_dim (which only
+      # sets its output width) and of sr_cfgs.hidden_sizes (its depth and width are its own, which
+      # is the point of this mode). A source-specific phi_{source}_hidden_sizes (e.g.
+      # phi_predictive_hidden_sizes, set below) overrides this shared default for that source only.
       phi_hidden_sizes: [64, 64]
       # draw phi_source: 'random' / 'separate' (and any such phi_ensemble_sources entries) with
       # an orthogonal rather than i.i.d. random first-layer weight matrix (Orthogonal Random
@@ -605,8 +614,40 @@ defaults:
       # algo_cfgs.batch_size
       phi_contrastive_batch_size: ~
       # learning rate for phi's dedicated optimizer (the trained phi sources 'contrastive' /
-      # 'laplacian' only); null = reuse sr_cfgs.lr
+      # 'laplacian' / 'predictive' only); null = reuse sr_cfgs.lr
       phi_lr: ~
+      # --- Reward/cost-predictive phi learning (phi_source: 'predictive' only) ----------------
+      # wider default than phi_hidden_sizes' shared [64, 64]: a held-out-verified convergence
+      # study found [128, 128] converged cleanest and fastest for this loss specifically. Leave
+      # phi_hidden_sizes itself alone -- changing it would also silently widen 'separate' /
+      # 'contrastive' / 'laplacian'.
+      phi_predictive_hidden_sizes: [128, 128]
+      # gradient steps taken on phi (and phi_aux_r / phi_aux_c) at epoch 0, before the first psi
+      # TD update / ridge solve. Deliberately 30x phi_contrastive_pretrain_steps's default: a
+      # held-out-verified study found the cheap cadence left this specific loss 10-30x
+      # undertrained (held-out R2 still climbing from about 0.3 past that budget, not plateauing
+      # until roughly this many steps) -- gradient steps on this small network are cheap (tens of
+      # microseconds each), so there is no real cost to the larger budget. See
+      # Predictive/HeldOutR2Cost / HeldOutR2Reward.
+      phi_predictive_pretrain_steps: 15000
+      # gradient steps taken on phi every epoch after epoch 0. Also raised well past
+      # phi_contrastive_steps_per_epoch's default for the same reason.
+      phi_predictive_steps_per_epoch: 500
+      # minibatch size sampled from phi_predictive's own replay buffer (below); null = reuse
+      # algo_cfgs.batch_size
+      phi_predictive_batch_size: ~
+      # fraction of each epoch's fresh transitions routed to the held-out buffer instead of the
+      # training buffer, every epoch -- a transition assigned here is never trained on at any
+      # point in its history. This is what makes Predictive/HeldOutR2Cost a genuine convergence
+      # check rather than an in-sample fit number.
+      phi_predictive_heldout_frac: 0.2
+      # size of the persistent train / held-out replay buffers (each), FIFO once full. Large
+      # enough that 20-epoch runs at steps_per_epoch in the low thousands never wrap.
+      phi_predictive_buffer_size: 1000000
+      # floor on the per-epoch reward/cost variance the loss normalizes by (MSE / Var), so an
+      # early, near-constant buffer (e.g. zero cost events yet) does not divide by ~0 and blow
+      # the loss up.
+      phi_predictive_var_floor: 1.0e-6
       # --- Laplacian phi learning, ALLO (phi_source: 'laplacian' only) ------------------------
       # quadratic barrier coefficient b of the augmented Lagrangian. Unlike the fixed-penalty
       # methods ALLO replaces -- whose equilibrium, and therefore whose recovered features, are an

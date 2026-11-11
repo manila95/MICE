@@ -193,10 +193,23 @@ class ConstraintActorCritic(ActorCritic):
         # bottleneck is deliberate.
         hidden_sizes = list(sr_cfgs.hidden_sizes)
         # Same independence for the standalone phi network of sr_cfgs.phi_source='separate' /
-        # 'contrastive': phi_hidden_sizes sets its hidden widths verbatim, sr_dim only sets its
-        # output width. Its depth (and now its width) is independent of the trunk's, which is the
-        # point of that mode.
-        phi_hidden_sizes = list(sr_cfgs.get('phi_hidden_sizes', []) or [])
+        # 'contrastive' / 'predictive': phi_hidden_sizes sets its hidden widths verbatim, sr_dim
+        # only sets its output width. Its depth (and now its width) is independent of the trunk's,
+        # which is the point of that mode.
+        #
+        # A source-specific phi_{source}_hidden_sizes wins over the shared phi_hidden_sizes, same
+        # precedence as phi_{source}_lr over phi_lr below: 'predictive' needs a wider default
+        # ([128, 128], see phi_predictive_pretrain_steps's docstring for why) than
+        # 'separate'/'contrastive'/'laplacian' share ([64, 64]), and a single shared key cannot
+        # serve both without silently changing the others' default too. Read here (rather than
+        # off self._sr_phi_source, which is not set yet for shared_trunk mode and is set below for
+        # td_ridge) since phi_source is meaningless outside td_ridge anyway.
+        _phi_source_for_hidden_sizes = sr_cfgs.get('phi_source', 'trunk')
+        phi_hidden_sizes = list(
+            sr_cfgs.get(f'phi_{_phi_source_for_hidden_sizes}_hidden_sizes', None)
+            or sr_cfgs.get('phi_hidden_sizes', [])
+            or [],
+        )
 
         # SR-trunk regularization (dropout/LayerNorm/spectral-norm/weight_decay): shared across
         # both reward and cost since the trunk itself is shared between them (see the class
@@ -249,7 +262,11 @@ class ConstraintActorCritic(ActorCritic):
             # Both need the same three pieces of special-casing below -- exclusion from
             # sr_optimizer, exclusion from the critic-norm penalty, and an optimizer of their own
             # -- so they are named once here rather than tested for individually three times.
-            self._sr_phi_trained: bool = self._sr_phi_source in ('contrastive', 'laplacian')
+            self._sr_phi_trained: bool = self._sr_phi_source in (
+                'contrastive',
+                'laplacian',
+                'predictive',
+            )
             trunk = TDRidgeSuccessorRepresentationTrunk(
                 obs_dim=obs_dim,
                 hidden_sizes=hidden_sizes,
@@ -327,6 +344,17 @@ class ConstraintActorCritic(ActorCritic):
             phi_param_ids = (
                 {id(p) for p in trunk.phi_net.parameters()} if self._sr_phi_trained else set()
             )
+            if self._sr_phi_source == 'predictive':
+                # phi_aux_r / phi_aux_c carry _predictive_update_phi's loss into phi_net and share
+                # its sr_phi_optimizer (below); they must be excluded here for the same reason
+                # phi_net itself is.
+                phi_param_ids |= {
+                    id(p)
+                    for p in itertools.chain(
+                        trunk.phi_aux_r.parameters(),
+                        trunk.phi_aux_c.parameters(),
+                    )
+                }
             excluded_ids = readout_weight_ids | phi_param_ids
             # Read by PolicyGradient's use_critic_norm loops (_update_reward_critic /
             # _update_cost_critic / _update_successor_features), which otherwise fold phi_net's
@@ -420,8 +448,21 @@ class ConstraintActorCritic(ActorCritic):
                     or sr_cfgs.get('phi_lr', None)
                     or sr_cfgs.lr
                 )
+                # 'predictive' also trains phi_aux_r / phi_aux_c (the heads its regression loss
+                # reads out through) on this same optimizer, so their Adam momentum state is
+                # shared with phi_net's rather than split across two optimizers stepping in
+                # lockstep on one loss.
+                phi_params = (
+                    itertools.chain(
+                        trunk.phi_net.parameters(),
+                        trunk.phi_aux_r.parameters(),
+                        trunk.phi_aux_c.parameters(),
+                    )
+                    if self._sr_phi_source == 'predictive'
+                    else trunk.phi_net.parameters()
+                )
                 self.sr_phi_optimizer: optim.Optimizer = optim.Adam(
-                    trunk.phi_net.parameters(),
+                    phi_params,
                     lr=phi_lr,
                 )
 

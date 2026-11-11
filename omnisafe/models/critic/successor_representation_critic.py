@@ -100,6 +100,23 @@ Within ``td_ridge``, ``model_cfgs.sr_cfgs.phi_source`` selects where ``phi`` com
   and its on-policy-only restriction. Alone among the sources its output is *not* l2-normalized
   (the orthonormality constraint sets the scale instead, and satisfying it hands the ridge solve
   an ``N * I`` Gram matrix) -- see :class:`LaplacianPhiFeatures`.
+* ``predictive``: ``phi = normalize(MLP(s))``, architecturally identical to ``contrastive`` (and
+  to ``separate``) -- trained by a supervised regression loss instead, directly asking ``phi`` to
+  be linearly predictive of the one-step reward *and* cost it will actually be ridge-read-out
+  against (see :meth:`PolicyGradient._predictive_update_phi`). Two auxiliary linear heads
+  (``phi_aux_r`` / ``phi_aux_c``) exist solely to carry this training signal into ``phi`` -- they
+  are never the deployed read-out, which stays the unmodified closed-form ridge solve on ``w_r`` /
+  ``w_c``. Because this loss is a plain supervised regression (unlike ``contrastive``'s InfoNCE or
+  ``laplacian``'s ALLO objective, neither of which can be "memorized"), it is trained and
+  validated against a persistent replay buffer with a genuine held-out split
+  (``PolicyGradient._sr_phi_heldout_buf``) rather than the current epoch's rollout alone, and its
+  convergence is logged directly (``Predictive/HeldOutR2Cost`` and siblings) so it can be checked
+  without a bespoke script. Shares ``contrastive``'s dedicated ``sr_phi_optimizer`` and
+  on-policy-only restriction, but needs a substantially larger pretrain budget than that cadence's
+  defaults: gradient steps on this network are cheap, and a held-out-verified study found the
+  cheap 500-pretrain/50-per-epoch cadence left this loss 10-30x undertrained (held-out
+  :math:`R^2` still climbing from about 0.3 past that budget, not plateauing until roughly 15,000
+  steps) -- see ``phi_predictive_pretrain_steps``'s default.
 * ``joint``: ``phi = MLP(s)``, the same architecture once more, trainable and unnormalized, but
   with **no objective of its own at all**. It is one factor of the bilinear successor-measure
   critic ``psi(s)^T phi(g)`` that ``model_cfgs.sr_cfgs.psi_objective='contrastive'`` fits (see
@@ -796,8 +813,8 @@ def build_frozen_phi(
     raise NotImplementedError(
         f'Unknown sr_cfgs.phi_source "{phi_source}". '
         'Available phi sources are: "trunk", "random", "separate", "rff", "ensemble" '
-        '(plus "contrastive" / "laplacian" / "joint", V-flavor td_ridge trunk only -- not '
-        'supported here).',
+        '(plus "contrastive" / "laplacian" / "predictive" / "joint", V-flavor td_ridge trunk '
+        'only -- not supported here).',
     )
 
 
@@ -813,14 +830,15 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         phi_source (str): Where ``phi`` comes from -- ``'trunk'`` (a trainable linear read-out of
             the trunk shared with ``psi``), ``'random'`` / ``'separate'`` / ``'rff'`` /
             ``'ensemble'`` (a frozen map of the raw observation, see :func:`build_frozen_phi`), or
-            ``'contrastive'`` / ``'laplacian'`` / ``'joint'`` (*trained* maps of the raw
-            observation, fit by a time-contrastive loss, by the Augmented Lagrangian Laplacian
-            Objective, and jointly with ``psi`` by the contrastive successor-measure loss
-            respectively, rather than frozen or read off the trunk -- see
-            :class:`ContrastivePhiFeatures`, :class:`LaplacianPhiFeatures` and
-            :class:`UnnormalizedPhiFeatures`).
+            ``'contrastive'`` / ``'laplacian'`` / ``'predictive'`` / ``'joint'`` (*trained* maps of
+            the raw observation, fit by a time-contrastive loss, by the Augmented Lagrangian
+            Laplacian Objective, by a supervised one-step reward/cost regression, and jointly with
+            ``psi`` by the contrastive successor-measure loss respectively, rather than frozen or
+            read off the trunk -- see :class:`ContrastivePhiFeatures` (also backs
+            ``'predictive'``), :class:`LaplacianPhiFeatures` and :class:`UnnormalizedPhiFeatures`).
         phi_hidden_sizes (list of int): Hidden sizes of the standalone ``phi`` network, used by
-            ``phi_source`` ``'separate'`` / ``'contrastive'`` / ``'laplacian'`` only.
+            ``phi_source`` ``'separate'`` / ``'contrastive'`` / ``'laplacian'`` / ``'predictive'``
+            only.
         phi_orthogonal_init (bool): See :func:`build_frozen_phi`.
         phi_rff_bandwidth (float): See :func:`build_frozen_phi`.
         phi_ensemble_sources (list of str or None): See :func:`build_frozen_phi`.
@@ -883,6 +901,10 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
         trained_phi = {
             'contrastive': ContrastivePhiFeatures,
             'laplacian': LaplacianPhiFeatures,
+            # Architecturally identical to 'contrastive' (both are ContrastivePhiFeatures, i.e.
+            # FrozenPhiFeatures left trainable) -- they differ only in which loss trains the
+            # network, which lives in PolicyGradient._predictive_update_phi, not here.
+            'predictive': ContrastivePhiFeatures,
             # 'joint' is the odd one out: it is trained, but not by an optimizer of its own -- it
             # is one factor of the bilinear successor-measure critic that
             # sr_cfgs.psi_objective='contrastive' fits, so it is stepped by the same loss and the
@@ -915,6 +937,17 @@ class TDRidgeSuccessorRepresentationTrunk(RidgeSolvedReadoutWeights):
             initialize_layer(weight_initialization_mode, self.phi_head)
         else:
             self.phi_net = phi_net
+        if phi_source == 'predictive':
+            # Auxiliary read-out heads that exist solely to carry PolicyGradient
+            # ._predictive_update_phi's supervised loss into phi_net -- never read by phi()/psi(),
+            # and never the deployed w_r/w_c (which stay the unmodified closed-form ridge solve).
+            # Registered as submodules so they save/load with the rest of the trunk's state_dict
+            # and so ConstraintActorCritic can find their parameters to build sr_phi_optimizer
+            # over and to exclude from sr_optimizer.
+            self.phi_aux_r = nn.Linear(sr_dim, 1)
+            self.phi_aux_c = nn.Linear(sr_dim, 1)
+            initialize_layer(weight_initialization_mode, self.phi_aux_r)
+            initialize_layer(weight_initialization_mode, self.phi_aux_c)
         self.psi_head = build_mlp_network(
             sizes=[trunk_out, sr_dim],
             activation=activation,
