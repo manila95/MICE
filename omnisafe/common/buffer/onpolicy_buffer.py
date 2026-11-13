@@ -153,6 +153,10 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         self.max_size: int = size
         self._episode_slices: list[tuple[int, int]] = []
         self._last_episode_slices: list[tuple[int, int]] = []
+        # Per-path plug-in tail values, parallel to _episode_slices.  finish_path folds these
+        # into the advantage and then forgets them; advantages_under needs them to rebuild the
+        # same paths under a different lambda.
+        self._episode_bootstrap: list[tuple[float, float]] = []
 
         # Presets stay valid names; so do the bare advantage methods, but only when the target
         # axis is given explicitly (otherwise there is nothing to expand them with).
@@ -379,7 +383,47 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
             )
 
         self._episode_slices.append((self.path_start_idx, self.ptr))
+        self._episode_bootstrap.append((float(last_value_r), float(last_value_c)))
         self.path_start_idx = self.ptr
+
+    def advantages_under(self, lam: float, stream: str = 'c') -> torch.Tensor:
+        """This epoch's advantages recomputed with GAE at a different ``lam``.
+
+        Used by the gradient-direction diagnostics, which need several advantage
+        constructions over the one batch the policy actually produced.  GAE spans the
+        family on its own: ``lam=0`` is TD(0), ``lam=1`` is the Monte Carlo advantage
+        :math:`G_t - V(s_t)`, and the configured ``lam_c`` is what GAE cells train on.
+
+        Must be called **before** :meth:`get`, which clears the path bookkeeping.  The
+        paths are rebuilt exactly as :meth:`finish_path` built them, plug-in tail value
+        included, so the only difference from ``self.data['adv_c']`` is ``lam`` (and the
+        estimator, when the run is configured for something other than ``gae``).
+
+        Args:
+            lam: The GAE lambda to rebuild with.
+            stream: ``'c'`` for cost, ``'r'`` for reward.
+
+        Returns:
+            Advantages for the whole buffer, in buffer order.
+        """
+        assert stream in ('r', 'c'), f"stream must be 'r' or 'c', got {stream!r}"
+        rew_key, val_key = ('cost', 'value_c') if stream == 'c' else ('reward', 'value_r')
+        gamma = self._cost_gamma if stream == 'c' else self._gamma
+        boot_idx = 1 if stream == 'c' else 0
+
+        out = torch.zeros_like(self.data[val_key])
+        for (start, stop), boot in zip(self._episode_slices, self._episode_bootstrap):
+            path = slice(start, stop)
+            last = torch.tensor([boot[boot_idx]], dtype=torch.float32, device=self._device)
+            adv, _ = self._calculate_adv_and_value_targets(
+                torch.cat([self.data[val_key][path], last]),
+                torch.cat([self.data[rew_key][path], last]),
+                lam=lam,
+                gamma=gamma,
+                advantage_estimator='gae',
+            )
+            out[path] = adv
+        return out
 
     def get(self) -> dict[str, torch.Tensor]:
         """Get the data in the buffer.
@@ -396,6 +440,7 @@ class OnPolicyBuffer(BaseBuffer):  # pylint: disable=too-many-instance-attribute
         """
         self._last_episode_slices = list(self._episode_slices)
         self._episode_slices = []
+        self._episode_bootstrap = []
         self.ptr, self.path_start_idx = 0, 0
 
         data = {

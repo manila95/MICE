@@ -162,6 +162,37 @@ class VectorOnPolicyBuffer(OnPolicyBuffer):
                 slices.append((s + offset, e + offset))
         return slices
 
+    def live_episode_slices(self) -> list[tuple[int, int]]:
+        """Episode ``(start, end)`` pairs for the epoch **currently** in the buffer.
+
+        Same row convention as :meth:`get_episode_slices`, but reads the live
+        ``_episode_slices`` that ``finish_path`` appends to, so it is valid *before*
+        :meth:`get` (which moves them to ``_last_episode_slices`` and clears the live list).
+        The eval studies run before ``get``, hence this variant.
+        """
+        slices: list[tuple[int, int]] = []
+        for i, buf in enumerate(self.buffers):
+            offset = i * buf.max_size
+            for s, e in buf._episode_slices:  # pylint: disable=protected-access
+                slices.append((s + offset, e + offset))
+        return slices
+
+    def advantages_under(self, lam: float, stream: str = 'c') -> torch.Tensor:
+        """Per-sub-buffer :meth:`OnPolicyBuffer.advantages_under`, concatenated.
+
+        Concatenation follows :meth:`get`'s own sub-buffer order, so the result lines up
+        row-for-row with the ``obs``/``act`` that :meth:`raw_obs_act` returns and with the
+        ``adv_c`` of :meth:`get`.  Call before :meth:`get`.
+        """
+        return torch.cat([buf.advantages_under(lam, stream) for buf in self.buffers], dim=0)
+
+    def raw_obs_act(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """This epoch's ``(obs, act)`` in :meth:`get`'s row order, without consuming the buffer."""
+        return (
+            torch.cat([buf.data['obs'] for buf in self.buffers], dim=0),
+            torch.cat([buf.data['act'] for buf in self.buffers], dim=0),
+        )
+
     def get(self) -> dict[str, torch.Tensor]:
         """Get the data in the buffer.
 

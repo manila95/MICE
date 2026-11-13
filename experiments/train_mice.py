@@ -290,6 +290,22 @@ if __name__ == '__main__':
         help='Advantage estimation method for cost; defaults to --adv-estimation-method if unset',
     )
     args, unparsed_args = parser.parse_known_args()
+
+    if str(args.device).startswith('cpu'):
+        # torch.cuda.device_count() caches its result ONLY when it finds >0 GPUs, so on a CPU
+        # node every call re-probes -- and the probe runs ctypes.util.find_library, which forks
+        # gcc. torch.optim's _cuda_graph_capture_health_check calls it once per optimizer step,
+        # i.e. ~628 times per epoch here. Profiled on rorqual: 101 s of a 105 s _update(), with
+        # 86 s inside _findLib_gcc and 121 s of self time reading the subprocess pipe, against
+        # ~1.2 s of actual tensor math. It is node-dependent (harmless where cvmfs is warm,
+        # catastrophic where it is not), which is why it hid for so long.
+        #
+        # Pinning the count to 0 for CPU runs makes the probe happen never instead of per step.
+        # Guarded on --device cpu, so a GPU run is untouched.
+        import torch  # noqa: PLC0415
+
+        torch.cuda.device_count = lambda: 0
+
     # Handle both '--key value' and '--key=value' (wandb sweep format).
     # Keys may use '.' or ':' as hierarchy separator, and '-' or '_' between words.
     _cfg_overrides = {}

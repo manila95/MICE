@@ -153,6 +153,43 @@ defaults:
     cost_bias_decay_factor: 0.4
     # The sub-sampling rate of the observation
     fvp_sample_freq: 1
+    # Gradient-direction diagnostics (see PolicyGradient._gradient_direction_study): on each
+    # eval epoch, build the cost and reward policy gradients from TD(0), TD(lam) and TD(1)
+    # advantages over this epoch's own batch and record the Euclidean and Fisher cosines
+    # between them. Costs no environment steps -- one backward per gradient plus one
+    # conjugate-gradient solve each -- and lands in the epoch's eval_data pickle under
+    # 'gradient_direction', not in the online loggers.
+    gradient_direction_study: True
+    # Probe-gradient study: on each eval epoch, draw probe_per_episode within-episode step
+    # indices uniformly per episode (redrawn at every episode boundary) out of the TRAINING
+    # rollout, capture (s, a, s') there, promote s' to a probe too, and estimate V at both
+    # ends by MC. Yields the cost and reward policy gradients from the critic and from the MC
+    # estimates over the same transitions -- a literal subsample of the batch CPO updated on.
+    # Sampling is uniform over the batch's transitions, matching what CPO's own gradient
+    # averages over, NOT d^pi (see the undiscounted-visitation discussion in the paper).
+    probe_gradient_study: True
+    # Probes per episode. With N episodes in a batch this gives N * probe_per_episode probe
+    # states and as many next states, so 20 x 5 = 100 + 100 here.
+    probe_per_episode: 25
+    # Random half-splits averaged for the split-half gradient ceiling. C(10,5)/2 = 126 exist;
+    # each is pure dot products, so this is cheap.
+    probe_split_half_draws: 20
+    # Conjugate-gradient iterations for the DIAGNOSTICS only (Fisher cosines). Deliberately
+    # larger than algo_cfgs.cg_iters: CPO needs only a descent direction from its own solve,
+    # whereas a bilinear form g_a^T H^-1 g_b needs real convergence -- cg_asymmetry measured
+    # 2.2e-01 at 15 iterations against the ~1e-3 that counts as converged. Training reads
+    # cg_iters and is untouched by this.
+    diag_cg_iters: 100
+    # The legacy value studies (MCStudy/* from re-seeded resets, IntermediateMC/pos*/* from a
+    # dedicated on-policy rollout, and the PooledMC/* pooling over them). Superseded by the
+    # probe study above, which scores V on states that are a subsample of the training batch
+    # instead of a separate rollout, and reports gradients on the same states. Off here; set
+    # True to reproduce the original Figure 1 protocol.
+    legacy_value_studies: False
+    # Per-epoch training-batch critic diagnostics (Value/Train/{Before,After}Update/*): ten
+    # correlations needing two extra critic passes over the batch every epoch. The probe study
+    # measures critic-vs-MC on batch states directly, so these are redundant here.
+    train_batch_diagnostics: False
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5
     # width of the early_eval_freq window: epochs below this use early_eval_freq, epochs at or

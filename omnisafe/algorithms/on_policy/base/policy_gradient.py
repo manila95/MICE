@@ -41,9 +41,7 @@ from omnisafe.utils import clearning, contrastive, distributed, laplacian, sr_di
 from omnisafe.utils.critic_ensemble import GPLBetaAdapter, TOPBanditAdapter
 from omnisafe.utils.eval_data_dump import (
     log_eval_data_to_wandb,
-    log_scatter_to_wandb,
     save_eval_data,
-    save_scatter_grid,
 )
 from omnisafe.utils.state_snapshot import (
     collect_on_policy_snapshots,
@@ -54,6 +52,11 @@ from omnisafe.utils.isolated_eval import (
     env_needs_isolated_eval,
     resolve_episode_cap,
     run_isolated_value_studies,
+)
+from omnisafe.utils.grad_alignment import (
+    euclidean_cosines,
+    fisher_cosines,
+    score_gradients,
 )
 from omnisafe.utils.value_eval import (
     _find_obs_normalizer,
@@ -149,6 +152,14 @@ class PolicyGradient(BaseAlgo):
             AssertionError: If the number of steps per epoch is not divisible by the number of
                 environments.
         """
+        # enable_state_snapshots was previously called lazily, when the intermediate-state eval
+        # env is built at the first eval epoch -- far too late for the TRAINING env, whose
+        # subprocess workers are forked just below and so never inherited the patched
+        # Builder.step. Probing the training rollout needs the patch in place before this env
+        # exists. Calling it here is what that function's own docstring recommends ("safe to
+        # call unconditionally/early, once per training process"): with no trigger steps
+        # configured it costs one getattr per step and changes nothing else.
+        enable_state_snapshots()
         self._env: OnPolicyAdapter = OnPolicyAdapter(
             self._env_id,
             self._cfgs.train_cfgs.vector_env_nums,
@@ -707,6 +718,15 @@ class PolicyGradient(BaseAlgo):
                 self._logger.register_key(f'IntermediateMC/pos{pos}/NumProbes')
                 self._logger.register_key(f'IntermediateMC/pos{pos}/MCRepeats')
 
+        if getattr(self._cfgs.algo_cfgs, 'probe_gradient_study', False):
+            for key in self._PROBE_STAT_KEYS:
+                self._logger.register_key(f'ProbeMC/{key}')
+                self._logger.register_key(f'ProbeMC/next/{key}')
+            for key in self._PROBE_GRAD_KEYS:
+                self._logger.register_key(f'ProbeMC/Grad/{key}')
+            # NumProbes already comes from _PROBE_STAT_KEYS above.
+            self._logger.register_key('ProbeMC/NumTaus')
+
             # Pooled diversity correlation: s0 (if mc_value_study is also on) plus every
             # intermediate position, pooled into one correlation -- see
             # value_eval.pool_correlation_stats's docstring for why this isn't just the per-
@@ -934,6 +954,20 @@ class PolicyGradient(BaseAlgo):
             )
             self._buf.set_cost_bias_for_epoch(cost_bias)
 
+            # Probe capture is armed BEFORE the rollout it samples from: the probes are
+            # transitions of this epoch's own training batch, which is what makes them a
+            # subsample of the update CPO is about to take rather than an independent draw.
+            # Eval epochs only, disarmed straight after, so ordinary epochs pay nothing.
+            probe_epoch = self._is_value_eval_epoch(epoch) and getattr(
+                self._cfgs.algo_cfgs, 'probe_gradient_study', False,
+            )
+            if probe_epoch:
+                self._env.arm_probe_capture(
+                    per_episode=int(getattr(self._cfgs.algo_cfgs, 'probe_per_episode', 5)),
+                    max_episode_steps=self._probe_episode_steps(),
+                    seed=self._seed + 7919 * epoch,
+                )
+
             rollout_time = time.time()
             self._env.rollout(
                 steps_per_epoch=self._steps_per_epoch,
@@ -941,6 +975,8 @@ class PolicyGradient(BaseAlgo):
                 buffer=self._buf,
                 logger=self._logger,
             )
+            if probe_epoch:
+                self._env.disarm_probe_capture()
             # Must run after rollout (needs this epoch's just-collected Metrics/EpRet/EpCost as
             # the adaptation signal) and before _update() (below) so this epoch's critic training
             # actually uses the freshly-adapted beta -- see _update_critic_ensemble_beta's
@@ -1077,6 +1113,490 @@ class PolicyGradient(BaseAlgo):
                 f'{min(result["episode_lengths"])}-{max(result["episode_lengths"])}).',
             )
 
+    def _gradient_direction_study(self) -> dict | None:
+        r"""Angles between the cost (and reward) policy gradients of different advantages.
+
+        Answers a question the per-state value diagnostics cannot: the optimizer acts on
+        advantages, so a critic that predicts values poorly may still produce the same
+        update direction.  All gradients here are built on **this epoch's own batch** --
+        the same ~2e4 ``(s, a)`` pairs the real update uses -- so they differ only in the
+        advantage, never in which samples were drawn.  Three advantages per stream, all
+        from GAE, which spans the family on its own:
+
+        ``td0``
+            ``lam = 0``, i.e. :math:`c_t + \gamma V(s_{t+1}) - V(s_t)`.  For a ``plain``
+            cell this *is* the update the algorithm takes.
+        ``tdlam``
+            the configured ``lam``/``lam_c``, what GAE cells train on.
+        ``td1``
+            ``lam = 1``, the Monte Carlo advantage :math:`G_t - V(s_t)`; the critic enters
+            only as a state-dependent baseline.
+
+        Advantages are centred, as :meth:`OnPolicyBuffer.get` centres ``adv_c``; the
+        remaining standardisation of ``adv_r`` is a global scalar and cosines ignore it.
+
+        Costs no environment steps: one forward pass, one backward per gradient, and one
+        conjugate-gradient solve per gradient for the Fisher metric.
+
+        Returns:
+            Bundle of Euclidean and Fisher cosines, gradient norms and the CG diagnostics,
+            or ``None`` if the buffer cannot supply the batch (e.g. a buffer type without
+            :meth:`raw_obs_act`).
+        """
+        if not hasattr(self._buf, 'raw_obs_act'):
+            return None
+        lam_r = float(self._cfgs.algo_cfgs.lam)
+        lam_c = float(getattr(self._cfgs.algo_cfgs, 'lam_c', lam_r))
+        obs, act = self._buf.raw_obs_act()
+
+        advantages: dict[str, torch.Tensor] = {}
+        for stream, lam in (('c', lam_c), ('r', lam_r)):
+            for name, value in (('td0', 0.0), ('tdlam', lam), ('td1', 1.0)):
+                adv = self._buf.advantages_under(value, stream)
+                advantages[f'{stream}_{name}'] = adv - adv.mean()
+
+        grads = score_gradients(self._actor_critic.actor, obs, act, advantages)
+        # Kept for _probe_gradient_study's subsample ceiling, which needs the full-batch
+        # gradient VECTORS rather than these cosines; recomputing them would mean another
+        # backward pass over ~2e4 samples. Valid only within this epoch's eval pass.
+        self._batch_grads = grads
+        out: dict = {
+            'euclidean': euclidean_cosines(grads),
+            'grad_norm': {k: v.norm().item() for k, v in grads.items()},
+            'lam_r': lam_r,
+            'lam_c': lam_c,
+            'n_samples': int(obs.shape[0]),
+        }
+        out.update(self._batch_split_half(obs, act, advantages))
+        if hasattr(self, '_fvp'):
+            # _fvp reads self._fvp_obs; _update_actor overwrites it later this epoch, so
+            # setting it here is not visible to the real update.
+            self._fvp_obs = obs[:: self._cfgs.algo_cfgs.fvp_sample_freq]
+            # diag_cg_iters, not the algorithm's cg_iters -- see _probe_gradient_study.
+            cosines, asymmetry = fisher_cosines(
+                grads, self._fvp,
+                int(getattr(self._cfgs.algo_cfgs, 'diag_cg_iters', 100)),
+            )
+            out['fisher'] = cosines
+            out['cg_asymmetry'] = asymmetry
+            out['cg_damping'] = float(self._cfgs.algo_cfgs.cg_damping)
+        return out
+
+    def _batch_split_half(
+        self,
+        obs: torch.Tensor,
+        act: torch.Tensor,
+        advantages: dict[str, torch.Tensor],
+    ) -> dict:
+        r"""Split the epoch's batch in two and re-measure every gradient on each half.
+
+        The split is **by episode**, not by row: 25 probes from one episode are temporally
+        correlated, and so are adjacent rows of the batch, so a row-wise split would leave the
+        two halves sharing trajectories and overstate agreement. Episodes come from different
+        time ranges of independent vectorized slots, so splitting on them gives two genuinely
+        independent estimates of the same population gradient.
+
+        Two quantities come out of it:
+
+        ``SplitHalf_<name>``
+            :math:`\cos(g^A_{\text{name}}, g^B_{\text{name}})`. Under
+            :math:`g^{A/B} = g + \varepsilon^{A/B}` with independent, equal-variance noise this
+            is :math:`r = \lVert g\rVert^2/(\lVert g\rVert^2 + \operatorname{tr}\Sigma/(N/2))`,
+            so a half-batch gradient's cosine with the population one is :math:`\sqrt r` and a
+            full-batch gradient's is :math:`\sqrt{2r/(1+r)}` (Spearman--Brown, then the square
+            root because the cosine between two noisy copies is the square of each one's cosine
+            with the truth).
+
+        ``CrossHalf_<a>|<b>``
+            :math:`\cos(g^A_a, g^B_b)` averaged with :math:`\cos(g^B_a, g^A_b)`. Built from
+            **disjoint** halves, so the two gradients' sampling noises are independent and the
+            attenuation factorizes exactly: dividing by :math:`\sqrt{r_a r_b}` gives the cosine
+            the two advantage definitions would have at infinite sample size. The same-sample
+            cosine in ``euclidean`` cannot be corrected this way, since there the two gradients
+            share every draw.
+
+        This is what separates "the cost critic redirects the update" from "TD(1) is a
+        single-sample return and therefore noisy": only the second is removed by the
+        correction. Costs one extra forward pass and ``2 x len(advantages)`` backward passes,
+        no environment steps.
+        """
+        if not hasattr(self._buf, 'live_episode_slices'):
+            return {}
+        episodes = self._buf.live_episode_slices()
+        if len(episodes) < 4:
+            return {}
+        order = np.random.default_rng(0).permutation(len(episodes))
+        halves: list[list[int]] = [[], []]
+        n_eps = [0, 0]
+        for rank, ep_idx in enumerate(order):
+            start, end = episodes[int(ep_idx)]
+            halves[rank % 2].extend(range(start, end))
+            n_eps[rank % 2] += 1
+        idx_a = torch.tensor(sorted(halves[0]), device=obs.device)
+        idx_b = torch.tensor(sorted(halves[1]), device=obs.device)
+
+        grads_half = []
+        for idx in (idx_a, idx_b):
+            # Re-centre within the half: an N-sample estimator centres on what it can see.
+            sub = {k: (v[idx] - v[idx].mean()) for k, v in advantages.items()}
+            grads_half.append(score_gradients(self._actor_critic.actor, obs[idx], act[idx], sub))
+
+        def cos(a: torch.Tensor, b: torch.Tensor) -> float:
+            na, nb = a.norm(), b.norm()
+            return float('nan') if na == 0 or nb == 0 else float((a.dot(b) / (na * nb)).item())
+
+        out: dict = {'split_half_n': [int(idx_a.numel()), int(idx_b.numel())],
+                     'split_half_episodes': n_eps}
+        ga, gb = grads_half
+        for name in advantages:
+            out[f'SplitHalf_{name}'] = cos(ga[name], gb[name])
+        for stream in ('c', 'r'):
+            for a_name, b_name in (('td0', 'td1'), ('td0', 'tdlam'), ('tdlam', 'td1')):
+                ka, kb = f'{stream}_{a_name}', f'{stream}_{b_name}'
+                out[f'CrossHalf_{ka}|{kb}'] = 0.5 * (cos(ga[ka], gb[kb]) + cos(gb[ka], ga[kb]))
+        return out
+
+    # Keys the probe study emits. Shared by _init_log's registration and
+    # _probe_gradient_study's store, so the two cannot disagree.
+    _PROBE_STAT_KEYS: tuple[str, ...] = tuple(
+        f'{name}_{stream}'
+        for stream in ('r', 'c')
+        for name in (
+            'Correlation', 'EstimationError', 'MeanVar', 'MeanTrue', 'MeanPred',
+            'Correlation_target_true', 'Correlation_pred_target',
+            'EstimationError_target_true', 'MeanTarget',
+        )
+    ) + ('NumProbes', 'MCRepeats')
+    _PROBE_GRAD_KEYS: tuple[str, ...] = tuple(
+        f'{name}_{stream}'
+        for stream in ('r', 'c')
+        for name in (
+            'CriticVsMC_Euclid', 'CriticVsMC_Fisher',
+            'Subsample_Euclid_owncentre', 'Subsample_Euclid_batchcentre',
+            'SplitHalfCos', 'SplitHalfCosStd', 'SplitHalfCeiling',
+            'TD0MatchMaxAbsDiff', 'Norm_critic', 'Norm_mc',
+        )
+    ) + ('cg_asymmetry',)
+
+    def _probe_episode_steps(self) -> int:
+        """Episode length, needed before the eval env (which caches it) has been built."""
+        cached = self._mc_intermediate_max_episode_steps
+        if cached:
+            return int(cached)
+        import gymnasium  # noqa: PLC0415
+
+        spec_len = gymnasium.spec(self._env_id).max_episode_steps
+        return int(spec_len) if spec_len else 1000
+
+    def _probe_gradient_study(self, epoch: int) -> dict | None:
+        r"""Cost and reward policy gradients from the critic vs from MC estimates, paired.
+
+        The per-state value diagnostics answer "does the critic predict :math:`V` well". This
+        answers the question the optimizer actually poses: does the critic's error change the
+        *direction of the update*?  Two independent axes:
+
+        ===============  ==========================  ==========================
+        stream           critic :math:`\hat V`       MC :math:`\tilde V`
+        ===============  ==========================  ==========================
+        cost             ``g_c_critic``              ``g_c_mc``
+        reward           ``g_r_critic``              ``g_r_mc``
+        ===============  ==========================  ==========================
+
+        all four being :math:`\frac{1}{N}\sum_i \nabla_\theta \log \pi(a_i|s_i) A_i` over the
+        **same** probe transitions, with
+        :math:`A_i = c_i + \gamma_c V_c(s'_i) - V_c(s_i)`.  The reward stream is the control:
+        its critic is accurate, so its two gradients should agree closely, and without that
+        contrast a low cost cosine could equally mean "102 samples is noisy".
+
+        The probes are transitions of the training rollout itself (see
+        :meth:`~omnisafe.adapter.OnPolicyAdapter.arm_probe_capture`), so they are a literal
+        subsample of the batch CPO just updated on, and :math:`s'` is promoted to a probe in
+        its own right so MC supplies :math:`\tilde V(s')` the same way it supplies
+        :math:`\tilde V(s)`.
+
+        Three cosine families, because the headline number is uninterpretable alone:
+
+        ``CriticVsMC``
+            the quantity of interest.
+        ``Subsample``
+            critic-on-probes vs critic-on-the-whole-batch.  Both use the critic, so this is
+            pure sample-size cost -- the ceiling any critic-vs-MC number must be read against.
+            Reported under two centring conventions: against the batch mean (the probes are
+            then literally a subsample of the same summands, isolating subsampling) and
+            against their own mean (what a real N-sample estimator would compute).
+        ``SplitHalf``
+            two MC estimates from disjoint halves of the rollouts, so the only difference is
+            MC noise.  With :math:`r` the split-half cosine, the full-:math:`K` estimator's
+            alignment with the true MC gradient is :math:`\sqrt{2r/(1+r)}` -- the
+            Spearman-Brown form used on the value side, square-rooted because the cosine
+            between two noisy copies is the square of each one's cosine with the truth.
+
+        Returns:
+            Bundle of scalars plus the per-probe estimates/predictions, or ``None`` when no
+            probes were captured.
+        """
+        records = self._env.probe_records()
+        if not records:
+            return None
+
+        interm_env = self._get_intermediate_state_env()
+        sync_obs_normalizer(interm_env, self._env._env)
+        # safety_gymnasium builds Builder.task on the first reset, so a never-reset env has
+        # task None and restoring into it dies with "'NoneType' object has no attribute
+        # 'data'" inside the worker. The legacy path got its reset for free from
+        # collect_on_policy_snapshots; this path has to do it itself. The seed is irrelevant --
+        # every restore overwrites the layout (verified bit-exact across env instances) -- it
+        # just has to have happened once.
+        n_slots = int(getattr(interm_env, 'num_envs', 1))
+        interm_env.reset(
+            seed=[900_000 + i for i in range(n_slots)] if n_slots > 1 else 900_000,
+        )
+        repeats = int(getattr(self._cfgs.algo_cfgs, 'intermediate_state_study_repeats', 5))
+        gamma_r = float(self._cfgs.algo_cfgs.gamma)
+        gamma_c = float(getattr(self._cfgs.algo_cfgs, 'cost_gamma', gamma_r))
+        horizon = self._probe_episode_steps()
+        kwargs = {
+            'agent': self._actor_critic, 'env': interm_env, 'cfgs': self._cfgs,
+            'discount_r': gamma_r, 'discount_c': gamma_c, 'horizon': horizon,
+            'mc_repeats': repeats, 'epoch': epoch, 'return_raw': True,
+            'bootstrap_threshold': getattr(
+                self._cfgs.algo_cfgs, 'mc_eval_bootstrap_threshold', None,
+            ),
+            'tail_mode': getattr(self._cfgs.algo_cfgs, 'mc_eval_tail', None),
+        }
+        stats_s, raw_s = estimate_value_from_snapshots(
+            snapshots=[r['snapshot'] for r in records], **kwargs,
+        )
+        stats_next, raw_next = estimate_value_from_snapshots(
+            snapshots=[r['next_snapshot'] for r in records], **kwargs,
+        )
+        self._logger.store({
+            f'ProbeMC/{k}': float(stats_s.get(k, float('nan'))) for k in self._PROBE_STAT_KEYS
+        })
+        self._logger.store({
+            f'ProbeMC/next/{k}': float(stats_next.get(k, float('nan')))
+            for k in self._PROBE_STAT_KEYS
+        })
+
+        obs = torch.stack([r['obs'] for r in records]).to(self._device)
+        act = torch.stack([r['action'] for r in records]).to(self._device)
+        out: dict = {
+            'n_probes': len(records),
+            'taus': self._env.probe_taus(),
+            'gamma': gamma_r,
+            'cost_gamma': gamma_c,
+            'mc_repeats': repeats,
+        }
+
+        # Where each probe sits in the buffer. The adapter read each probe's row straight off
+        # its sub-buffer's write pointer at capture time, so this is a concatenation offset and
+        # nothing more -- no assumption that episodes fill exactly `horizon` rows.
+        # advantages_under must be called before _buf.get(), which _run_eval_studies is
+        # (see _gradient_direction_study).
+        sub_size = self._steps_per_epoch // self._cfgs.train_cfgs.vector_env_nums
+        rows = torch.tensor([r['env_slot'] * sub_size + r['row'] for r in records])
+        adv_full = {
+            stream: self._buf.advantages_under(0.0, stream).detach().cpu()
+            for stream in ('c', 'r')
+        }
+
+        advantages: dict[str, torch.Tensor] = {}
+        per_probe: dict[str, list] = {}
+        # Per-repeat returns G^(k), one row of K per probe state, for s and s' and both
+        # streams. They are the raw material for the split-half ceiling below, and they are
+        # pickled as well: every noise quantity derived from them downstream (the variance of
+        # the MC TD(0) advantage, in particular) can then be measured by splitting repeats
+        # instead of inferred from sigma^2_hat, whose own sampling error at K=10 is
+        # sigma^2 * sqrt(2/(K-1)) ~= 0.47 sigma^2 and which the advantage's noise term
+        # subtracts as a difference of two nearly equal large numbers. ~40 KB/epoch.
+        returns: dict[str, list] = {}
+        for stream, gamma in (('c', gamma_c), ('r', gamma_r)):
+            key = 'cost' if stream == 'c' else 'reward'
+            inst = torch.tensor([r[key] for r in records], dtype=torch.float32)
+            # V_hat at s is the value the policy saw during the rollout -- taken from the
+            # record, not recomputed, so it is the frozen critic by construction. V_hat at s'
+            # comes from the next-state study's own forward pass, which runs before _update()
+            # and so uses that same frozen critic.
+            pred_s = torch.tensor([float(v) for v in [r['value_' + stream] for r in records]])
+            pred_n = torch.tensor([float(v) for v in raw_next[stream]['pred']])
+            mc_s = torch.tensor([float(v) for v in raw_s[stream]['mc_mean']])
+            mc_n = torch.tensor([float(v) for v in raw_next[stream]['mc_mean']])
+            # A true terminal has no successor value to bootstrap off.
+            alive = torch.tensor(
+                [0.0 if r['terminated'] else 1.0 for r in records], dtype=torch.float32,
+            )
+            # The critic-side advantage is read straight out of the buffer rather than
+            # rebuilt from pred_s/pred_n. Rebuilding it was wrong: pred_n comes from a forward
+            # pass at EVAL time on the restored s', whereas the buffer's value_c was recorded
+            # during the rollout, when ObsNormalize's running statistics were different. The
+            # normalizer drifts within an epoch, so the two V_hat(s') disagree -- measured 2.94
+            # on the cost stream. Taking adv_full is both exact and the right object: for a
+            # `plain` cell it *is* the advantage CPO updated on.
+            advantages[f'{stream}_critic'] = adv_full[stream][rows]
+            advantages[f'{stream}_mc'] = inst + gamma * alive * mc_n - mc_s
+
+            # Split-half: disjoint halves of the SAME rollouts, so c_i and grad log pi are
+            # shared and only MC value noise separates the two.
+            ret_s = [[float(x) for x in row] for row in raw_s[stream]['returns']]
+            ret_n = [[float(x) for x in row] for row in raw_next[stream]['returns']]
+            returns[f's_{stream}'] = ret_s
+            returns[f'next_{stream}'] = ret_n
+
+            per_probe[f'pred_s_{stream}'] = pred_s.tolist()
+            per_probe[f'pred_next_{stream}'] = pred_n.tolist()
+            per_probe[f'mc_s_{stream}'] = mc_s.tolist()
+            per_probe[f'mc_next_{stream}'] = mc_n.tolist()
+            per_probe[f'mc_var_s_{stream}'] = [float(v) for v in raw_s[stream]['mc_var']]
+            per_probe[f'mc_var_next_{stream}'] = [float(v) for v in raw_next[stream]['mc_var']]
+
+        out['returns'] = returns
+        per_probe['tau'] = [r['tau'] for r in records]
+        per_probe['env_slot'] = [r['env_slot'] for r in records]
+        per_probe['episode'] = [r['episode'] for r in records]
+        per_probe['row'] = [r['row'] for r in records]
+        per_probe['logp'] = [r['logp'] for r in records]
+        per_probe['cost'] = [r['cost'] for r in records]
+        per_probe['reward'] = [r['reward'] for r in records]
+        per_probe['terminated'] = [r['terminated'] for r in records]
+        out['per_probe'] = per_probe
+
+        centred = {k: v - v.mean() for k, v in advantages.items()}
+        grads = score_gradients(self._actor_critic.actor, obs, act, centred)
+        out['grad_norm'] = {k: v.norm().item() for k, v in grads.items()}
+        out['euclidean'] = euclidean_cosines(grads)
+
+        def cos(a: torch.Tensor, b: torch.Tensor) -> float:
+            na, nb = a.norm(), b.norm()
+            return float('nan') if na == 0 or nb == 0 else (a.dot(b) / (na * nb)).item()
+
+        # --- index check + subsample ceiling ------------------------------------------------
+        # advantages[*_critic] is now adv_full by construction, so an equality check there
+        # would be vacuous. What still needs proving is that `rows` really points at the probe
+        # transitions: compare the instantaneous cost/reward the adapter recorded against the
+        # one the buffer stored at that row. If the arithmetic
+        # (slot, episode, tau) -> row is wrong, these disagree immediately.
+        # Logged, not asserted: a tolerance failure must be impossible to miss but should not
+        # kill a multi-hour run.
+        for stream in ('c', 'r'):
+            key = 'cost' if stream == 'c' else 'reward'
+            try:
+                stored = torch.tensor([
+                    float(self._buf.buffers[r['env_slot']].data[key][r['row']])
+                    for r in records
+                ])
+            except (AttributeError, IndexError, KeyError):
+                stored = None
+            if stored is not None:
+                mine = torch.tensor([float(r[key]) for r in records])
+                gap = float((mine - stored).abs().max())
+                out[f'TD0MatchMaxAbsDiff_{stream}'] = gap
+                if gap > 1e-5:
+                    self._logger.log(
+                        f'WARNING: probe {key} disagrees with the buffer at the recorded rows '
+                        f'by {gap:.3e} -- the capture-time write pointer does not name this '
+                        f'transition, so the subsample cosine below is meaningless.',
+                    )
+
+        batch_grads = getattr(self, '_batch_grads', None)
+        for stream in ('c', 'r'):
+            # Centring against the batch mean makes the probe gradient a subsample of exactly
+            # the same summands; centring on its own mean is what an N-sample estimator would
+            # really compute. They answer different questions, so both are reported.
+            if batch_grads is not None and f'{stream}_td0' in batch_grads:
+                full_g = batch_grads[f'{stream}_td0']
+                out[f'Subsample_Euclid_owncentre_{stream}'] = cos(
+                    grads[f'{stream}_critic'], full_g,
+                )
+                batch_centred = {
+                    f'{stream}_critic_bc': advantages[f'{stream}_critic'] - adv_full[stream].mean(),
+                }
+                g_bc = score_gradients(self._actor_critic.actor, obs, act, batch_centred)
+                out[f'Subsample_Euclid_batchcentre_{stream}'] = cos(
+                    g_bc[f'{stream}_critic_bc'], full_g,
+                )
+
+        # --- split-half ceiling --------------------------------------------------------------
+        # Disjoint halves of the same rollouts: c_i and grad log pi are shared, so only MC
+        # value noise separates the two gradients. Averaged over several random splits since a
+        # single split is itself noisy; C(10,5)/2 = 126 exist and these are pure dot products.
+        n_splits = int(getattr(self._cfgs.algo_cfgs, 'probe_split_half_draws', 20))
+        rng = np.random.default_rng(10_000 + epoch)
+        for stream, gamma in (('c', gamma_c), ('r', gamma_r)):
+            key = 'cost' if stream == 'c' else 'reward'
+            inst = torch.tensor([r[key] for r in records], dtype=torch.float32)
+            alive = torch.tensor(
+                [0.0 if r['terminated'] else 1.0 for r in records], dtype=torch.float32,
+            )
+            ret_s = returns[f's_{stream}']
+            ret_n = returns[f'next_{stream}']
+            k = min(len(ret_s[0]), len(ret_n[0]))
+            half = k // 2
+            if half < 1:
+                continue
+            cosines = []
+            for _ in range(n_splits):
+                perm = rng.permutation(k)
+                a_idx, b_idx = perm[:half], perm[half:2 * half]
+                halves = {}
+                for tag, sel in (('a', a_idx), ('b', b_idx)):
+                    v_s = torch.tensor(
+                        [float(np.mean([row[j] for j in sel])) for row in ret_s],
+                        dtype=torch.float32,
+                    )
+                    v_n = torch.tensor(
+                        [float(np.mean([row[j] for j in sel])) for row in ret_n],
+                        dtype=torch.float32,
+                    )
+                    adv = inst + gamma * alive * v_n - v_s
+                    halves[tag] = adv - adv.mean()
+                g_half = score_gradients(self._actor_critic.actor, obs, act, halves)
+                cosines.append(cos(g_half['a'], g_half['b']))
+            arr = np.asarray([c for c in cosines if np.isfinite(c)], dtype=np.float64)
+            if arr.size:
+                r_bar = float(arr.mean())
+                out[f'SplitHalfCos_{stream}'] = r_bar
+                out[f'SplitHalfCosStd_{stream}'] = float(arr.std(ddof=1)) if arr.size > 1 else 0.0
+                # Spearman-Brown, then square-rooted: the cosine between two noisy copies is
+                # the square of each one's cosine with the truth.
+                out[f'SplitHalfCeiling_{stream}'] = (
+                    float(np.sqrt(2 * r_bar / (1 + r_bar))) if r_bar > 0 else float('nan')
+                )
+
+        # --- Fisher metric -------------------------------------------------------------------
+        # diag_cg_iters, not the algorithm's cg_iters: CPO needs only a descent direction from
+        # its solve, while a bilinear form g_a^T H^-1 g_b needs real convergence (cg_asymmetry
+        # measured 2.2e-01 at 15 iterations, against the ~1e-3 that counts as converged).
+        # Training reads cg_iters and is untouched.
+        if hasattr(self, '_fvp'):
+            self._fvp_obs = obs[:: self._cfgs.algo_cfgs.fvp_sample_freq]
+            diag_iters = int(getattr(self._cfgs.algo_cfgs, 'diag_cg_iters', 100))
+            fisher, asym = fisher_cosines(grads, self._fvp, diag_iters)
+            out['fisher'] = fisher
+            out['cg_asymmetry'] = asym
+            out['diag_cg_iters'] = diag_iters
+
+        for stream in ('c', 'r'):
+            out[f'CriticVsMC_Euclid_{stream}'] = out['euclidean'].get(
+                f'{stream}_critic|{stream}_mc', float('nan'),
+            )
+            if 'fisher' in out:
+                out[f'CriticVsMC_Fisher_{stream}'] = out['fisher'].get(
+                    f'{stream}_critic|{stream}_mc', float('nan'),
+                )
+
+        for stream in ('c', 'r'):
+            out[f'Norm_critic_{stream}'] = out['grad_norm'].get(f'{stream}_critic', float('nan'))
+            out[f'Norm_mc_{stream}'] = out['grad_norm'].get(f'{stream}_mc', float('nan'))
+        # Every declared key, every eval epoch -- a missing one logs nan rather than vanishing
+        # from the column, which keeps the csv rectangular across epochs.
+        scalars = {
+            f'ProbeMC/Grad/{k}': float(out.get(k, float('nan')))
+            for k in self._PROBE_GRAD_KEYS
+        }
+        scalars['ProbeMC/NumTaus'] = float(sum(len(t) for t in out['taus']))
+        self._logger.store(scalars)
+        return out
+
     def _run_eval_studies(self, epoch: int) -> None:
         """Run this epoch's value-function evaluation studies, if any are due.
 
@@ -1159,12 +1679,17 @@ class PolicyGradient(BaseAlgo):
         # estimate_true_value call above so both diagnostics are read from the same epochs.
         if (
             getattr(self._cfgs.algo_cfgs, 'eval_critic', False)
+            and getattr(self._cfgs.algo_cfgs, 'legacy_value_studies', True)
             and is_eval_epoch
             and self._use_isolated_eval
         ):
             # One subprocess runs both studies; see _run_isolated_eval_studies.
             self._run_isolated_eval_studies(epoch, eval_data_bundle)
-        elif getattr(self._cfgs.algo_cfgs, 'eval_critic', False) and is_eval_epoch:
+        elif (
+            getattr(self._cfgs.algo_cfgs, 'eval_critic', False)
+            and getattr(self._cfgs.algo_cfgs, 'legacy_value_studies', True)
+            and is_eval_epoch
+        ):
             if self._mc_probe_seeds is None:
                 n_probes = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_probes', 100))
                 seed_offset = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_seed_offset', 100_000))
@@ -1196,8 +1721,14 @@ class PolicyGradient(BaseAlgo):
         # _mc_probe_seeds) -- by epoch 400 the policy visits very different states than at
         # epoch 20, so re-using an old batch would be scoring accuracy on states the current
         # policy may never actually visit.
+        # Hoisted out of the block below so the next-state probe study can reach the same
+        # snapshots: it has to designate its transitions from the very states the value study
+        # scored, not a freshly collected batch.
+        interm_collected: dict | None = None
+        interm_positions: list = []
         if (
             getattr(self._cfgs.algo_cfgs, 'eval_critic', False)
+            and getattr(self._cfgs.algo_cfgs, 'legacy_value_studies', True)
             and is_eval_epoch
             and not self._use_isolated_eval
         ):
@@ -1230,6 +1761,7 @@ class PolicyGradient(BaseAlgo):
             collected = collect_on_policy_snapshots(
                 self._actor_critic, interm_env, positions, base_seed=base_seed,
             )
+            interm_collected, interm_positions = collected, positions
             eval_data_bundle['intermediate_study'] = {}
             for pos in positions:
                 pos_stats, pos_raw = estimate_value_from_snapshots(
@@ -1261,7 +1793,11 @@ class PolicyGradient(BaseAlgo):
                 }
         # Pooling, gradient alignment and the scatter quick-look read only what the two studies
         # above filed in eval_data_bundle, so they run for whichever path produced it.
-        if getattr(self._cfgs.algo_cfgs, 'eval_critic', False) and is_eval_epoch:
+        if (
+            getattr(self._cfgs.algo_cfgs, 'eval_critic', False)
+            and getattr(self._cfgs.algo_cfgs, 'legacy_value_studies', True)
+            and is_eval_epoch
+        ):
             # Pooled diversity correlation over every state actually evaluated on this
             # epoch -- s0 (if mc_value_study also ran) plus every intermediate position,
             # pooled into one set before computing a single correlation. See
@@ -1285,56 +1821,24 @@ class PolicyGradient(BaseAlgo):
                 alignment = compute_gradient_alignment(self._actor_critic.actor, pooled_raw, stream)
                 self._logger.store({f'PooledMC/GradientAlignment_{stream}': alignment})
             eval_data_bundle['pooled'] = {'stats': pooled_stats, 'raw': pooled_raw}
-        # Persist this epoch's eval data (raw + aggregates -- see eval_data_dump.py's
-        # docstring for why this needs to exist separately from the online loggers) and save
-        # a checkpoint, both on the exact same cadence as the eval blocks above. Note this
-        # runs before this epoch's own dump_tabular() (in learn()), so self._logger's own epoch
-        # counter still equals `epoch` here -- torch_save() names the file accordingly,
-        # consistent with eval_data_bundle's filename.
+
+        if is_eval_epoch and getattr(self._cfgs.algo_cfgs, 'gradient_direction_study', False):
+            grad_study = self._gradient_direction_study()
+            if grad_study is not None:
+                eval_data_bundle['gradient_direction'] = grad_study
+
+        # After the block above, which populates self._batch_grads for the subsample ceiling.
+        if is_eval_epoch and getattr(self._cfgs.algo_cfgs, 'probe_gradient_study', False):
+            probe_study = self._probe_gradient_study(epoch)
+            if probe_study is not None:
+                eval_data_bundle['probe_study'] = probe_study
+
+        # Persist this epoch's eval data (raw + aggregates -- see eval_data_dump.py's docstring
+        # for why this exists separately from the online loggers), on the same cadence as the
+        # eval blocks above.
         if is_eval_epoch:
             eval_data_path = save_eval_data(self._logger.log_dir, epoch, eval_data_bundle)
             log_eval_data_to_wandb(eval_data_path, epoch)
-            scatter_series = []
-            if 'mc_study' in eval_data_bundle:
-                scatter_series.append(('s0', eval_data_bundle['mc_study']['raw']))
-            for pos, pos_data in eval_data_bundle.get('intermediate_study', {}).items():
-                scatter_series.append((f'pos{pos}', pos_data['raw']))
-            if 'pooled' in eval_data_bundle:
-                scatter_series.append(('pooled', eval_data_bundle['pooled']['raw']))
-            if scatter_series:
-                scatter_path = save_scatter_grid(self._logger.log_dir, epoch, scatter_series)
-                log_scatter_to_wandb(scatter_path, epoch)
-            self._logger.torch_save()
-            # Push this epoch's checkpoint to wandb too -- previously local-only (see
-            # Logger.torch_save's docstring), meaning any retroactive analysis pulling a run's
-            # eval_data pickles (e.g. to recompute compute_gradient_alignment offline, since that
-            # needs the actor's *weights* at this exact epoch, not just the (obs, action, returns,
-            # pred, mc_mean) the pickle already carries) had no way to reconstruct the actor and
-            # was permanently stuck with whatever got logged live. _what_to_save on this
-            # (on-policy) path is already just {'pi': actor, 'obs_normalizer': ...} -- i.e.
-            # already the lightweight snapshot this needs -- actor, both critics and the
-            # observation normalizer, but no optimizer state -- so this reuses that exact file
-            # rather than writing a second, redundant copy. Naming/cadence mirrors eval_data_path
-            # exactly (same epoch, same is_eval_epoch gate) so the two artifacts are always
-            # available as a pair.
-            #
-            # The artifact is still called "actor-snapshot" for continuity with runs logged before
-            # the critics were added; it has held them since, and the description below says so.
-            checkpoint_path = os.path.join(self._logger.log_dir, 'torch_save', f'epoch-{epoch}.pt')
-            if os.path.exists(checkpoint_path):
-                log_eval_data_to_wandb(
-                    checkpoint_path, epoch,
-                    name_prefix='actor-snapshot', artifact_type='actor_snapshot',
-                    description=(
-                        f'Agent state dicts at epoch {epoch}, keyed by _what_to_save: '
-                        f"'pi', 'reward_critic', 'cost_critic' and (when obs_normalize) "
-                        f"'obs_normalizer'. This is the PRE-update critic -- the snapshot is "
-                        f'taken before _update() runs, so it is exactly the critic an epoch-'
-                        f'{epoch} evaluation scores. Enough on its own to re-run the value '
-                        f'studies offline, and pairs with this epoch\'s eval-data artifact to '
-                        f'recompute compute_gradient_alignment.'
-                    ),
-                )
 
     def _persist_scatter_raw_data(self, epoch: int) -> None:
         """Persist + push the raw arrays behind every ``log_scatter_image`` call this epoch made.
@@ -1570,6 +2074,12 @@ class PolicyGradient(BaseAlgo):
         specifically and want them while ``eval_critic: False``, they need their own flag.
         """
         if not getattr(self._cfgs.algo_cfgs, 'eval_critic', False):
+            return
+        # The per-epoch training-batch critic diagnostics (Value/Train/{Before,After}Update/*)
+        # are their own axis -- the flag this docstring anticipates. The probe study scores the
+        # critic against MC on batch states directly, which is what those correlations were
+        # standing in for, so they are off by default in the probe configuration.
+        if not getattr(self._cfgs.algo_cfgs, 'train_batch_diagnostics', True):
             return
         self._log_critic_diagnostics(
             train_data['obs'],
