@@ -120,6 +120,8 @@ defaults:
     lambda_lr: 0.00001
     # Type of lagrangian optimizer
     lambda_optimizer: "Adam"
+    # The upper bound of the lagrange multiplier; null leaves it unbounded
+    lagrangian_upper_bound: null
 
 SafetyCarCircle1-v0:
   # model configurations
