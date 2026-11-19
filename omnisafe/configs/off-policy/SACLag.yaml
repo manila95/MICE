@@ -78,6 +78,10 @@ defaults:
     use_cost: True
     # warm up epoch
     warmup_epochs: 100
+    # EMA smoothing applied to Jc before the multiplier update; 0 disables
+    lambda_jc_ema: 0.0
+    # Update the multiplier only every n-th call (n = steps_per_epoch -> once per epoch)
+    lambda_update_every: 1
   # logger configurations
   logger_cfgs:
     # use wandb for logging

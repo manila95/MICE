@@ -53,6 +53,42 @@ class SACLag(SAC):
         super()._init_log()
         self._logger.register_key('Metrics/LagrangeMultiplier')
 
+    def _lambda_signal(self, Jc: float) -> float | None:
+        """The cost estimate the multiplier is actually driven by.
+
+        ``update_cycle: 1`` means this runs once per environment *step*, so the multiplier
+        integrates 2000 times per epoch against a ``Metrics/EpCost`` that only refreshes when
+        episodes finish -- on a 1000-step task that is a two-episode average. The multiplier
+        therefore chases sampling noise and keeps accumulating right up to the moment cost
+        crosses the limit, overshooting by the time it gets there.
+
+        Two knobs, both no-ops at their defaults:
+
+        ``lambda_update_every`` skips all but every n-th update, so the multiplier moves on a
+        coarser clock (``n = steps_per_epoch`` makes it once per epoch). ``lambda_jc_ema``
+        smooths ``Jc`` with an exponential moving average first, so the multiplier responds to
+        the trend rather than to which two episodes happened to land in this window.
+
+        Returns:
+            The (possibly smoothed) cost estimate, or ``None`` when this call falls on a
+            skipped tick. ``None`` means *do not step the optimizer at all*: feeding it the
+            cost limit instead would zero the gradient but Adam would still move on stale
+            momentum, which is a leaky integrator rather than a skip.
+        """
+        cfgs = self._cfgs.algo_cfgs
+        ema = getattr(cfgs, 'lambda_jc_ema', 0.0)
+        if ema > 0.0:
+            prev = getattr(self, '_jc_ema', None)
+            Jc = Jc if prev is None else ema * prev + (1.0 - ema) * Jc
+            self._jc_ema = Jc
+
+        every = getattr(cfgs, 'lambda_update_every', 1)
+        if every > 1:
+            self._lambda_tick = getattr(self, '_lambda_tick', 0) + 1
+            if self._lambda_tick % every:
+                return None
+        return Jc
+
     def _update(self) -> None:
         """Update actor, critic, as we used in the :class:`PolicyGradient` algorithm.
 
@@ -62,7 +98,9 @@ class SACLag(SAC):
         super()._update()
         Jc = self._logger.get_stats('Metrics/EpCost')[0]
         if self._epoch > self._cfgs.algo_cfgs.warmup_epochs:
-            self._lagrange.update_lagrange_multiplier(Jc)
+            signal = self._lambda_signal(Jc)
+            if signal is not None:
+                self._lagrange.update_lagrange_multiplier(signal)
         self._logger.store(
             {
                 'Metrics/LagrangeMultiplier': self._lagrange.lagrangian_multiplier.data.item(),
