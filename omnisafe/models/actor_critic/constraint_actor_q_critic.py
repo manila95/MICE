@@ -134,13 +134,18 @@ class ConstraintActorQCritic(ActorQCritic):
             self._build_successor_representation_critics(obs_space, act_space, model_cfgs)
             return
 
+        # The reward critic gets num_critics (twins, aggregated with min); the cost critic
+        # has historically been a single network, which leaves its bootstrap with nothing
+        # resisting underestimation -- and an underestimated cost feeds the multiplier a
+        # violation that looks smaller than it is. num_critics_cost gives it an ensemble of
+        # its own; see _aggregate_cost_q for how the members are combined.
         self.cost_critic: Critic = CriticBuilder(
             obs_space=obs_space,
             act_space=act_space,
             hidden_sizes=model_cfgs.critic.hidden_sizes,
             activation=model_cfgs.critic.activation,
             weight_initialization_mode=model_cfgs.weight_initialization_mode,
-            num_critics=1,
+            num_critics=int(getattr(model_cfgs.critic, 'num_critics_cost', 1)),
             use_obs_encoder=False,
         ).build_critic('q')
         self.target_cost_critic: Critic = deepcopy(self.cost_critic)

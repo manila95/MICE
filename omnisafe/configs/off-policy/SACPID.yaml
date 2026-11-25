@@ -52,6 +52,13 @@ defaults:
     max_grad_norm: 40
     # use critic norm
     use_critic_norm: False
+    # How the cost critic's ensemble members are combined: none, cdq, gpl or top.
+    # Applied in the COST direction -- cdq takes the max where the reward twins
+    # take the min, because the conservative reading of a disputed cost is the
+    # higher one. Needs num_critics_cost > 1 to do anything.
+    cost_ensemble_method: none
+    # Pessimism coefficient, read only by gpl and top.
+    cost_ensemble_beta: 1.0
     # critic norm coefficient
     critic_norm_coeff: 0.001
     # The soft update coefficient
@@ -79,6 +86,18 @@ defaults:
     # warm up epoch
     warmup_epochs: 100
     # whether to evaluate the Q-critics against Monte-Carlo returns of the current policy
+    # Score the critics against a repeated same-layout Monte-Carlo reference: fix a
+    # layout by seed, re-roll the stochastic policy from it mc_value_study_repeats
+    # times, and compare Q(s0,a0) against the sample mean. The alternative compares
+    # against ONE rollout per state, which is a single draw from the return
+    # distribution rather than an estimate. Costs probes x repeats episodes per
+    # evaluation. Set False for the cheaper single-rollout study.
+    mc_value_study: True
+    mc_value_study_probes: 17
+    mc_value_study_repeats: 10
+    mc_value_study_seed_offset: 100000
+    # Probe environments run concurrently; each still gets its own clean reset(seed=X).
+    mc_value_study_vector_envs: 5
     test_estimate: True
     # eval frequency for the first 100 epochs (higher cadence for early monitoring)
     early_eval_freq: 5
@@ -121,6 +140,9 @@ defaults:
     critic:
       # The number of critic networks
       num_critics: 2
+      # Ensemble size for the COST critic, separate from num_critics above
+      # (which is the reward twins). 1 reproduces the single cost network.
+      num_critics_cost: 1
       # Size of hidden layers
       hidden_sizes: [256, 256]
       # Activation function

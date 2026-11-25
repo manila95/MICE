@@ -30,7 +30,11 @@ from omnisafe.algorithms import registry
 from omnisafe.algorithms.base_algo import BaseAlgo
 from omnisafe.common.buffer import VectorOffPolicyBuffer
 from omnisafe.common.logger import Logger
+from omnisafe.envs.core import make as make_env
+from omnisafe.envs.wrapper import ActionScale, AutoReset, ObsNormalize, TimeLimit, Unsqueeze
+from omnisafe.utils.critic_ensemble import aggregate as aggregate_critic_ensemble
 from omnisafe.utils.eval_data_dump import log_eval_data_to_wandb, save_eval_data
+from omnisafe.utils.value_eval import estimate_true_q_value_same_state_mc
 from omnisafe.models.actor_critic.constraint_actor_q_critic import ConstraintActorQCritic
 
 
@@ -231,8 +235,12 @@ class DDPG(BaseAlgo):
         if getattr(self._cfgs.algo_cfgs, 'test_estimate', False):
             # Registered here, not when the first evaluation produces them: the progress.csv
             # header is written at the first dump_tabular, so a column added later is lost.
-            for key in self._value_eval_keys() + self._value_eval_extra_keys():
-                self._logger.register_key(key)
+            if getattr(self._cfgs.algo_cfgs, 'mc_value_study', True):
+                for key in self._mc_study_keys():
+                    self._logger.register_key(key)
+            else:
+                for key in self._value_eval_keys() + self._value_eval_extra_keys():
+                    self._logger.register_key(key)
 
         if self._cfgs.train_cfgs.eval_episodes > 0:
             self._logger.register_key(
@@ -463,6 +471,112 @@ class DDPG(BaseAlgo):
             return False
         return done // freq > before // freq
 
+    _mc_eval_env = None
+    _mc_probe_seeds: list[int] | None = None
+    _mc_max_episode_steps: int | None = None
+
+    @staticmethod
+    def _mc_study_keys() -> tuple[str, ...]:
+        """Aggregate statistics the same-layout MC study reports, in a fixed order.
+
+        Registered before training starts rather than when the first evaluation produces
+        them: progress.csv's header is written at the first dump_tabular, so a column added
+        later never appears in the file.
+
+        ``*_target_true_*`` and ``*_pred_target_*`` decompose the prediction-versus-truth gap
+        into the two failure modes it can come from -- a target that does not match the real
+        return, and a critic that does not match its own target. ``MeanVar_*`` is the
+        variance of the repeats at each probe, which says how much of any remaining gap is
+        simply the spread of the return rather than bias.
+        """
+        pairs = (
+            'EstimationError', 'Correlation', 'MeanTrue', 'MeanPred', 'MeanTarget', 'MeanVar',
+            'EstimationError_target_true', 'Correlation_target_true', 'Correlation_pred_target',
+        )
+        return tuple(
+            f'MCStudy/{name}_{stream}' for name in pairs for stream in ('r', 'c')
+        ) + ('MCStudy/NumProbes', 'MCStudy/MCRepeats')
+
+    def _ensure_mc_eval_env(self):
+        """A dedicated environment for the same-layout probe resets, built once.
+
+        It cannot be the training environment: each probe needs a clean ``reset(seed=X)``, and
+        doing that on the training env would destroy the episode in flight. It gets the same
+        wrapper recipe as training (minus the reward/cost normalizers, which must not update
+        from evaluation rollouts) so the policy sees identical observation and action
+        processing to what it was trained under.
+        """
+        if self._mc_eval_env is not None:
+            return self._mc_eval_env
+        env_cfgs = {}
+        if getattr(self._cfgs, 'env_cfgs', None) is not None:
+            env_cfgs = self._cfgs.env_cfgs.todict()
+        n = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_vector_envs', 1))
+        env = make_env(self._env_id, num_envs=n, device=self._device, **env_cfgs)
+        if env.need_time_limit_wrapper:
+            env = TimeLimit(env, time_limit=env.max_episode_steps, device=self._device)
+        if env.need_auto_reset_wrapper:
+            env = AutoReset(env, device=self._device)
+        if self._cfgs.algo_cfgs.obs_normalize:
+            env = ObsNormalize(env, device=self._device, update_stats=False)
+        env = ActionScale(env, low=-1.0, high=1.0, device=self._device)
+        if n == 1:
+            env = Unsqueeze(env, device=self._device)
+        probe = make_env(self._env_id, num_envs=1, device=self._device, **env_cfgs)
+        self._mc_max_episode_steps = probe.max_episode_steps
+        self._mc_eval_env = env
+        return env
+
+    def _run_mc_value_study(self, epoch: int) -> None:
+        """Score the Q critics against a repeated same-layout Monte-Carlo reference.
+
+        The protocol the on-policy algorithms use. The earlier off-policy study compared the
+        critic against *one* rollout per visited state, so each reference was a single draw
+        from the return distribution rather than an estimate -- with nothing to say how much
+        of a gap was bias and how much was the variance of one sample. Here a fixed set of
+        layouts is reproduced exactly by seed and the stochastic policy is re-rolled from each
+        ``mc_value_study_repeats`` times, so the reference is a sample mean whose variance is
+        reported beside it.
+
+        Args:
+            epoch (int): Current epoch, used as the logging step and the dump's filename.
+        """
+        if self._mc_probe_seeds is None:
+            n = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_probes', 17))
+            off = int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_seed_offset', 100_000))
+            self._mc_probe_seeds = list(range(off, off + n))
+        gamma = self._cfgs.algo_cfgs.gamma
+        stats, raw = estimate_true_q_value_same_state_mc(
+            agent=self._actor_critic,
+            env=self._ensure_mc_eval_env(),
+            cfgs=self._cfgs,
+            discount_r=gamma,
+            discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', gamma),
+            probe_seeds=self._mc_probe_seeds,
+            mc_repeats=int(getattr(self._cfgs.algo_cfgs, 'mc_value_study_repeats', 10)),
+            epoch=epoch,
+            sync_normalizer_from=self._env._env,  # noqa: SLF001
+            max_episode_steps=self._mc_max_episode_steps,
+            return_raw=True,
+        )
+        for key in self._mc_study_keys():
+            value = stats.get(key)
+            if isinstance(value, (int, float)):
+                self._logger.store({key: float(value)})
+        # Everything the aggregates were computed from: per-probe predictions, per-repeat
+        # returns and their variances. An aggregate cannot be un-averaged later, so a
+        # calibration curve or a reliability diagram has to come from these.
+        path = save_eval_data(
+            self._logger.log_dir,
+            epoch,
+            {'mc_study': {'stats': stats, 'raw': raw},
+             'probe_seeds': list(self._mc_probe_seeds),
+             'epoch': epoch,
+             'total_env_steps': (epoch + 1) * self._cfgs.algo_cfgs.steps_per_epoch},
+            subdir='mc_eval_data',
+        )
+        log_eval_data_to_wandb(path, epoch, name_prefix='mc-eval-data')
+
     def _eval_value_function(self, epoch: int) -> None:
         """Evaluate the Q-critics against Monte-Carlo returns of the current policy.
 
@@ -491,6 +605,12 @@ class DDPG(BaseAlgo):
         if (epoch + 1) * self._cfgs.algo_cfgs.steps_per_epoch <= (
             self._cfgs.algo_cfgs.start_learning_steps
         ):
+            return
+
+        if getattr(self._cfgs.algo_cfgs, 'mc_value_study', True):
+            # Repeated same-layout rollouts: the reference is a sample mean with a reported
+            # variance, not a single draw from the return distribution.
+            self._run_mc_value_study(epoch)
             return
 
         gamma = self._cfgs.algo_cfgs.gamma
@@ -799,6 +919,33 @@ class DDPG(BaseAlgo):
             )
         self._actor_critic.reward_critic_optimizer.step()
 
+    def _aggregate_cost_q(self, values: list[torch.Tensor]) -> torch.Tensor:
+        """Combine the cost critic's ensemble members into one conservative estimate.
+
+        Mirrors what SAC already does on the reward side, in the opposite direction. There
+        the twins are combined with ``min``, so a reward the members disagree about is
+        treated as the lower of their estimates. Cost is the same argument reflected: the
+        conservative reading of a disputed cost is the *higher* one, because a cost critic
+        that reads low feeds the Lagrange multiplier a violation smaller than the real one,
+        and the constraint is under-enforced without anything in the loss noticing.
+
+        ``cost_ensemble_method`` selects the rule ('none', 'cdq', 'gpl', 'top'); the shared
+        aggregator applies the cost-side direction for each. With one member, or 'none',
+        this is the first member and the behaviour is exactly what it was.
+
+        Args:
+            values (list of torch.Tensor): Per-member ``(B,)`` predictions, as the critic
+                returns them.
+
+        Returns:
+            The aggregated ``(B,)`` cost estimate.
+        """
+        method = str(getattr(self._cfgs.algo_cfgs, 'cost_ensemble_method', 'none'))
+        if method == 'none' or len(values) == 1:
+            return values[0]
+        beta = float(getattr(self._cfgs.algo_cfgs, 'cost_ensemble_beta', 1.0))
+        return aggregate_critic_ensemble(torch.stack(values, dim=0), method, 'c', beta)
+
     def _update_cost_critic(
         self,
         obs: torch.Tensor,
@@ -822,10 +969,16 @@ class DDPG(BaseAlgo):
         """
         with torch.no_grad():
             next_action = self._actor_critic.actor.predict(next_obs, deterministic=True)
-            next_q_value_c = self._actor_critic.target_cost_critic(next_obs, next_action)[0]
+            next_q_value_c = self._aggregate_cost_q(
+                self._actor_critic.target_cost_critic(next_obs, next_action),
+            )
             target_q_value_c = cost + self._cfgs.algo_cfgs.gamma * (1 - done) * next_q_value_c
-        q_value_c = self._actor_critic.cost_critic(obs, action)[0]
-        loss = nn.functional.mse_loss(q_value_c, target_q_value_c)
+        q_values_c = self._actor_critic.cost_critic(obs, action)
+        # Every member is regressed onto the same target, exactly as SAC trains its reward
+        # twins: summed, not averaged, so each member's gradient is unchanged by how many
+        # members there are.
+        loss = sum(nn.functional.mse_loss(q, target_q_value_c) for q in q_values_c)
+        q_value_c = self._aggregate_cost_q(q_values_c)
 
         if self._cfgs.algo_cfgs.use_critic_norm:
             for param in self._actor_critic.cost_critic.parameters():

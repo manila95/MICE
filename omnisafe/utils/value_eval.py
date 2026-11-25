@@ -335,6 +335,43 @@ def _rollout_and_report(  # pylint: disable=too-many-locals,too-many-statements
     )
 
 
+def estimate_true_q_value_same_state_mc(agent, env, cfgs, **kwargs):
+    r"""Same-layout Monte-Carlo study for a **Q** critic.
+
+    :func:`estimate_true_value_same_state_mc` fixes a state, reproduces it exactly by resetting
+    with the same seed, and re-rolls the stochastic policy out from it ``mc_repeats`` times, so
+    the reference is a sample mean with a known variance rather than one noisy draw. That is
+    the whole reason it exists, and none of it is specific to the critic being a V critic.
+
+    The only difference here is where the prediction comes from. A V critic reports
+    :math:`V(s_0)` with no action involved; a Q critic reports :math:`Q(s_0, a_0)` for the
+    action actually taken, so the action has to be drawn first and the pairing is between that
+    action's value and the return of the trajectory that follows it.
+
+    Args:
+        agent: Actor-critic exposing ``actor.predict``, ``reward_critic`` and ``cost_critic``.
+        env: The evaluation environment, as the V version takes it.
+        cfgs: Run config; only ``train_cfgs.device`` is read here.
+        **kwargs: Forwarded verbatim -- ``probe_seeds``, ``mc_repeats``, ``return_raw`` and
+            the rest behave exactly as they do for the V version.
+
+    Returns:
+        Whatever :func:`estimate_true_value_same_state_mc` returns for these arguments.
+    """
+    def _predict(obs):
+        with torch.no_grad():
+            act = agent.actor.predict(obs, deterministic=False)
+            q_r = torch.min(torch.stack(agent.reward_critic(obs, act), dim=0), dim=0).values
+            raw_c = agent.cost_critic(obs, act)
+            # Cost ensembles are combined toward the high end; with one member this is it.
+            q_c = torch.stack(raw_c, dim=0).max(dim=0).values if len(raw_c) > 1 else raw_c[0]
+        return act, q_r, q_c
+
+    return estimate_true_value_same_state_mc(
+        agent=agent, env=env, cfgs=cfgs, predict=_predict, **kwargs
+    )
+
+
 def _find_obs_normalizer(env):
     """Walk an env's wrapper chain (outermost first) for its ``ObsNormalize`` instance, if any.
 
@@ -511,6 +548,7 @@ def estimate_true_value_same_state_mc(
     return_raw=False,
     bootstrap_threshold=None,
     tail_mode=None,
+    predict=None,
 ):
     r"""Compare the critic's V(s0) against a genuine same-layout Monte-Carlo estimate.
 
@@ -679,7 +717,15 @@ def estimate_true_value_same_state_mc(
             wave_seeds += [wave_seeds[0]] * (n_envs - wave_size)
 
         obs, _ = env.reset(seed=wave_seeds if n_envs > 1 else wave_seeds[0])
-        act, value_r, value_c, log_prob = agent.step(obs)
+        # ``predict`` lets a Q critic be scored by this same protocol: an actor-critic with
+        # V critics reads the value straight off ``agent.step``, while a Q critic needs the
+        # action first and then ``Q(s0, a0)``. Everything downstream -- the same-layout
+        # resets, the repeated rollouts, the discounting -- is identical either way.
+        if predict is None:
+            act, value_r, value_c, log_prob = agent.step(obs)
+        else:
+            act, value_r, value_c = predict(obs)
+            log_prob = None
         # V(s0) is deterministic given s0 (no action taken yet), so it only needs computing once
         # per rollout -- cheap regardless (one batched NN forward pass vs. hundreds of env steps).
         pred_r_batch = value_r.reshape(-1).detach().cpu().numpy()
@@ -717,7 +763,15 @@ def estimate_true_value_same_state_mc(
             disc_r *= discount_r
             disc_c *= discount_c
             if t < horizon - 1:
-                act, value_r, value_c, log_prob = agent.step(obs)
+                if predict is None:
+                    act, value_r, value_c, log_prob = agent.step(obs)
+                else:
+                    act, value_r, value_c = predict(obs)
+                    # A Q critic's predict gives no log-prob. It is only read by the
+                    # training-style target, whose entropy term has no counterpart here, so
+                    # leaving it at zero keeps that target comparable across the sequence
+                    # rather than silently mixing in a value that was never computed.
+                    log_prob = torch.zeros_like(value_r)
                 v_r_seq[t + 1] = value_r.reshape(-1).detach().cpu().numpy()
                 v_c_seq[t + 1] = value_c.reshape(-1).detach().cpu().numpy()
                 logp_seq[t] = log_prob.reshape(-1).detach().cpu().numpy()
@@ -750,7 +804,10 @@ def estimate_true_value_same_state_mc(
         # construction exactly (see omnisafe.utils.gae's docstring). Queried for every slot
         # uniformly (cheap: one more batched forward pass) rather than branching per-env; the
         # terminated slots' values are simply zeroed out afterward.
-        _, boot_value_r, boot_value_c, _ = agent.step(obs)
+        if predict is None:
+            _, boot_value_r, boot_value_c, _ = agent.step(obs)
+        else:
+            _, boot_value_r, boot_value_c = predict(obs)
         boot_r = np.where(is_terminated, 0.0, boot_value_r.reshape(-1).detach().cpu().numpy())
         boot_c = np.where(is_terminated, 0.0, boot_value_c.reshape(-1).detach().cpu().numpy())
         v_r_seq[horizon] = boot_r
@@ -1112,7 +1169,15 @@ def estimate_value_from_snapshots(
             disc_r *= discount_r
             disc_c *= discount_c
             if t < horizon - 1:
-                act, value_r, value_c, log_prob = agent.step(obs)
+                if predict is None:
+                    act, value_r, value_c, log_prob = agent.step(obs)
+                else:
+                    act, value_r, value_c = predict(obs)
+                    # A Q critic's predict gives no log-prob. It is only read by the
+                    # training-style target, whose entropy term has no counterpart here, so
+                    # leaving it at zero keeps that target comparable across the sequence
+                    # rather than silently mixing in a value that was never computed.
+                    log_prob = torch.zeros_like(value_r)
                 v_r_seq[t + 1] = value_r.reshape(-1).detach().cpu().numpy()
                 v_c_seq[t + 1] = value_c.reshape(-1).detach().cpu().numpy()
                 logp_seq[t] = log_prob.reshape(-1).detach().cpu().numpy()
