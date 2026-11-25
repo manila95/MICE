@@ -80,6 +80,10 @@ defaults:
     warmup_epochs: 100
     # EMA smoothing applied to Jc before the multiplier update; 0 disables
     lambda_jc_ema: 0.0
+    # Epochs over which the cost limit reaches its configured value
+    cost_limit_anneal_epochs: 0
+    # Start the cost limit here and tighten to cost_limit; 0 keeps it fixed
+    cost_limit_start: 0.0
     # Update the multiplier only every n-th call (n = steps_per_epoch -> once per epoch)
     lambda_update_every: 1
   # logger configurations
@@ -122,6 +126,317 @@ defaults:
       activation: relu
       # The learning rate of Critic network
       lr: 0.0003
+    # whether to use a shared successor-representation value function for reward and cost,
+    # instead of two independent critics
+    use_successor_representation: False
+    # successor representation configurations, only used when use_successor_representation is True
+    sr_cfgs:
+      # 'shared_trunk': shared feature trunk + linear reward/cost read-out heads, trained
+      # end-to-end by the ordinary value-target MSE loss (reuses the stock GAE / GAE-RTG /
+      # V-trace / Plain value-target code exactly).
+      # 'td_ridge': literal successor representation -- phi/psi trained by TD (using the same
+      # estimator machinery above, applied to a vector feature stream), with the reward/cost
+      # read-out weights solved by closed-form ridge regression each update.
+      sr_mode: shared_trunk
+      # when sr_mode is 'td_ridge', train the reward critic the normal way -- a plain MLP
+      # Q/V critic with its own optimizer, independent of the SR trunk -- and use the SR trunk
+      # for the cost critic only (a single psi head off-policy; no change on-policy, which
+      # already has one). The trunk still fits w_r each update for diagnostic parity with the
+      # non-cost_only run; it is simply never read out into an actual critic. Ignored (raises)
+      # under sr_mode: 'shared_trunk'.
+      cost_only: false
+      # dimensionality of the shared successor-feature vector
+      sr_dim: 64
+      # Run the SR hooks only every n-th update. update_cycle=1 calls them once per
+      # environment step; n = steps_per_epoch matches the on-policy cadence. 1 = per step.
+      sr_update_every: 1
+      # Recompute the Gram condition numbers every n-th ridge solve (an SVD apiece,
+      # diagnostic only); the last value is carried forward in between. 1 = every solve.
+      cond_every: 1
+      # hidden layer sizes of the shared trunk / psi network. Sets the trunk's own hidden
+      # widths verbatim -- independent of sr_dim, which only sets the final phi/psi
+      # projection's output width. Keep the last width >= sr_dim unless a deliberate
+      # bottleneck is wanted: that final phi/psi layer has no nonlinearity, so it can't
+      # raise rank above hidden_sizes[-1] (wasted capacity in shared_trunk mode; a
+      # rank-deficient, singular-without-regularization ridge Gram matrix in td_ridge mode).
+      hidden_sizes: [64, 64]
+      # activation function of the trunk
+      activation: tanh
+      # learning rate for the trunk (shared_trunk mode) or the psi network (td_ridge mode)
+      lr: 0.0003
+      # lambda for the successor-feature TD target (td_ridge mode only); mirrors lam_c
+      lam_sr: 0.95
+      # discount factor for the successor-feature TD recursion (td_ridge mode only);
+      # defaults to algo_cfgs.gamma when null
+      gamma_sr: ~
+      # ridge regression L2 regularization coefficient for solving w_r / w_c (td_ridge mode only)
+      ridge_kappa: 0.001
+      # ridge L2 coefficient for the COST read-out only (td_ridge mode); null = reuse
+      # ridge_kappa. Split because the MSE-optimal shrinkage scales with a target's
+      # noise-to-signal ratio, and a sparse cost generalizes far worse than a dense reward
+      # at the same kappa -- measured train-minus-val RidgeR2 gap on SafetyPointGoal1-v0 was
+      # 1.19 for cost against 0.05 for reward, i.e. one shared kappa cannot suit both.
+      ridge_kappa_cost: ~
+      # optional [lo, hi] clamp on the cost critic's read-out value (td_ridge mode only); null =
+      # unclamped. psi(s).w_c is an unconstrained linear functional with no notion of the cost
+      # target's valid range, so nothing stops it landing far outside one even when the target
+      # has a known bound -- e.g. a discounted, single-occurrence cost (cost=terminated, as in
+      # plain-Mujoco environments) can never leave [0, 1], yet the unclamped read-out was
+      # measured reaching 5.45 on Ant-v4/CPO early in training. Set to [0.0, 1.0] for that case;
+      # every consumer of the cost critic's output (including the GAE/advantage computation) then
+      # sees a bounded value instead of an occasional wild outlier.
+      cost_value_clip: ~
+      # EMA smoothing coefficient for w_r / w_c across iterations, 1.0 = no smoothing (td_ridge mode only)
+      ema_tau: 1.0
+      # --- trunk regularization (dropout/LayerNorm/spectral-norm/weight_decay; all off by
+      # default), applied to the shared trunk body + psi_head (td_ridge) or the trunk's own
+      # feature layer (shared_trunk) -- see SuccessorRepresentationTrunk/
+      # TDRidgeSuccessorRepresentationTrunk and _build_successor_representation_critics. Shared
+      # across reward AND cost since the trunk itself is shared between them (except under
+      # sr_cfgs.cost_only, where the trunk is cost-exclusive already, so these already only
+      # affect cost with no separate "_cost" knob needed -- unlike model_cfgs.critic.dropout_cost
+      # etc, there is no architecturally-coherent way to regularize "cost only" on a trunk both
+      # streams flow through). Out of scope: phi_head/phi_net under the frozen/contrastive/
+      # laplacian phi_source options, which have their own separate training paths already.
+      #
+      # dropout probability, applied to every layer of the regularized networks including their
+      # own last layer (see build_mlp_network's regularize_last_layer) -- unlike a plain critic's
+      # output layer, none of these layers is an unconstrained scalar value; they all just
+      # produce a feature vector consumed downstream (by SuccessorRepresentationReadout's head,
+      # or by the w_r/w_c ridge solve). sr_trunk defaults to eval() everywhere except its own
+      # gradient-update step (_update_reward_critic/_update_cost_critic/
+      # _update_successor_features), so dropout never affects a value read or the ridge solve's
+      # design matrix -- see those methods.
+      dropout: 0.0
+      # LayerNorm between each regularized layer's affine transform and its activation.
+      use_layer_norm: False
+      # spectral-normalize each regularized layer, bounding the trunk's Lipschitz constant.
+      use_spectral_norm: False
+      # decoupled weight decay (AdamW) on the trunk-training optimizer (sr_optimizer). Distinct
+      # from algo_cfgs.critic_norm_coef's existing L2-added-to-the-loss (also applied to the
+      # trunk via _update_reward_critic/_update_cost_critic/_update_successor_features) for the
+      # same coupled-vs-decoupled reason as model_cfgs.critic.weight_decay -- see that comment.
+      # 0.0 (default) makes AdamW behave identically to the previous plain Adam.
+      weight_decay: 0.0
+      # read-out weight learning (td_ridge mode): 'ridge' (closed-form each epoch) or 'sgd'
+      # (gradient descent over a persistent cross-epoch replay buffer; principled with a frozen
+      # phi_source: random / separate). On-policy 'sgd' keeps its own buffer since the rollout
+      # buffer is wiped every epoch, so w is still fit over all past experience.
+      readout: ridge
+      # what the closed-form ridge regresses (readout: ridge only).
+      #   'phi' (default): phi(s).w ~= one-step reward/cost -- the original successor-feature
+      #                 factorization; w is policy-independent since the immediate reward/cost
+      #                 doesn't depend on the return.
+      #   'psi'         : psi(s).w ~= the true discounted return (discounted_ret /
+      #                 discounted_cost_ret), an ordinary linear value-function regression on top
+      #                 of psi as a learned feature extractor rather than a literal successor
+      #                 measure. Requires ridge_data: 'epoch'. Motivated by phi_source: 'trunk'
+      #                 specifically: phi_head never receives a gradient there (every trainable
+      #                 loss reads out through psi, never phi), so regressing against the
+      #                 gradient-shaped psi instead of the frozen-random phi measured a large,
+      #                 held-out-verified improvement in both correlation and absolute scale
+      #                 against the true cost-to-go on Ant-v4/CPO -- see WOracleCostCorr /
+      #                 WOracleCostR2 in PolicyGradient._sr_split_scalars, the diagnostic this
+      #                 mode makes real.
+      w_source: phi
+      # which transitions the closed-form ridge is solved on (readout: ridge only).
+      #   'epoch'       : the fresh epoch's training split (the rollout's own phi).
+      #   'buffer'      : the persistent cross-epoch history, recomputing phi under the current
+      #                   basis. Valid because the read-out r(s) ~= phi(s).w is policy-independent;
+      #                   widens the state coverage the Gram is built from, which is what
+      #                   conditions the solve when phi is rank-deficient (phi_source: random).
+      #                   Held-out val episodes are never added, so SR/Gap/RidgeR2* stays a
+      #                   genuine generalization test.
+      #   'cost_replay' : the fresh epoch plus an equal number of past cost-inducing (cost > 0)
+      #                   transitions resampled from a dedicated replay buffer -- e.g. at
+      #                   steps_per_epoch=5000, tries for 5000 fresh + 5000 replayed rows. Costs
+      #                   are typically sparse, so an 'epoch'-only fit rarely sees enough
+      #                   cost-positive rows; this concentrates the replay on exactly those rows
+      #                   instead of diluting it with 'buffer''s whole (mostly cost-zero) history.
+      #                   Both w_r and w_c are solved on the same combined design matrix.
+      ridge_data: epoch
+      # how many buffered transitions to draw for the solve (ridge_data: buffer only);
+      # null = use the entire buffer. Cost is O(N * sr_dim^2), linear in N.
+      ridge_buffer_samples: ~
+      # capacity of the persistent cost-inducing replay buffer (ridge_data: cost_replay only)
+      cost_replay_buffer_size: 1000000
+      # learning rate for the sgd read-out weights (readout: sgd only); null = reuse sr_cfgs.lr
+      w_lr: ~
+      # capacity of the persistent sgd read-out replay buffer (readout: sgd only)
+      readout_buffer_size: 1000000
+      # gradient steps taken on w_r / w_c per epoch (readout: sgd only)
+      readout_grad_steps: 50
+      # L2 weight decay on the sgd read-out weights (readout: sgd only) -- the SGD analogue of the
+      # ridge kappa; raise it if w_r / w_c overfit (e.g. rank-deficient phi under phi_source: random)
+      w_weight_decay: 0.0
+      # L2 weight decay on the sgd COST read-out weight only (readout: sgd only); null =
+      # reuse w_weight_decay. The SGD analogue of ridge_kappa_cost above.
+      w_weight_decay_cost: ~
+      # minibatch size for the sgd read-out regression (readout: sgd only), sampled from the
+      # persistent buffer independently of the policy update; null = reuse algo_cfgs.batch_size
+      readout_batch_size: ~
+      # where phi comes from (td_ridge mode only). In the off-policy Q flavors "s" below is
+      # really the raw (obs, act) pair, since the ridge regresses the immediate reward onto phi.
+      #   'trunk'    : phi = normalize(Linear(trunk(s))), a read-out of the same trunk psi is
+      #                read from. Nothing optimizes phi, but it drifts anyway because the trunk
+      #                beneath it is trained by the psi TD loss and the value losses -- so psi is
+      #                fit against a feature stream that moves during the fit, and the ridge
+      #                basis shifts out from under the w_r / w_c solved on it.
+      #   'random'   : phi = normalize(Linear(s)), frozen at init -- a fixed random projection of
+      #                the raw input. Stationary, but an affine map cannot raise rank: phi's
+      #                effective rank is capped at obs_dim + 1 however large sr_dim is (measured
+      #                18 of 64 on a 17-dim obs), and the ridge can only fit near-affine
+      #                rewards/costs. A lower-bound baseline; 'separate' is the full-rank
+      #                nonlinear version of the same stationarity idea.
+      #   'separate' : phi = normalize(MLP(s)) on the raw input, frozen at init -- fixed deep
+      #                random features. Stationary like 'random' but nonlinear, and its depth is
+      #                set independently of the trunk's (which 'trunk' mode cannot do, since phi
+      #                and psi are both single read-outs of one shared body there).
+      #   'rff'      : phi = normalize(cos(Linear(s))), Random Fourier Features approximating a
+      #                Gaussian/RBF kernel of bandwidth phi_rff_bandwidth. Frozen like 'random' /
+      #                'separate', but unlike 'separate' its capacity is one interpretable knob
+      #                (the bandwidth) instead of an architecture search, and unlike 'random' it
+      #                escapes the affine rank cap via the cos nonlinearity.
+      #   'ensemble' : concatenates several independent frozen sub-bases (phi_ensemble_sources,
+      #                each one of 'random' / 'separate' / 'rff') into one sr_dim-wide phi,
+      #                splitting sr_dim evenly across members. Trades one arbitrary random draw
+      #                for an average over several; also useful as a diagnostic (via
+      #                sr_diagnostics) for which family actually fits the reward/cost signal.
+      #   'contrastive': phi = normalize(MLP(s)), same architecture as 'separate' but NOT frozen
+      #                -- trained by a time-contrastive InfoNCE loss (see the block below) that
+      #                pulls together states visited close in time within an episode and pushes
+      #                apart temporally-distant / other-episode ones. Pretrained at epoch 0,
+      #                before the first psi TD update / ridge solve ever see it, then continually
+      #                fine-tuned every epoch after. On-policy (V flavor) only.
+      #   'laplacian': phi = MLP(s) -- same architecture as 'separate' / 'contrastive', trained
+      #                by the Augmented Lagrangian Laplacian Objective (ALLO; see the block
+      #                below) to be the bottom sr_dim eigenvectors of the transition graph's
+      #                Laplacian. Where 'contrastive' asks only that temporally-adjacent states
+      #                be close, this asks for the property td_ridge actually needs: those
+      #                eigenvectors are, by the variational characterization of the eigenvalue
+      #                problem, the sr_dim-dimensional basis in which an arbitrary state signal
+      #                is best approximated LINEARLY -- and w_r / w_c are exactly two such linear
+      #                approximations. Same cadence as 'contrastive' (pretrained at epoch 0,
+      #                fine-tuned every epoch after) and likewise on-policy (V flavor) only.
+      #                NOTE: alone among the sources its phi is NOT l2-normalized -- the
+      #                orthonormality constraint sets the scale instead, and satisfying it is
+      #                what hands the ridge solve an N * I Gram matrix (watch Misc/GramCond).
+      #   'joint'    : phi = MLP(s) -- trainable and unnormalized like 'laplacian', but with NO
+      #                objective of its own: it is one factor of the bilinear successor-measure
+      #                critic psi(s).phi(g) that psi_objective: 'contrastive' fits, so it is
+      #                trained by the same loss, optimizer and step as psi. Only meaningful
+      #                together with that psi_objective, and validated against it at startup.
+      phi_source: trunk
+      # hidden layer sizes of the standalone phi network (phi_source: 'separate' /
+      # 'contrastive' / 'laplacian' only, and any such entries of phi_ensemble_sources). Sets
+      # its hidden widths verbatim, independent of sr_dim (which only sets its output width) and of
+      # sr_cfgs.hidden_sizes (its depth and width are its own, which is the point of this mode).
+      phi_hidden_sizes: [64, 64]
+      # draw phi_source: 'random' / 'separate' (and any such phi_ensemble_sources entries) with
+      # an orthogonal rather than i.i.d. random first-layer weight matrix (Orthogonal Random
+      # Features) -- reduces the variance of the random projection and improves effective-rank
+      # utilization of sr_dim for the same obs_dim, at ~zero cost since phi is always
+      # re-normalized, so only the projection's directions matter, not its raw scale
+      phi_orthogonal_init: false
+      # RBF kernel bandwidth (sigma) for phi_source: 'rff' (and any such phi_ensemble_sources
+      # entries); larger = smoother/lower-frequency features, smaller = higher-frequency
+      phi_rff_bandwidth: 1.0
+      # sub-basis families for phi_source: 'ensemble', each one of 'random' / 'separate' / 'rff';
+      # null falls back to one of each ['random', 'separate', 'rff']. Ignored unless
+      # phi_source: 'ensemble'
+      phi_ensemble_sources: ~
+      # --- Time-contrastive phi learning (phi_source: 'contrastive' only) ---------------------
+      # temperature for the InfoNCE / NT-Xent similarity scaling; lower = sharper, more
+      # discriminative positive/negative separation
+      phi_contrastive_temperature: 0.1
+      # max |timestep offset| within an episode a state pair may be sampled as a positive; both
+      # directions (past and future) count, i.e. the true window is +/- this many steps
+      phi_contrastive_horizon: 5
+      # gradient steps taken on phi at epoch 0, before the first psi TD update / ridge solve --
+      # gets phi out of its random-init regime before anything downstream is fit against it
+      phi_contrastive_pretrain_steps: 500
+      # gradient steps taken on phi every epoch after epoch 0 -- phi is trained continually,
+      # never frozen once pretrained
+      phi_contrastive_steps_per_epoch: 50
+      # minibatch size for the contrastive loss's in-batch-negative InfoNCE; null = reuse
+      # algo_cfgs.batch_size
+      phi_contrastive_batch_size: ~
+      # learning rate for phi's dedicated optimizer (the trained phi sources 'contrastive' /
+      # 'laplacian' only); null = reuse sr_cfgs.lr
+      phi_lr: ~
+      # --- Laplacian phi learning, ALLO (phi_source: 'laplacian' only) ------------------------
+      # quadratic barrier coefficient b of the augmented Lagrangian. Unlike the fixed-penalty
+      # methods ALLO replaces -- whose equilibrium, and therefore whose recovered features, are an
+      # artifact of this coefficient -- the solution here does NOT depend on it: the dual
+      # variables below are what make the constraint exact. It only conditions the descent.
+      phi_laplacian_barrier: 2.0
+      # dual-ascent step size for the Lagrange multipliers enforcing E_rho[phi phi^T] = I. Too
+      # large and the multipliers oscillate; too small and phi spends the run with an unsatisfied
+      # constraint. Watch Misc/LaplacianOffDiagErr (are the coordinates decorrelating?) against
+      # Misc/LaplacianDualNorm (are the multipliers still growing, or have they settled?).
+      phi_laplacian_dual_lr: 0.01
+      # minibatch size for the objective, deliberately larger than algo_cfgs.batch_size: the
+      # constraint is on an sr_dim x sr_dim second moment, so a batch that does not comfortably
+      # exceed sr_dim leaves the residual dominated by estimation noise rather than by real
+      # correlation. Cheap -- it is a small MLP over states already in memory. Each step draws two
+      # independent batches this size (needed for an unbiased barrier gradient) plus one batch of
+      # graph edges. null = reuse algo_cfgs.batch_size.
+      phi_laplacian_batch_size: 1024
+      # learning rate for phi under this objective, overriding phi_lr / sr_cfgs.lr. Deliberately
+      # ~10x the trunk's: ALLO has an orthonormality constraint to satisfy from scratch, and at
+      # sr_cfgs.lr (3e-4) it simply does not get there within any sane pretrain budget.
+      phi_laplacian_lr: 0.003
+      # gradient steps taken on phi at epoch 0, before the first psi TD update / ridge solve --
+      # gets phi out of its random-init regime before anything downstream is fit against it.
+      # Measured on Simple-v0 at sr_dim 16 (LaplacianDiagErr / OffDiagErr / GramCond after the
+      # burst): 500 steps at 3e-4 leaves 0.28 / 0.30 / ~4000 -- i.e. no better conditioned than
+      # phi_source: trunk -- while 2000 at 3e-3 reaches 0.07 / 0.08 / ~3, which is the N * I Gram
+      # this basis exists to produce. 5000 steps buys nothing more. If GramCond is not falling to
+      # single digits within a few epochs, this and phi_laplacian_lr are the two knobs to raise.
+      phi_laplacian_pretrain_steps: 2000
+      # gradient steps taken on phi every epoch after epoch 0 -- phi keeps adapting as the
+      # on-policy state distribution shifts, rather than being frozen once pretrained
+      phi_laplacian_steps_per_epoch: 50
+      # --- How psi is fitted (td_ridge mode only) ---------------------------------------------
+      #   'td'          : bootstrap psi against the discounted lambda-target of the phi stream
+      #                   (lam_sr / gamma_sr above), the same estimator machinery the scalar
+      #                   reward/cost value targets use. The original and the default.
+      #   'contrastive' : C-learning / contrastive RL. Drop the bootstrap: fit phi and psi
+      #                   *jointly* as the two factors of one bilinear critic psi(s).phi(g),
+      #                   trained to be the density ratio of the discounted successor measure
+      #                   against the visitation distribution -- positives drawn from each
+      #                   anchor's own geometrically-discounted future, negatives from the batch.
+      #                   Removes the moving-target problem outright: psi's TD target refers to
+      #                   phi, so under any phi that is still training psi chases a feature map
+      #                   that moves under it, and here there is no target at all. The ridge
+      #                   read-out is unchanged and in fact becomes exactly right, since
+      #                   sum_t gamma^t r(s_t) = psi(s) . E_rho[phi(g) r(g)] -- note this needs
+      #                   the ratio in its LINEAR scale, which is why the loss is a least-squares
+      #                   density-ratio fit and not an InfoNCE whose inner product is a logit.
+      #                   Requires phi_source: 'joint'. On-policy (V flavor) only.
+      psi_objective: td
+      # gradient steps on the joint phi/psi critic at epoch 0 (psi_objective: 'contrastive' only).
+      # Larger than the per-epoch budget because epoch 0 builds the representation from scratch
+      # with nothing downstream yet fitted against it.
+      psi_contrastive_pretrain_steps: 2000
+      # gradient steps on the joint phi/psi critic every epoch after epoch 0. Roughly matches what
+      # the 'td' path spends on psi (update_iters * minibatches per epoch), so the two objectives
+      # are compared at comparable budget rather than at comparable wall-clock.
+      psi_contrastive_steps_per_epoch: 300
+      # minibatch size for the joint critic. The negatives ARE the rho sample the E_rho term is
+      # estimated over, and all anchor-negative pairs are used at once (a batch of M anchors
+      # contributes M^2 samples via one matmul), so this is the knob that sets that estimate's
+      # quality. null = reuse algo_cfgs.batch_size.
+      psi_contrastive_batch_size: 1024
+      # --- SR diagnostics (td_ridge mode only; see PolicyGradient._log_sr_diagnostics) ---
+      # number of observations in each phi/psi drift probe set. One probe is drawn once and held
+      # for the whole run (drift with the input distribution held constant), the other is redrawn
+      # from each epoch's rollout (drift on the states the current policy actually visits).
+      probe_size: 512
+      # cap on the rows used per split by the diagnostic pass, which runs SVDs and ridge solves
+      # over the epoch batch; the metrics are all per-row averages, so subsampling only costs
+      # precision, never bias
+      diag_max_samples: 4096
   # lagrangian configurations
   lagrange_cfgs:
     # Tolerance of constraint violation
@@ -220,12 +535,37 @@ SafetyPointCircle1-v0:
     lambda_optimizer: "Adam"
 
 SafetyPointGoal1-v0:
+  # Validated configuration: SACLag reaches episodic return 12.3 at episodic cost 13.5
+  # against a limit of 10, in 1.8 h for 3M steps (seed 0). See configs/offpolicy_stable/.
+  #
+  # The four values below the learning rates are the ones that matter, and three of them
+  # are not what OmniSafe ships:
+  #   * cost_limit 10 rather than 25. The benchmark uses 25; 10 is the tighter target this
+  #     work is for. At 25 the same setup reaches a higher return (the frontier's knee is
+  #     around cost 20-30), so raise it back if the looser limit is acceptable.
+  #   * vector_env_nums 5 with update_cycle 2. SAC takes one gradient step per environment
+  #     step; this takes one per ten. Measured over 1500 epochs that costs no return, and
+  #     cuts a 3M run from 8.0 h to 1.8 h. update_cycle alone saturates near 2.8x because
+  #     rollout is a fixed per-step floor; parallel environments cut that floor as well.
+  #   * lambda_lr is scaled to match. The multiplier is updated inside _update(), so it
+  #     moves once per ten environment steps here instead of once per step: 7.5e-6 x 10.
+  #     Change vector_env_nums or update_cycle and this has to be rescaled with them, or
+  #     lambda's trajectory against environment steps changes too.
+  #   * lagrangian_upper_bound caps the multiplier. On plain Lagrangian lambda usually
+  #     self-regulates below it, so this is insurance rather than the mechanism.
+  # warmup_epochs 0 keeps the constraint live from the first step.
+  train_cfgs:
+    vector_env_nums: 5
   # algorithm configurations
   algo_cfgs:
     # The value of alpha
     alpha: 0.00001
     # normalize cost
     cost_normalize: False
+    # Environment steps collected between updates, per environment
+    update_cycle: 2
+    # Epochs before the multiplier starts moving
+    warmup_epochs: 0
   # model configurations
   model_cfgs:
     # Configuration of Actor network
@@ -239,13 +579,15 @@ SafetyPointGoal1-v0:
   # lagrangian configurations
   lagrange_cfgs:
     # Tolerance of constraint violation
-    cost_limit: 25.0
+    cost_limit: 10.0
     # Initial value of lagrangian multiplier
     lagrangian_multiplier_init: 0.000
-    # Learning rate of lagrangian multiplier
-    lambda_lr: 0.0000005
+    # Learning rate of lagrangian multiplier, scaled for 10 env steps per update
+    lambda_lr: 0.000075
     # Type of lagrangian optimizer
     lambda_optimizer: "Adam"
+    # Upper bound of the lagrangian multiplier
+    lagrangian_upper_bound: 0.5
 
 SafeMetaDrive:
   # training configurations

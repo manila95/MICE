@@ -53,6 +53,31 @@ class SACLag(SAC):
         super()._init_log()
         self._logger.register_key('Metrics/LagrangeMultiplier')
 
+    def _anneal_cost_limit(self) -> None:
+        """Tighten the cost limit over training instead of ramping the multiplier.
+
+        Driving lambda up is a blunt way to buy safety: the multiplier scales the whole
+        cost term at once, and past roughly 0.5 on SafetyPointGoal1-v0 the policy stops
+        moving rather than learning to move safely. The multiplier is also only able to
+        *fall* once cost is under the limit, so a limit the policy cannot yet meet makes
+        lambda grow without bound.
+
+        Annealing the limit inverts that. The run starts with a limit the policy can
+        actually satisfy, so lambda stays small and reward forms; the limit then tightens
+        toward its target, keeping the constraint live but never far out of reach, so
+        lambda tracks it instead of ramping. ``cost_limit_start`` is where it begins and
+        ``cost_limit_anneal_epochs`` how long it takes to reach the configured
+        ``cost_limit``; leaving ``cost_limit_start`` unset keeps the limit fixed.
+        """
+        cfgs = self._cfgs.algo_cfgs
+        start = getattr(cfgs, 'cost_limit_start', 0.0)
+        span = getattr(cfgs, 'cost_limit_anneal_epochs', 0)
+        if start <= 0.0 or span <= 0:
+            return
+        target = self._cfgs.lagrange_cfgs.cost_limit
+        frac = min(1.0, self._epoch / span)
+        self._lagrange.cost_limit = start + frac * (target - start)
+
     def _lambda_signal(self, Jc: float) -> float | None:
         """The cost estimate the multiplier is actually driven by.
 
@@ -96,6 +121,7 @@ class SACLag(SAC):
         :meth:`update_lagrange_multiplier` method.
         """
         super()._update()
+        self._anneal_cost_limit()
         Jc = self._logger.get_stats('Metrics/EpCost')[0]
         if self._epoch > self._cfgs.algo_cfgs.warmup_epochs:
             signal = self._lambda_signal(Jc)

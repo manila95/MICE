@@ -262,6 +262,10 @@ class RidgeSolvedReadoutWeights(nn.Module):
             self.w_c = nn.Parameter(torch.zeros(sr_dim))
         else:
             # Solved by closed-form ridge regression (see ridge_update), never by SGD.
+            # diagnostic cache, see _ridge_solve: the condition numbers cost an SVD each
+            self._cond_tick: int = 0
+            self._cond_cache: tuple[float, float] | None = None
+
             self.register_buffer('w_r', torch.zeros(sr_dim))
             self.register_buffer('w_c', torch.zeros(sr_dim))
 
@@ -312,6 +316,7 @@ class RidgeSolvedReadoutWeights(nn.Module):
         ridge_kappa: float,
         ema_tau: float,
         ridge_kappa_cost: float | None,
+        cond_every: int = 1,
     ) -> dict[str, float]:
         r"""Shared closed-form solve behind :meth:`ridge_update` and :meth:`ridge_update_on_return`.
 
@@ -345,7 +350,17 @@ class RidgeSolvedReadoutWeights(nn.Module):
         Returns:
             A dict of diagnostic statistics for logging.
         """
-        x = design.double()
+        # The solve is a 64x64 system on a 256-row design: on a GPU that is 267x slower
+        # than on the CPU (14.7 ms against 0.055 ms measured on an RTX PRO 6000), because
+        # it is all kernel-launch and cuSOLVER setup rather than arithmetic, and each
+        # .item() below forces a device sync on top. Off-policy calls this once per
+        # environment step, so that per-call overhead is multiplied by steps_per_epoch.
+        # The tensors are tiny, so moving the whole solve to the CPU costs one small
+        # transfer and removes all of it; the weights go back to the original device.
+        dev = design.device
+        x = design.double().cpu()
+        target_r = target_r.cpu()
+        target_c = target_c.cpu()
         gram = x.T @ x
         # Both kappas scale the same Gram diagonal, so they stay comparable across bases whatever
         # the design matrix's magnitude is -- the ratio kappa_c / kappa_r is the quantity tuned.
@@ -358,19 +373,30 @@ class RidgeSolvedReadoutWeights(nn.Module):
 
         w_r_new = torch.linalg.solve(mat_r, x.T @ target_r.double())
         w_c_new = torch.linalg.solve(mat_c, x.T @ target_c.double())
-        self.w_r.mul_(1.0 - ema_tau).add_(ema_tau * w_r_new.float())
-        self.w_c.mul_(1.0 - ema_tau).add_(ema_tau * w_c_new.float())
+        self.w_r.mul_(1.0 - ema_tau).add_(ema_tau * w_r_new.float().to(dev))
+        self.w_c.mul_(1.0 - ema_tau).add_(ema_tau * w_c_new.float().to(dev))
 
         resid_r = (x @ w_r_new - target_r.double()).pow(2).mean().sqrt().item()
         resid_c = (x @ w_c_new - target_c.double()).pow(2).mean().sqrt().item()
-        return {
+        stats = {
             'Misc/RidgeResidualReward': resid_r,
             'Misc/RidgeResidualCost': resid_c,
             'Misc/WrNorm': self.w_r.norm().item(),
             'Misc/WcNorm': self.w_c.norm().item(),
-            'Misc/GramCond': torch.linalg.cond(mat_r).item(),
-            'Misc/GramCondCost': torch.linalg.cond(mat_c).item(),
         }
+        # The condition numbers are an SVD apiece and cost more than everything else here
+        # put together (191 ms for the pair on GPU, against 14.7 ms for the solves they
+        # describe). They are a diagnostic, not part of the fit, and the Gram matrix moves
+        # slowly, so recompute them every `cond_every` solves and carry the last value
+        # forward in between. `cond_every=1` restores the original behaviour exactly.
+        self._cond_tick += 1
+        if cond_every <= 1 or self._cond_tick % cond_every == 1 or self._cond_cache is None:
+            self._cond_cache = (
+                torch.linalg.cond(mat_r).item(),
+                torch.linalg.cond(mat_c).item(),
+            )
+        stats['Misc/GramCond'], stats['Misc/GramCondCost'] = self._cond_cache
+        return stats
 
     @torch.no_grad()
     def ridge_update(
@@ -381,6 +407,7 @@ class RidgeSolvedReadoutWeights(nn.Module):
         ridge_kappa: float,
         ema_tau: float,
         ridge_kappa_cost: float | None = None,
+        cond_every: int = 1,
     ) -> dict[str, float]:
         r"""Refresh ``w_r`` and ``w_c`` by closed-form ridge regression of the one-step
         reward/cost onto ``phi`` -- the original successor-feature factorization
@@ -397,7 +424,9 @@ class RidgeSolvedReadoutWeights(nn.Module):
         Returns:
             A dict of diagnostic statistics for logging.
         """
-        return self._ridge_solve(phi, reward, cost, ridge_kappa, ema_tau, ridge_kappa_cost)
+        return self._ridge_solve(
+            phi, reward, cost, ridge_kappa, ema_tau, ridge_kappa_cost, cond_every
+        )
 
     @torch.no_grad()
     def ridge_update_on_return(
@@ -408,6 +437,7 @@ class RidgeSolvedReadoutWeights(nn.Module):
         ridge_kappa: float,
         ema_tau: float,
         ridge_kappa_cost: float | None = None,
+        cond_every: int = 1,
     ) -> dict[str, float]:
         r"""Refresh ``w_r`` and ``w_c`` by closed-form ridge regression of the true multi-step
         discounted return onto ``psi`` (``sr_cfgs.w_source='psi'``).
@@ -446,7 +476,9 @@ class RidgeSolvedReadoutWeights(nn.Module):
         Returns:
             A dict of diagnostic statistics for logging, with the same keys as :meth:`ridge_update`.
         """
-        return self._ridge_solve(psi, true_r, true_c, ridge_kappa, ema_tau, ridge_kappa_cost)
+        return self._ridge_solve(
+            psi, true_r, true_c, ridge_kappa, ema_tau, ridge_kappa_cost, cond_every
+        )
 
 
 class FrozenPhiFeatures(nn.Module):

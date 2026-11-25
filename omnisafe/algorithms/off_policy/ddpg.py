@@ -472,7 +472,17 @@ class DDPG(BaseAlgo):
                 data['next_obs'],
             )
 
-            if self._sr_td_ridge and self._sr_readout == 'ridge':
+            # update_cycle=1 runs this whole block once per environment *step*, so every
+            # successor-representation hook below is paid steps_per_epoch times an epoch.
+            # The on-policy path it was ported from runs them once per epoch. sr_update_every
+            # restores that cadence: 1 keeps the per-step behaviour, steps_per_epoch matches
+            # on-policy. The ridge read-out is a closed-form fit on a fresh batch, so solving
+            # it less often costs accuracy only to the extent the trunk moved in between.
+            sr_every = int(self._cfgs.model_cfgs.sr_cfgs.get('sr_update_every', 1))
+            self._sr_tick = getattr(self, '_sr_tick', 0) + 1
+            sr_due = sr_every <= 1 or self._sr_tick % sr_every == 1
+
+            if self._sr_td_ridge and self._sr_readout == 'ridge' and sr_due:
                 # Refresh w_r / w_c before the critic losses consume them, mirroring how the
                 # on-policy path solves the ridge on the fresh batch before its minibatch loop.
                 self._ridge_update_successor_weights(obs, act, reward, cost)
@@ -480,7 +490,7 @@ class DDPG(BaseAlgo):
             self._update_reward_critic(obs, act, reward, done, next_obs)
             if self._cfgs.algo_cfgs.use_cost:
                 self._update_cost_critic(obs, act, cost, done, next_obs)
-            if self._sr_td_ridge:
+            if self._sr_td_ridge and sr_due:
                 self._update_successor_features(obs, act, done, next_obs)
                 if self._sr_readout == 'sgd':
                     # Take one gradient step on the SGD read-out weights. Order relative to the
@@ -526,6 +536,7 @@ class DDPG(BaseAlgo):
             ridge_kappa=sr_cfgs.get('ridge_kappa', 1e-3),
             ema_tau=sr_cfgs.get('ema_tau', 1.0),
             ridge_kappa_cost=sr_cfgs.get('ridge_kappa_cost', None),
+            cond_every=int(sr_cfgs.get('cond_every', 1)),
         )
         self._actor_critic.sync_sr_readout_weights()
         self._logger.store(stats)
