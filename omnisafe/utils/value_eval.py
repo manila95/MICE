@@ -368,7 +368,8 @@ def estimate_true_q_value_same_state_mc(agent, env, cfgs, **kwargs):
         return act, q_r, q_c
 
     return estimate_true_value_same_state_mc(
-        agent=agent, env=env, cfgs=cfgs, predict=_predict, **kwargs
+        agent=agent, env=env, cfgs=cfgs, predict=_predict,
+        average_pred_over_repeats=True, **kwargs
     )
 
 
@@ -548,6 +549,7 @@ def estimate_true_value_same_state_mc(
     return_raw=False,
     bootstrap_threshold=None,
     tail_mode=None,
+    average_pred_over_repeats=False,
     predict=None,
 ):
     r"""Compare the critic's V(s0) against a genuine same-layout Monte-Carlo estimate.
@@ -870,16 +872,33 @@ def estimate_true_value_same_state_mc(
     # but the first would throw away most of the available gradient-estimation samples.
     obs_list: list[list[torch.Tensor]] = []
     act_list: list[list[torch.Tensor]] = []
+    # Per-repeat predictions, so a Q critic's per-action pairing survives the averaging above.
+    pred_repeats_r_list: list[list[float]] = []
+    pred_repeats_c_list: list[list[float]] = []
     idx = 0
     for _seed in probe_seeds:
         idxs = range(idx, idx + mc_repeats)
         idx += mc_repeats
-        pred_r_list.append(pred_r_of[idxs[0]])
-        pred_c_list.append(pred_c_of[idxs[0]])
+        if average_pred_over_repeats:
+            # Q(s0, a0) is NOT constant across a probe's repeats: a0 is resampled from the
+            # stochastic policy each time, so taking idxs[0] would compare the value of ONE
+            # sampled action against a return averaged over ten trajectories that each began
+            # with a DIFFERENT action -- a Q on the left, a V on the right. Averaging the
+            # predictions makes both sides estimate the same quantity, E_a[Q(s0,a)] = V(s0),
+            # and the per-repeat predictions are still kept in the raw bundle so the
+            # per-action pairing can be recovered offline.
+            pred_r_list.append(float(np.mean([pred_r_of[i] for i in idxs])))
+            pred_c_list.append(float(np.mean([pred_c_of[i] for i in idxs])))
+        else:
+            # V(s0) does not depend on the action, so every repeat computed the same number.
+            pred_r_list.append(pred_r_of[idxs[0]])
+            pred_c_list.append(pred_c_of[idxs[0]])
         obs_list.append([obs_of[i] for i in idxs])
         act_list.append([act_of[i] for i in idxs])
         returns_r = [ret_r_of[i] for i in idxs]
         returns_c = [ret_c_of[i] for i in idxs]
+        pred_repeats_r_list.append([pred_r_of[i] for i in idxs])
+        pred_repeats_c_list.append([pred_c_of[i] for i in idxs])
         mc_mean_r_list.append(float(np.mean(returns_r)))
         mc_mean_c_list.append(float(np.mean(returns_c)))
         mc_var_r_list.append(float(np.var(returns_r)))
@@ -951,6 +970,7 @@ def estimate_true_value_same_state_mc(
         'obs': obs_list, 'action': act_list,
         'r': {
             'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list,
+            'pred_repeats': pred_repeats_r_list,
             'target': target_r_list,
             # Per-repeat raw values (mc_repeats-length list per probe) -- see the comment where
             # these are collected, above.
@@ -958,6 +978,7 @@ def estimate_true_value_same_state_mc(
         },
         'c': {
             'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list,
+            'pred_repeats': pred_repeats_c_list,
             'target': target_c_list,
             'returns': returns_c_list, 'target_repeats': target_repeats_c_list,
         },
@@ -1023,6 +1044,8 @@ def estimate_value_from_snapshots(
     return_raw=False,
     bootstrap_threshold=None,
     tail_mode=None,
+    predict=None,
+    average_pred_over_repeats=False,
 ):
     r"""Like :func:`estimate_true_value_same_state_mc`, but for arbitrary on-policy *intermediate*
     states captured via :mod:`omnisafe.utils.state_snapshot`, instead of states reachable by
@@ -1137,7 +1160,13 @@ def estimate_value_from_snapshots(
         # horizon budget ahead, not one bound by the physically-remaining steps of the episode it
         # was captured from -- see this function's docstring.
         obs = restore_and_get_obs(env, wave_snaps, device, reset_elapsed_steps=True)
-        act, value_r, value_c, log_prob = agent.step(obs)
+        # ``predict`` scores a Q critic by this same protocol; see
+        # estimate_true_value_same_state_mc's matching branch.
+        if predict is None:
+            act, value_r, value_c, log_prob = agent.step(obs)
+        else:
+            act, value_r, value_c = predict(obs)
+            log_prob = None
         pred_r_batch = value_r.reshape(-1).detach().cpu().numpy()
         pred_c_batch = value_c.reshape(-1).detach().cpu().numpy()
         obs_s0_cpu = obs.detach().cpu().clone()
@@ -1202,7 +1231,10 @@ def estimate_value_from_snapshots(
         else:
             is_terminated = np.zeros(n_envs, dtype=bool)
 
-        _, boot_value_r, boot_value_c, _ = agent.step(obs)
+        if predict is None:
+            _, boot_value_r, boot_value_c, _ = agent.step(obs)
+        else:
+            _, boot_value_r, boot_value_c = predict(obs)
         boot_r = np.where(is_terminated, 0.0, boot_value_r.reshape(-1).detach().cpu().numpy())
         boot_c = np.where(is_terminated, 0.0, boot_value_c.reshape(-1).detach().cpu().numpy())
         v_r_seq[horizon] = boot_r
@@ -1250,16 +1282,33 @@ def estimate_value_from_snapshots(
     target_repeats_c_list: list[list[float]] = []
     obs_list: list[list[torch.Tensor]] = []
     act_list: list[list[torch.Tensor]] = []
+    # Per-repeat predictions, so a Q critic's per-action pairing survives the averaging above.
+    pred_repeats_r_list: list[list[float]] = []
+    pred_repeats_c_list: list[list[float]] = []
     idx = 0
     for _snap in snapshots:
         idxs = range(idx, idx + mc_repeats)
         idx += mc_repeats
-        pred_r_list.append(pred_r_of[idxs[0]])
-        pred_c_list.append(pred_c_of[idxs[0]])
+        if average_pred_over_repeats:
+            # Q(s0, a0) is NOT constant across a probe's repeats: a0 is resampled from the
+            # stochastic policy each time, so taking idxs[0] would compare the value of ONE
+            # sampled action against a return averaged over ten trajectories that each began
+            # with a DIFFERENT action -- a Q on the left, a V on the right. Averaging the
+            # predictions makes both sides estimate the same quantity, E_a[Q(s0,a)] = V(s0),
+            # and the per-repeat predictions are still kept in the raw bundle so the
+            # per-action pairing can be recovered offline.
+            pred_r_list.append(float(np.mean([pred_r_of[i] for i in idxs])))
+            pred_c_list.append(float(np.mean([pred_c_of[i] for i in idxs])))
+        else:
+            # V(s0) does not depend on the action, so every repeat computed the same number.
+            pred_r_list.append(pred_r_of[idxs[0]])
+            pred_c_list.append(pred_c_of[idxs[0]])
         obs_list.append([obs_of[i] for i in idxs])
         act_list.append([act_of[i] for i in idxs])
         returns_r = [ret_r_of[i] for i in idxs]
         returns_c = [ret_c_of[i] for i in idxs]
+        pred_repeats_r_list.append([pred_r_of[i] for i in idxs])
+        pred_repeats_c_list.append([pred_c_of[i] for i in idxs])
         mc_mean_r_list.append(float(np.mean(returns_r)))
         mc_mean_c_list.append(float(np.mean(returns_c)))
         mc_var_r_list.append(float(np.var(returns_r)))
@@ -1317,11 +1366,13 @@ def estimate_value_from_snapshots(
             'pred': pred_r_list, 'mc_mean': mc_mean_r_list, 'mc_var': mc_var_r_list,
             'target': target_r_list,
             'returns': returns_r_list, 'target_repeats': target_repeats_r_list,
+            'pred_repeats': pred_repeats_r_list,
         },
         'c': {
             'pred': pred_c_list, 'mc_mean': mc_mean_c_list, 'mc_var': mc_var_c_list,
             'target': target_c_list,
             'returns': returns_c_list, 'target_repeats': target_repeats_c_list,
+            'pred_repeats': pred_repeats_c_list,
         },
     }
     return stats, raw
