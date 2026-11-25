@@ -347,9 +347,17 @@ SafetyPointCircle1-v0:
 
 SafetyPointGoal1-v0:
   train_cfgs:
+    # Same speed configuration as SACLag: one gradient step per ten environment steps,
+    # with five parallel environments so the per-step rollout overhead is amortised
+    # rather than paid once per step. Measured on SACLag this costs no return and cuts a
+    # 3M run from 8.0 h to 1.8 h.
+    vector_env_nums: 5
     eval_episodes: 0
   # algorithm configurations
   algo_cfgs:
+    update_cycle: 2
+    # The multiplier is live from the first step, as in SACLag.
+    warmup_epochs: 0
     # Value-function evaluation, scheduled on ENVIRONMENT STEPS so the cadence does not
     # shift when steps_per_epoch or vector_env_nums change: every early_eval_step_freq
     # steps up to early_eval_steps, then every value_eval_step_freq.
@@ -375,12 +383,19 @@ SafetyPointGoal1-v0:
       lr: 0.001
   # lagrangian configurations
   lagrange_cfgs:
+    # Tolerance of constraint violation, matching SACLag here.
+    cost_limit: 10.0
+    # The PID terms fire once per _update(), so at ten environment steps per update they
+    # act a tenth as often as at update_cycle 1. The gains below are scaled by that same
+    # factor, so the multiplier follows the same trajectory against ENVIRONMENT STEPS.
+    # Change vector_env_nums or update_cycle and these must be rescaled with them, or the
+    # dual silently moves at a different rate for the same run.
     # The Kp of PID controller
-    pid_kp: 0.0000005
+    pid_kp: 0.000005
     # The Ki of PID controller
-    pid_ki: 0.00000001
+    pid_ki: 0.0000001
     # The Kd of PID controller
-    pid_kd: 0.00000001
+    pid_kd: 0.0000001
 SafeMetaDrive:
   # training configurations
   train_cfgs:
