@@ -78,6 +78,20 @@ defaults:
     use_cost: True
     # warm up epoch
     warmup_epochs: 100
+    # Value-function evaluation is scheduled on ENVIRONMENT STEPS, not epochs, so the
+    # cadence does not shift when steps_per_epoch or vector_env_nums change.
+    # Dense early, sparse later: every early_eval_step_freq steps up to
+    # early_eval_steps, then every value_eval_step_freq steps.
+    # Evaluate the Q-critics against Monte-Carlo returns of the current policy.
+    test_estimate: True
+    # Complete episodes rolled out per evaluation. This runs on the training
+    # environment and resets it afterwards, so it is kept small.
+    value_eval_episodes: 5
+    early_eval_steps: 100000
+    early_eval_step_freq: 10000
+    value_eval_step_freq: 100000
+    # Set False to fall back to the old epoch-based value_eval_freq/early_eval_freq.
+    use_step_eval_schedule: True
     # EMA smoothing applied to Jc before the multiplier update; 0 disables
     lambda_jc_ema: 0.0
     # Epochs over which the cost limit reaches its configured value

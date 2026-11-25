@@ -47,6 +47,7 @@ def estimate_true_q_value(
     eval_episodes=100,
     epoch=None,
     deterministic=False,
+    extras: dict | None = None,
 ):
     """Off-policy counterpart of :func:`estimate_true_value` for Q-critics.
 
@@ -90,6 +91,7 @@ def estimate_true_q_value(
         eval_episodes=eval_episodes,
         epoch=epoch,
         value_symbol='Q',
+        extras=extras,
     )
 
 
@@ -102,6 +104,7 @@ def _rollout_and_report(  # pylint: disable=too-many-locals,too-many-statements
     eval_episodes,
     epoch,
     value_symbol,
+    extras: dict | None = None,
 ):
     """Roll ``predict``'s policy out for ``eval_episodes`` episodes and log the calibration stats.
 
@@ -213,6 +216,38 @@ def _rollout_and_report(  # pylint: disable=too-many-locals,too-many-statements
     s0_r_error,  s0_true_r_m,  s0_est_r_m,  s0_corr_r  = _stats(s0_true_r_t,  s0_est_r_t)
     all_c_error, all_true_c_m, all_est_c_m, all_corr_c = _stats(all_true_c_t, all_est_c_t)
     all_r_error, all_true_r_m, all_est_r_m, all_corr_r = _stats(all_true_r_t, all_est_r_t)
+
+    if extras is not None:
+        # Pearson (above) measures linear agreement and is pulled around by a few extreme
+        # probes; Spearman measures only whether the critic ORDERS states correctly, which is
+        # what an advantage actually depends on. A critic can rank perfectly while being
+        # badly scaled, or be well scaled and rank poorly, so both are worth seeing.
+        from omnisafe.utils.ceiling_core import _spearman  # noqa: PLC0415
+
+        def _np(t):
+            return t.detach().cpu().numpy()
+
+        pairs = {
+            'Eval_s0/Spearman_c':  (s0_true_c_t,  s0_est_c_t),
+            'Eval_s0/Spearman_r':  (s0_true_r_t,  s0_est_r_t),
+            'Eval_all/Spearman_c': (all_true_c_t, all_est_c_t),
+            'Eval_all/Spearman_r': (all_true_r_t, all_est_r_t),
+        }
+        extras['stats'] = {k: float(_spearman(_np(a), _np(b))) for k, (a, b) in pairs.items()}
+        # The per-probe arrays behind every scalar above, so a calibration or reliability
+        # diagram can be rebuilt offline instead of only the aggregates surviving.
+        extras['raw'] = {
+            's0': {
+                'true_c': _np(s0_true_c_t), 'est_c': _np(s0_est_c_t),
+                'true_r': _np(s0_true_r_t), 'est_r': _np(s0_est_r_t),
+            },
+            'all': {
+                'true_c': _np(all_true_c_t), 'est_c': _np(all_est_c_t),
+                'true_r': _np(all_true_r_t), 'est_r': _np(all_est_r_t),
+            },
+            'num_probes_s0': int(s0_true_c_t.numel()),
+            'num_probes_all': int(all_true_c_t.numel()),
+        }
 
     # Opt-in local dump of the raw per-state (true, estimate) pairs behind the scatter plots
     # above, keyed by epoch. Independent of use_wandb -- offline analysis (e.g. reliability /

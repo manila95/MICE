@@ -48,6 +48,10 @@ class OffPolicyAdapter(OnlineAdapter):
 
     _current_obs: torch.Tensor
     _ep_ret: torch.Tensor
+    _total_cost: float
+    _total_violations: int
+    _total_episodes: int
+    _violation_limit: float
     _ep_cost: torch.Tensor
     _ep_len: torch.Tensor
 
@@ -62,6 +66,15 @@ class OffPolicyAdapter(OnlineAdapter):
         super().__init__(env_id, num_envs, seed, cfgs)
         self._current_obs, _ = self.reset()
         self._max_ep_len: int = 1000
+        # Cumulative over the whole run, so they are set up before the first _reset_log and
+        # never cleared by it. An episode counts as a violation when its cost exceeds the
+        # configured limit; with no lagrange_cfgs the limit is 0, so any cost at all counts.
+        self._total_cost: float = 0.0
+        self._total_violations: int = 0
+        self._total_episodes: int = 0
+        self._violation_limit: float = float(
+            getattr(getattr(cfgs, 'lagrange_cfgs', None), 'cost_limit', 0.0) or 0.0,
+        )
         self._reset_log()
 
     def eval_policy(  # pylint: disable=too-many-locals
@@ -135,7 +148,9 @@ class OffPolicyAdapter(OnlineAdapter):
             deterministic (bool): Whether to evaluate the deterministic policy. Defaults to
                 False, matching how training transitions are generated.
         """
-        estimate_true_q_value(
+        extras: dict = {}
+        stats = estimate_true_q_value(
+            extras=extras,
             agent=agent,
             env=self._env,
             cfgs=self._cfgs,
@@ -147,6 +162,7 @@ class OffPolicyAdapter(OnlineAdapter):
         )
         self._current_obs, _ = self.reset()
         self._reset_log()
+        return stats, extras
 
     def rollout(  # pylint: disable=too-many-locals
         self,
@@ -232,6 +248,17 @@ class OffPolicyAdapter(OnlineAdapter):
         """
         if hasattr(self._env, 'spec_log'):
             self._env.spec_log(logger)
+        # Running totals over the whole run, not per-episode: the cumulative cost paid so far
+        # and how many episodes finished over the limit. Both are what a safety result is
+        # usually quoted on, and neither can be recovered from a per-epoch average afterwards,
+        # because the averaging has already thrown away the episode count.
+        # These are read once per epoch by the algorithm, not stored here: the logger averages
+        # whatever it is given within an epoch, which would turn a count into a fraction, and
+        # an epoch in which no episode happens to finish would record nothing at all.
+        self._total_cost += float(self._ep_cost[idx])
+        self._total_episodes += 1
+        if float(self._ep_cost[idx]) > self._violation_limit:
+            self._total_violations += 1
         logger.store(
             {
                 'Metrics/EpRet': self._ep_ret[idx],
@@ -240,6 +267,23 @@ class OffPolicyAdapter(OnlineAdapter):
             },
         )
 
+    @property
+    def safety_totals(self) -> dict[str, float]:
+        """Running totals over the whole run, for the algorithm to log once per epoch.
+
+        ``TotalCost`` is every unit of cost paid since training began, ``TotalViolations`` the
+        number of finished episodes whose cost exceeded the limit, and ``ViolationRate`` the
+        share of finished episodes that did. None of the three can be recovered afterwards
+        from a per-epoch average, which has already discarded the episode count.
+        """
+        return {
+            'Metrics/TotalCost': self._total_cost,
+            'Metrics/TotalViolations': float(self._total_violations),
+            'Metrics/ViolationRate': (
+                self._total_violations / self._total_episodes if self._total_episodes else 0.0
+            ),
+        }
+
     def _reset_log(self, idx: int | None = None) -> None:
         """Reset the episode return, episode cost and episode length.
 
@@ -247,6 +291,9 @@ class OffPolicyAdapter(OnlineAdapter):
             idx (int or None, optional): The index of the environment. Defaults to None
                 (single environment).
         """
+        # The running totals below are deliberately NOT reset here: _reset_log runs at the end
+        # of every episode and after each value-function evaluation, and a total that restarts
+        # there would count only the last episode.
         if idx is None:
             self._ep_ret = torch.zeros(self._env.num_envs)
             self._ep_cost = torch.zeros(self._env.num_envs)

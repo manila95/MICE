@@ -30,6 +30,7 @@ from omnisafe.algorithms import registry
 from omnisafe.algorithms.base_algo import BaseAlgo
 from omnisafe.common.buffer import VectorOffPolicyBuffer
 from omnisafe.common.logger import Logger
+from omnisafe.utils.eval_data_dump import log_eval_data_to_wandb, save_eval_data
 from omnisafe.models.actor_critic.constraint_actor_q_critic import ConstraintActorQCritic
 
 
@@ -221,6 +222,17 @@ class DDPG(BaseAlgo):
             'Metrics/EpLen',
             window_length=self._cfgs.logger_cfgs.window_lens,
         )
+        # Running totals over the whole run. No window_length: these are monotone, so a
+        # moving average of them would lag the true total rather than smooth anything.
+        self._logger.register_key('Metrics/TotalCost')
+        self._logger.register_key('Metrics/TotalViolations')
+        self._logger.register_key('Metrics/ViolationRate')
+
+        if getattr(self._cfgs.algo_cfgs, 'test_estimate', False):
+            # Registered here, not when the first evaluation produces them: the progress.csv
+            # header is written at the first dump_tabular, so a column added later is lost.
+            for key in self._value_eval_keys() + self._value_eval_extra_keys():
+                self._logger.register_key(key)
 
         if self._cfgs.train_cfgs.eval_episodes > 0:
             self._logger.register_key(
@@ -363,6 +375,7 @@ class DDPG(BaseAlgo):
                     'Time/Epoch': (time.time() - epoch_time),
                     'Train/Epoch': epoch,
                     'Train/LR': self._actor_critic.actor_scheduler.get_last_lr()[0],
+                    **self._env.safety_totals,
                 },
             )
 
@@ -379,6 +392,76 @@ class DDPG(BaseAlgo):
         self._env.close()
 
         return ep_ret, ep_cost, ep_len
+
+    @staticmethod
+    def _value_eval_keys() -> tuple[str, ...]:
+        """Names for the flat tuple :func:`estimate_true_q_value` returns, in its order.
+
+        It reports only to wandb, so without this the evaluation runs, pays for its rollouts
+        and discards every number it computed.
+        """
+        return (
+            'Eval_s0/EstimationError_c', 'Eval_s0/true_value_c', 'Eval_s0/estimate_value_c',
+            'Eval_s0/Correlation_c',
+            'Eval_s0/EstimationError_r', 'Eval_s0/true_value_r', 'Eval_s0/estimate_value_r',
+            'Eval_s0/Correlation_r',
+            'Eval_all/EstimationError_c', 'Eval_all/true_value_c', 'Eval_all/estimate_value_c',
+            'Eval_all/Correlation_c',
+            'Eval_all/EstimationError_r', 'Eval_all/true_value_r', 'Eval_all/estimate_value_r',
+            'Eval_all/Correlation_r',
+        )
+
+    @staticmethod
+    def _value_eval_extra_keys() -> tuple[str, ...]:
+        """Rank correlations, computed beside the Pearson ones in :mod:`value_eval`."""
+        return (
+            'Eval_s0/Spearman_c', 'Eval_s0/Spearman_r',
+            'Eval_all/Spearman_c', 'Eval_all/Spearman_r',
+        )
+
+    def _is_value_eval_epoch(self, epoch: int) -> bool:
+        """Whether an evaluation falls inside the epoch that just finished.
+
+        The schedule counts **environment steps**, not epochs, so it does not shift when
+        ``steps_per_epoch`` or ``vector_env_nums`` change -- an epoch is 2000 env steps at one
+        environment and still 2000 at five, but an epoch-based cadence would silently evaluate
+        at different points in training if either were retuned.
+
+        Dense early, sparse later: ``early_eval_step_freq`` up to ``early_eval_steps``, then
+        ``value_eval_step_freq``. The critics move fastest at the start, which is where the
+        calibration is most worth watching and least expensive to measure.
+
+        An evaluation fires when the epoch just finished *crossed* a multiple of the interval,
+        rather than when the step count divides it exactly, so an interval that is not a whole
+        number of epochs still fires once per interval instead of never.
+
+        Args:
+            epoch (int): Index of the epoch that has just finished.
+
+        Returns:
+            True when this epoch crossed an evaluation boundary.
+        """
+        cfgs = self._cfgs.algo_cfgs
+        # Epoch-based keys still win if a config sets them, so existing runs are unaffected.
+        if getattr(cfgs, 'value_eval_freq', None) is not None and getattr(
+            cfgs, 'use_step_eval_schedule', True
+        ) is False:
+            freq = int(cfgs.value_eval_freq)
+            early = int(getattr(cfgs, 'early_eval_freq', 5))
+            span = int(getattr(cfgs, 'early_eval_epochs', 100))
+            return epoch % (early if epoch < span else freq) == 0
+
+        early_steps = int(getattr(cfgs, 'early_eval_steps', 100_000))
+        early_freq = int(getattr(cfgs, 'early_eval_step_freq', 10_000))
+        late_freq = int(getattr(cfgs, 'value_eval_step_freq', 100_000))
+        per_epoch = int(cfgs.steps_per_epoch)
+
+        done = (epoch + 1) * per_epoch
+        before = epoch * per_epoch
+        freq = early_freq if done <= early_steps else late_freq
+        if freq <= 0:
+            return False
+        return done // freq > before // freq
 
     def _eval_value_function(self, epoch: int) -> None:
         """Evaluate the Q-critics against Monte-Carlo returns of the current policy.
@@ -403,13 +486,7 @@ class DDPG(BaseAlgo):
         """
         if not getattr(self._cfgs.algo_cfgs, 'test_estimate', False):
             return
-        eval_freq = getattr(self._cfgs.algo_cfgs, 'value_eval_freq', 50)
-        early_eval_freq = getattr(self._cfgs.algo_cfgs, 'early_eval_freq', 5)
-        # Same knob as PolicyGradient._is_value_eval_epoch; defaults to the old literal 100, so
-        # off-policy configs (which do not declare the key) keep their existing schedule.
-        early_eval_epochs = int(getattr(self._cfgs.algo_cfgs, 'early_eval_epochs', 100))
-        effective_eval_freq = early_eval_freq if epoch < early_eval_epochs else eval_freq
-        if epoch % effective_eval_freq != 0:
+        if not self._is_value_eval_epoch(epoch):
             return
         if (epoch + 1) * self._cfgs.algo_cfgs.steps_per_epoch <= (
             self._cfgs.algo_cfgs.start_learning_steps
@@ -417,7 +494,7 @@ class DDPG(BaseAlgo):
             return
 
         gamma = self._cfgs.algo_cfgs.gamma
-        self._env.eval_value_function(
+        stats, extras = self._env.eval_value_function(
             agent=self._actor_critic,
             # The off-policy cost critic bootstraps with ``gamma`` too (see
             # :meth:`_update_cost_critic`), so ``cost_gamma`` only takes effect if a config
@@ -427,6 +504,32 @@ class DDPG(BaseAlgo):
             eval_episodes=getattr(self._cfgs.algo_cfgs, 'value_eval_episodes', 100),
             epoch=epoch,
         )
+        # value_eval reports only to wandb, so with wandb off the evaluation would run, pay
+        # for its rollouts and discard every number. It returns the same figures as a flat
+        # tuple; name them here so they reach progress.csv as well.
+        names = self._value_eval_keys()
+        if stats is not None and len(stats) == len(names):
+            for key, value in zip(names, stats):
+                self._logger.store({key: float(value)})
+        for key, value in extras.get('stats', {}).items():
+            self._logger.store({key: float(value)})
+
+        # Persist the per-probe arrays and push them to wandb, the same way the on-policy
+        # path does: the scalars above are an aggregate, and a calibration diagram or a
+        # reliability curve needs the probes themselves, which no aggregate can reconstruct.
+        raw = extras.get('raw')
+        if raw:
+            bundle = {
+                'q_study': {
+                    'stats': dict(zip(names, (float(v) for v in stats))) if stats else {},
+                    'spearman': extras.get('stats', {}),
+                    'raw': raw,
+                },
+                'epoch': epoch,
+                'total_env_steps': (epoch + 1) * self._cfgs.algo_cfgs.steps_per_epoch,
+            }
+            path = save_eval_data(self._logger.log_dir, epoch, bundle)
+            log_eval_data_to_wandb(path, epoch)
 
     def _update(self) -> None:
         """Update actor, critic.
