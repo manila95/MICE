@@ -23,3 +23,7 @@ from omnisafe.envs.mujoco_env import MujocoEnv
 from omnisafe.envs.safety_gymnasium_env import SafetyGymnasiumEnv
 from omnisafe.envs.safety_gymnasium_modelbased import SafetyGymnasiumModelBased
 from omnisafe.envs.safety_isaac_gym_env import SafetyIsaacGymEnv
+
+# Registered after SafetyGymnasiumEnv on purpose: it claims the same ids, and the registry routes an
+# id to the first class that lists it, so it is used only when asked for by class_name.
+from omnisafe.envs.safety_gymnasium_gpu_env import SafetyGymnasiumGPUEnv  # noqa: E402

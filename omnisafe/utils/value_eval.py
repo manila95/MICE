@@ -140,14 +140,14 @@ def _rollout_and_report(  # pylint: disable=too-many-locals,too-many-statements
             r_sq = r.reshape(num_envs)
             c_sq = c.reshape(num_envs)
 
-            # Record V(s_t), V_c(s_t), r_t, c_t BEFORE moving to next state
+            # Record V(s_t), V_c(s_t), r_t, c_t BEFORE moving to next state. One host transfer
+            # per tensor per step (same values as per-element .item(), which on a GPU env would
+            # be 4 * num_envs synchronizations every step).
+            est_r_l = cur_est_r.reshape(num_envs).tolist()
+            est_c_l = cur_est_c.reshape(num_envs).tolist()
+            r_l, c_l = r_sq.tolist(), c_sq.tolist()
             for i in range(num_envs):
-                ep_history[i].append((
-                    cur_est_r[i].item(),
-                    cur_est_c[i].item(),
-                    r_sq[i].item(),
-                    c_sq[i].item(),
-                ))
+                ep_history[i].append((est_r_l[i], est_c_l[i], r_l[i], c_l[i]))
 
             done = (terminated.bool() | truncated.bool()).reshape(num_envs)
 

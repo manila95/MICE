@@ -20,7 +20,9 @@ import torch
 
 from omnisafe.algorithms import registry
 from omnisafe.algorithms.on_policy.base.trpo import TRPO
+from omnisafe.algorithms.on_policy.base.true_grad_mixin import TrueGradMixin
 from omnisafe.utils import distributed
+from omnisafe.utils.grad_alignment import ALIGN_KEYS, alignment_stats
 from omnisafe.utils.math import conjugate_gradients
 from omnisafe.utils.tools import (
     get_flat_gradients_from,
@@ -30,7 +32,7 @@ from omnisafe.utils.tools import (
 
 
 @registry.register
-class CPO(TRPO):
+class CPO(TrueGradMixin, TRPO):
     """The Constrained Policy Optimization (CPO) algorithm.
 
     CPO is a derivative of TRPO.
@@ -56,6 +58,20 @@ class CPO(TRPO):
             self._logger.register_key('Train/CostAdvShrinkage')
         if getattr(self._cfgs.algo_cfgs, 'use_cost_bias', False):
             self._logger.register_key('Misc/EpCostBias')
+        if getattr(self._cfgs.algo_cfgs, 'grad_alignment_groups', 0):
+            for key in ALIGN_KEYS:
+                self._logger.register_key(key)
+        self._register_true_grad_keys()
+
+    def _flat_surrogate_grad(self, obs, act, logp, adv, which: str) -> torch.Tensor:
+        """Flat gradient of the reward (ascent) or cost surrogate on a subset, without logging."""
+        self._actor_critic.actor.zero_grad()
+        self._actor_critic.actor(obs)
+        ratio = torch.exp(self._actor_critic.actor.log_prob(act) - logp)
+        (ratio * adv).mean().backward()
+        out = get_flat_gradients_from(self._actor_critic.actor)
+        self._actor_critic.actor.zero_grad()
+        return out
 
     # pylint: disable-next=too-many-arguments,too-many-locals
     def _cpo_search_step(
@@ -467,6 +483,31 @@ class CPO(TRPO):
             violation_c=ep_costs,
             optim_case=optim_case,
         )
+
+        groups = getattr(self._cfgs.algo_cfgs, 'grad_alignment_groups', 0)
+        if groups:
+            # Measured at theta_old (the actor is restored there by the line search).
+            def flat_grad(rows, which):
+                adv = adv_r if which == 'r' else adv_c
+                return self._flat_surrogate_grad(obs[rows], act[rows], logp[rows], adv[rows], which)
+
+            self._logger.store(
+                alignment_stats(
+                    flat_grad=flat_grad,
+                    n_rows=obs.shape[0],
+                    n_envs=self._cfgs.train_cfgs.vector_env_nums,
+                    groups=groups,
+                    g=grads,
+                    b=b_grads,
+                    hinv=lambda v: conjugate_gradients(self._fvp, v, self._cfgs.algo_cfgs.cg_iters),
+                    x=x,
+                    p=p,
+                    step=step_direction,
+                ),
+            )
+
+        if getattr(self._cfgs.algo_cfgs, 'true_grad_worlds', 0):
+            self._log_true_gradient(grads, b_grads)  # at theta_old, before the step is applied
 
         theta_new = theta_old + step_direction
         set_param_values_to_model(self._actor_critic.actor, theta_new)

@@ -1138,6 +1138,124 @@ class PolicyGradient(BaseAlgo):
                 f'{min(result["episode_lengths"])}-{max(result["episode_lengths"])}).',
             )
 
+    @property
+    def _use_gpu_eval(self) -> bool:
+        """Whether the value studies run on the GPU Safety-Gymnasium.
+
+        True when training itself runs on it (``env_cfgs.class_name = SafetyGymnasiumGPUEnv``),
+        or when asked for explicitly with ``algo_cfgs.gpu_value_eval`` (CPU training, GPU studies;
+        needs the process to run in the GPU python env all the same).
+        """
+        env_cfgs = getattr(self._cfgs, 'env_cfgs', None)
+        cls = env_cfgs.get('class_name') if env_cfgs is not None and hasattr(env_cfgs, 'get') else None
+        return cls == 'SafetyGymnasiumGPUEnv' or bool(getattr(self._cfgs.algo_cfgs, 'gpu_value_eval', False))
+
+    def _get_gpu_test_estimate_env(self, eval_episodes: int):
+        """A GPU env with ``eval_episodes`` worlds for ``test_estimate``, normalizer synced."""
+        env = getattr(self, '_gpu_test_env', None)
+        if env is None:
+            env_cfgs = self._cfgs.env_cfgs.todict()
+            env = make_env(self._env_id, num_envs=int(eval_episodes), device=self._device, **env_cfgs)
+            if self._cfgs.algo_cfgs.obs_normalize:
+                env = ObsNormalize(env, device=self._device, update_stats=False)
+            env = ActionScale(env, low=-1.0, high=1.0, device=self._device)
+            self._gpu_test_env = env
+        sync_obs_normalizer(env, self._env._env)
+        return env
+
+    def _run_gpu_eval_studies(self, epoch: int, eval_data_bundle: dict) -> None:
+        """The s0 and intermediate-state studies (plus the advantage study) on the GPU env.
+
+        Same probes, repeats, positions, seeds and logger keys as the CPU path in
+        :meth:`_run_eval_studies`, and the same ``eval_data_bundle`` entries, so pooling, gradient
+        alignment, tail scoring and the dump that follow run unchanged. See
+        :mod:`omnisafe.utils.gpu_value_eval` for which value is estimated (``rng_replay``).
+        """
+        from omnisafe.utils.gpu_value_eval import GPUValueStudies, gpu_env_kwargs  # noqa: PLC0415
+
+        algo = self._cfgs.algo_cfgs
+        gamma_r = algo.gamma
+        gamma_c = getattr(algo, 'cost_gamma', algo.gamma)
+        if getattr(self, '_gpu_studies', None) is None:
+            env_cfgs = self._cfgs.env_cfgs.todict() if getattr(self._cfgs, 'env_cfgs', None) is not None else {}
+            self._gpu_studies = GPUValueStudies(
+                self._env_id, gpu_env_kwargs(env_cfgs),
+                max_worlds=int(getattr(algo, 'gpu_value_eval_max_worlds', 8192)),
+                sim_device=env_cfgs.get('sim_device') or (str(self._device) if self._device.type == 'cuda' else 'cuda:0'),
+                rng_replay=bool(getattr(algo, 'gpu_value_eval_rng_replay', True)),
+            )
+        studies = self._gpu_studies
+        studies.timing = {}
+        normalizer = _find_obs_normalizer(self._env._env) if algo.obs_normalize else None
+        agent = self._actor_critic
+        threshold = getattr(algo, 'mc_eval_bootstrap_threshold', None)
+        tail = getattr(algo, 'mc_eval_tail', None)
+
+        # s0 study
+        if self._mc_probe_seeds is None:
+            n_probes = int(getattr(algo, 'mc_value_study_probes', 100))
+            seed_offset = int(getattr(algo, 'mc_value_study_seed_offset', 100_000))
+            self._mc_probe_seeds = list(range(seed_offset, seed_offset + n_probes))
+        s0_repeats = int(getattr(algo, 'mc_value_study_repeats', 5))
+
+        # intermediate-state states (+ transitions for the one-step advantage study)
+        positions = self._intermediate_study_positions()
+        n_probes = int(getattr(algo, 'intermediate_state_study_probes', 20))
+        repeats = int(getattr(algo, 'intermediate_state_study_repeats', 5))
+        eval_advantage = bool(getattr(algo, 'eval_advantage', False))
+        triggers = sorted(set(positions) | ({p + 1 for p in positions} if eval_advantage else set()))
+        collected, transitions = studies.collect(
+            agent, normalizer, triggers, base_seed=700_000 + epoch * n_probes, n_probes=n_probes,
+            transition_steps=positions if eval_advantage else None,
+        )
+        if s0_repeats == repeats:
+            # Every probe of both studies in one batched rollout (independent worlds either way).
+            (mc_stats, mc_raw), by_pos = studies.run_all(
+                agent, normalizer, self._cfgs, self._mc_probe_seeds, s0_repeats, collected, repeats,
+                gamma_r, gamma_c, threshold, tail,
+            )
+        else:
+            mc_stats, mc_raw = studies.s0_study(
+                agent, normalizer, self._cfgs, self._mc_probe_seeds, s0_repeats, gamma_r, gamma_c, threshold, tail,
+            )
+            by_pos = {
+                pos: studies.state_study(agent, normalizer, self._cfgs, collected[pos], repeats, gamma_r, gamma_c,
+                                         threshold, tail)
+                for pos in triggers
+            }
+        self._logger.store(mc_stats)
+        eval_data_bundle['mc_study'] = {'stats': mc_stats, 'raw': mc_raw}
+        self._store_tail_stats(mc_raw, 'MCStudyTail/', 'mc_study_tail', eval_data_bundle)
+
+        eval_data_bundle['intermediate_study'] = {}
+        if eval_advantage:
+            eval_data_bundle['advantage_study'] = {}
+        value_raw_by_pos: dict[int, dict] = {}
+        for pos in triggers:
+            pos_stats, pos_raw = by_pos[pos]
+            value_raw_by_pos[pos] = pos_raw
+            if pos not in positions:
+                continue
+            self._logger.store({f'IntermediateMC/pos{pos}/{k}': v for k, v in pos_stats.items()})
+            eval_data_bundle['intermediate_study'][pos] = {'stats': pos_stats, 'raw': pos_raw}
+            self._store_tail_stats(
+                pos_raw, f'IntermediateMCTail/pos{pos}/', pos,
+                eval_data_bundle.setdefault('intermediate_study_tail', {}),
+            )
+        for pos in positions:
+            if not eval_advantage or pos + 1 not in value_raw_by_pos:
+                continue
+            adv_stats, adv_raw = estimate_advantage_from_snapshots(
+                raw_at=value_raw_by_pos[pos], raw_next=value_raw_by_pos[pos + 1],
+                transition=transitions[pos], discount_r=gamma_r, discount_c=gamma_c, mc_repeats=repeats,
+            )
+            self._logger.store({f'IntermediateAdv/pos{pos}/{k}': v for k, v in adv_stats.items()})
+            eval_data_bundle['advantage_study'][pos] = {'stats': adv_stats, 'raw': adv_raw}
+        eval_data_bundle['gpu_eval_timing'] = dict(studies.timing)
+        self._logger.log(
+            'GPU value studies: ' + ', '.join(f'{k} {v:.1f}s' for k, v in studies.timing.items()),
+        )
+
     def _tail_eval_alpha(self) -> float | None:
         """Tail fraction the cost critic should be scored at, or ``None`` for the mean.
 
@@ -1199,13 +1317,18 @@ class PolicyGradient(BaseAlgo):
                 all_r_error, all_true_r_m, all_est_r_m, all_corr_r,
             ) = estimate_true_value(
                 agent=self._actor_critic,
-                env=self._env._env,
+                # On the GPU path, a dedicated env: rolling these episodes in the training env
+                # would reset the long, epoch-spanning episodes of a many-env persistent rollout.
+                env=self._get_gpu_test_estimate_env(eval_episodes) if self._use_gpu_eval else self._env._env,
                 cfgs=self._cfgs,
                 discount_r=self._cfgs.algo_cfgs.gamma,
                 discount_c=getattr(self._cfgs.algo_cfgs, 'cost_gamma', self._cfgs.algo_cfgs.gamma),
                 eval_episodes=eval_episodes,
                 epoch=epoch,
             )
+            # That rollout reset and stepped the training env; a persistent rollout must restart.
+            if hasattr(self._env, 'invalidate_persistent_rollout'):
+                self._env.invalidate_persistent_rollout()
             # Stored unconditionally (see _init_log's registration comment) -- previously
             # these numbers only reached wandb, so any use_wandb=False run (every run in the
             # SR calibration study) never had them in progress.csv at all.
@@ -1244,7 +1367,10 @@ class PolicyGradient(BaseAlgo):
         # Same-layout Monte-Carlo value study (opt-in, default off -- see
         # estimate_true_value_same_state_mc's docstring). Shares effective_eval_freq with the
         # estimate_true_value call above so both diagnostics are read from the same epochs.
-        if (
+        if getattr(self._cfgs.algo_cfgs, 'eval_critic', False) and is_eval_epoch and self._use_gpu_eval:
+            # Both studies on the GPU env, filed exactly as the CPU blocks below file theirs.
+            self._run_gpu_eval_studies(epoch, eval_data_bundle)
+        elif (
             getattr(self._cfgs.algo_cfgs, 'eval_critic', False)
             and is_eval_epoch
             and self._use_isolated_eval
@@ -1290,6 +1416,7 @@ class PolicyGradient(BaseAlgo):
             getattr(self._cfgs.algo_cfgs, 'eval_critic', False)
             and is_eval_epoch
             and not self._use_isolated_eval
+            and not self._use_gpu_eval
         ):
             positions = list(
                 getattr(

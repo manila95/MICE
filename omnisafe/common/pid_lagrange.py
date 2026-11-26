@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import abc
+import math
 from collections import deque
 
 
@@ -105,6 +106,10 @@ class PIDLagrangian(abc.ABC):  # noqa: B024
         Args:
             ep_cost_avg (float): The average cost of the current episode.
         """
+        if not math.isfinite(float(ep_cost_avg)):
+            # No episode has finished yet (e.g. long episodes split across epochs): a NaN
+            # cost would poison the EMA state and pin the penalty at max(0, NaN) = 0 forever.
+            return
         delta = float(ep_cost_avg - self._cost_limit)
         self._pid_i = max(0.0, self._pid_i + delta * self._pid_ki)
         if self._diff_norm:

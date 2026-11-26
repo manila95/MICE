@@ -92,11 +92,16 @@ class OnPolicyAdapter(OnlineAdapter):
             buffer (VectorOnPolicyBuffer): Vector on-policy buffer.
             logger (Logger): Logger, to log ``EpRet``, ``EpCost``, ``EpLen``.
         """
-        self._reset_log()
         self._epoch_cost_sum = 0.0
         self._epoch_ep_costs = []
 
-        obs, _ = self.reset()
+        if self._persistent_rollout and getattr(self, '_persist_obs', None) is not None:
+            # Continue every env's episode where the last epoch left it (its cut-off segment was
+            # already bootstrapped with the critic at epoch end, below).
+            obs = self._persist_obs
+        else:
+            self._reset_log()
+            obs, _ = self.reset()
         for step in track(
             range(steps_per_epoch),
             description=f'Processing rollout for epoch: {logger.current_epoch}...',
@@ -135,7 +140,9 @@ class OnPolicyAdapter(OnlineAdapter):
                             in {self._env.num_envs - num_dones} of {self._env.num_envs} environments.',
                     )
 
-            for idx, (done, time_out) in enumerate(zip(terminated, truncated)):
+            # One host transfer per step instead of one sync per env and flag when the env
+            # lives on the GPU (identical values; a no-op for CPU tensors).
+            for idx, (done, time_out) in enumerate(zip(terminated.tolist(), truncated.tolist())):
                 if epoch_end or done or time_out:
                     last_value_r = torch.zeros(1)
                     last_value_c = torch.zeros(1)
@@ -169,6 +176,7 @@ class OnPolicyAdapter(OnlineAdapter):
                         # _SelectiveReinforceBuffer) that override finish_path with a narrower
                         # signature and don't expect last_psi.
                         buffer.finish_path(last_value_r, last_value_c, idx)
+        self._persist_obs = obs if self._persistent_rollout else None
 
     def _log_value(
         self,
@@ -209,6 +217,27 @@ class OnPolicyAdapter(OnlineAdapter):
                 'Metrics/EpLen': self._ep_len[idx],
             },
         )
+
+    @property
+    def _persistent_rollout(self) -> bool:
+        """Whether episodes continue across epochs instead of every epoch starting with a reset.
+
+        omnisafe resets all envs at the start of each epoch's rollout. That is harmless when each
+        env runs several whole episodes per epoch (5 envs x 4000 steps), but with many parallel
+        envs each one runs only ``steps_per_epoch / num_envs`` steps (20 at 1000 envs) and would
+        never see past the start of an episode. ``algo_cfgs.persistent_rollout`` turns the reset
+        into a one-off; left unset, it is on exactly when training runs on the GPU env.
+        """
+        flag = self._cfgs.algo_cfgs.get('persistent_rollout', None)
+        if flag is not None:
+            return bool(flag)
+        env_cfgs = getattr(self._cfgs, 'env_cfgs', None)
+        cls = env_cfgs.get('class_name') if env_cfgs is not None and hasattr(env_cfgs, 'get') else None
+        return cls == 'SafetyGymnasiumGPUEnv'
+
+    def invalidate_persistent_rollout(self) -> None:
+        """Forget the carried-over state, e.g. after something else reset or stepped the env."""
+        self._persist_obs = None
 
     def _reset_log(self, idx: int | None = None) -> None:
         """Reset the episode return, episode cost and episode length.

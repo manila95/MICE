@@ -18,11 +18,13 @@ import torch
 
 from omnisafe.algorithms import registry
 from omnisafe.algorithms.on_policy.base.trpo import TRPO
+from omnisafe.algorithms.on_policy.base.true_grad_mixin import TrueGradMixin
+from omnisafe.utils import true_gradient
 from omnisafe.common.pid_lagrange import PIDLagrangian
 
 
 @registry.register
-class TRPOPID(TRPO):
+class TRPOPID(TrueGradMixin, TRPO):
     """The PID-Lagrange version of the TRPO algorithm.
 
     A simple combination of the PID-Lagrange method and the Trust Region Policy Optimization algorithm.
@@ -47,6 +49,26 @@ class TRPOPID(TRPO):
         """
         super()._init_log()
         self._logger.register_key('Metrics/LagrangeMultiplier')
+        self._register_true_grad_keys()
+
+    _TRUE_GRAD_EXTRA_KEYS = tuple(true_gradient.COMBINED_KEYS)
+
+    def _update_actor(  # pylint: disable=too-many-arguments
+        self,
+        obs: torch.Tensor,
+        act: torch.Tensor,
+        logp: torch.Tensor,
+        adv_r: torch.Tensor,
+        adv_c: torch.Tensor,
+    ) -> None:
+        """TRPO step on the combined advantage; with ``true_grad_worlds`` the reward and cost
+        surrogate gradients of this batch are first scored against the reference gradients."""
+        if self._true_grad_enabled():
+            self._fvp_obs = obs[:: self._cfgs.algo_cfgs.fvp_sample_freq]
+            g = self._flat_surrogate_grad(obs, act, logp, adv_r)
+            b = self._flat_surrogate_grad(obs, act, logp, adv_c)
+            self._log_true_gradient(g, b, penalty=self._lagrange.lagrangian_multiplier)
+        super()._update_actor(obs, act, logp, adv_r, adv_c)
 
     def _update(self) -> None:
         r"""Update actor, critic, as we used in the :class:`PolicyGradient` algorithm.

@@ -114,6 +114,23 @@ defaults:
     fvp_obs: None
     # Tolerance of constraint violation
     cost_limit: 25
+    # >= 2: log reward/cost gradient alignment (omnisafe/utils/grad_alignment.py) each update,
+    # splitting the batch into this many independent groups of environments for the
+    # noise-corrected cosine; 0 = off
+    grad_alignment_groups: 0
+    # > 0: brute-force "true" reward/cost gradients each update (omnisafe/utils/true_gradient.py,
+    # GPU env only) from this many extra worlds stepped in lockstep with training
+    true_grad_worlds: 0
+    # worlds per gradient group (sets the smallest batch size of the batch-size curve)
+    true_grad_group_envs: 10
+    # also the critic-free gradient from returns rolled out to each episode's end
+    true_grad_mc: True
+    # > 0: nested Monte-Carlo Q/V reference at true_grad_worlds/(2*this) anchor samples, scoring the
+    # learned value and advantage (AdvQ/* keys); needs true_grad_mc
+    true_grad_adv_repeats: 0
+    # > 0: oracle-advantage gradient on this many probe samples, each with one paired Monte-Carlo
+    # rollout for its advantage (Oracle/* keys); compares it with the learned advantage on the same samples
+    true_grad_oracle_samples: 0
     # Ablation: uniformly multiply the cost advantage (adv_c) by this factor before it touches
     # anything in _update_actor -- the cost gradient (b_grads), the closed-form step direction,
     # AND the line search's cost non-worsening check all consistently see the shrunk signal, as
