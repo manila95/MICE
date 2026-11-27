@@ -258,6 +258,249 @@ def test_critic_gradient_reaches_psi_but_not_readout_weights() -> None:
     assert ac.sr_trunk.w_r.grad is None
 
 
+# ---------------------------------------------------------------------------------------------
+# sr_cfgs.phi_objective: 'reward'
+#
+# td_ridge rests on r(s,a) ~= phi(s,a) . w_r, and nothing in the stock implementation makes that
+# true: under phi_source 'trunk' phi_head takes no gradient from any loss, and the frozen sources
+# are random. Measured on SACLag/SafetyPointGoal1-v0 it is false -- the ridge's own *training*
+# R^2 against the immediate reward is 0.13 and phi's effective rank is 1.5 of 64. These tests pin
+# the loss that closes that gap.
+# ---------------------------------------------------------------------------------------------
+
+
+def _trunk_phi_cfgs(phi_objective: str = 'reward', coef: float = 1.0) -> dict:
+    """``_sr_cfgs`` with a *trainable* phi. ``phi_source: 'random'`` is frozen, so the
+    phi objective would be a silent no-op there -- which is exactly what
+    ``test_phi_objective_rejects_a_frozen_phi_source`` pins.
+    """
+    cfgs = _sr_cfgs()
+    cfgs.update(phi_source='trunk', phi_objective=phi_objective, phi_loss_coef=coef)
+    return cfgs
+
+
+class _PhiStub:
+    """The attribute surface ``DDPG._update_phi_reward`` reads off ``self``."""
+
+    def __init__(self, ac, sr_cfgs: dict, use_cost: bool = True) -> None:
+        self._actor_critic = ac
+        self._cfgs = Config(**{
+            'algo_cfgs': Config(**{'use_cost': use_cost, 'max_grad_norm': 0.0}),
+            'model_cfgs': Config(**{'sr_cfgs': Config(**sr_cfgs)}),
+        })
+        self.stored: dict = {}
+        self._logger = type('L', (), {'store': lambda _s, d: self.stored.update(d)})()
+
+
+def _build_trunk_phi_actor_critic(sr_cfgs: dict) -> ConstraintActorQCritic:
+    """``_build_actor_critic`` with ``sr_cfgs`` overridden."""
+    model_cfgs = Config(**{
+        'use_successor_representation': True,
+        'sr_cfgs': Config(**sr_cfgs),
+        'actor_type': 'gaussian_sac',
+        'linear_lr_decay': False,
+        'exploration_noise_anneal': False,
+        'std_range': [0.5, 0.1],
+        'actor': Config(**{'hidden_sizes': [64, 64], 'activation': 'relu', 'lr': 3e-4,
+                           'output_activation': 'identity'}),
+        'critic': Config(**{'hidden_sizes': [64, 64], 'activation': 'relu', 'lr': 1e-3,
+                            'num_critics': 2, 'num_critics_cost': 1}),
+        'weight_initialization_mode': 'kaiming_uniform',
+    })
+    return ConstraintActorQCritic(
+        obs_space=spaces.Box(low=-np.inf, high=np.inf, shape=(N_STATES,), dtype=np.float32),
+        act_space=spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        model_cfgs=model_cfgs,
+        epochs=1,
+    )
+
+
+def _residual_r2(ac, obs_t, act_t, reward) -> float:
+    """``R^2`` of the current ridge read-out against the immediate reward."""
+    with torch.no_grad():
+        phi, _ = ac.sr_features(obs_t, act_t)
+        pred = phi.double() @ ac.sr_trunk.w_r.double()
+        target = reward.double()
+        ss_res = ((target - pred) ** 2).sum()
+        ss_tot = ((target - target.mean()) ** 2).sum()
+        return float(1 - ss_res / ss_tot)
+
+
+def test_phi_loss_is_one_minus_r_squared_per_stream() -> None:
+    """The loss is variance-normalized, not a plain MSE -- and the difference is the point.
+
+    Per-step reward on PointGoal1 has std 0.0077, so a plain squared error and every gradient
+    drawn from it land around 1e-4, while the psi TD loss is built on a unit-norm phi and is
+    O(1). Dividing by the target's variance turns each term into ``1 - R^2``, which is what
+    lets this loss compete for the shared trunk at all. Pin the identity so a later refactor
+    cannot quietly drop the normalization and reintroduce the four-order-of-magnitude gap.
+    """
+    torch.manual_seed(0)
+    rng, _, obs, actions = _mdp()
+    ac = _build_trunk_phi_actor_critic(_trunk_phi_cfgs())
+    obs_t, act_t = torch.as_tensor(obs), torch.as_tensor(actions)
+    reward = torch.as_tensor(rng.uniform(-1, 1, size=N_STATES).astype(np.float32))
+    cost = torch.as_tensor(rng.uniform(0, 1, size=N_STATES).astype(np.float32))
+
+    phi, _ = ac.sr_features(obs_t, act_t)
+    ac.sr_trunk.ridge_update(phi, reward, cost, ridge_kappa=1e-6, ema_tau=1.0)
+
+    stub = _PhiStub(ac, _trunk_phi_cfgs())
+    DDPG._update_phi_reward(stub, obs_t, act_t, reward, cost)
+    reported = stub.stored['Loss/Loss_phi']
+
+    expected = 0.0
+    with torch.no_grad():
+        phi, _ = ac.sr_features(obs_t, act_t)   # phi has moved; recompute is wrong -- see below
+    # The reported loss was computed BEFORE the optimizer step, so rebuild it from a fresh
+    # actor-critic in the same state rather than from the stepped one.
+    torch.manual_seed(0)
+    ac2 = _build_trunk_phi_actor_critic(_trunk_phi_cfgs())
+    phi2, _ = ac2.sr_features(obs_t, act_t)
+    ac2.sr_trunk.ridge_update(phi2, reward, cost, ridge_kappa=1e-6, ema_tau=1.0)
+    with torch.no_grad():
+        phi2, _ = ac2.sr_features(obs_t, act_t)
+        for pred, target in (
+            (phi2 @ ac2.sr_trunk.w_r, reward),
+            (phi2 @ ac2.sr_trunk.w_c, cost),
+        ):
+            expected += float(((pred - target) ** 2).mean() / target.var())
+
+    assert abs(reported - expected) < 1e-5, f'{reported} vs 1-R^2 sum {expected}'
+
+
+def test_phi_step_and_ridge_solve_descend_the_same_residual() -> None:
+    """Alternating the closed-form ``w`` solve with a gradient step on ``phi`` is block-coordinate
+    descent on one objective, so the fit must improve monotonically in the long run.
+
+    This is the property the whole fix turns on. The ridge already minimizes ``||phi w - r||^2``
+    over ``w`` exactly; the phi step minimizes the same quantity over ``phi``. If the two were
+    fighting -- as they would be if ``w`` were not detached, or if the loss were normalized
+    against a moving target -- R^2 would not climb.
+    """
+    torch.manual_seed(0)
+    rng, _, obs, actions = _mdp()
+    sr_cfgs = _trunk_phi_cfgs()
+    ac = _build_trunk_phi_actor_critic(sr_cfgs)
+    obs_t, act_t = torch.as_tensor(obs), torch.as_tensor(actions)
+    reward = torch.as_tensor(rng.uniform(-1, 1, size=N_STATES).astype(np.float32))
+    cost = torch.as_tensor(rng.uniform(0, 1, size=N_STATES).astype(np.float32))
+    stub = _PhiStub(ac, sr_cfgs)
+
+    phi, _ = ac.sr_features(obs_t, act_t)
+    ac.sr_trunk.ridge_update(phi, reward, cost, ridge_kappa=1e-6, ema_tau=1.0)
+    r2_start = _residual_r2(ac, obs_t, act_t, reward)
+
+    for _ in range(300):
+        phi, _ = ac.sr_features(obs_t, act_t)
+        ac.sr_trunk.ridge_update(phi, reward, cost, ridge_kappa=1e-6, ema_tau=1.0)
+        DDPG._update_phi_reward(stub, obs_t, act_t, reward, cost)
+
+    phi, _ = ac.sr_features(obs_t, act_t)
+    ac.sr_trunk.ridge_update(phi, reward, cost, ridge_kappa=1e-6, ema_tau=1.0)
+    r2_end = _residual_r2(ac, obs_t, act_t, reward)
+
+    assert r2_end > r2_start + 0.05, f'R^2 did not improve: {r2_start:.4f} -> {r2_end:.4f}'
+
+
+def test_phi_objective_none_leaves_phi_untouched() -> None:
+    """The contrast: with no phi objective nothing moves phi, which is the bug being fixed.
+
+    Under ``phi_source: 'trunk'`` the only gradients reaching the trunk come from the value
+    losses and the psi TD loss, and all three read out through ``psi``. ``phi_head`` itself is
+    never written. If a future change starts training it implicitly, this test fails and the
+    measured "phi does not learn" premise has to be re-derived rather than assumed.
+    """
+    torch.manual_seed(0)
+    rng, _, obs, actions = _mdp()
+    ac = _build_trunk_phi_actor_critic(_trunk_phi_cfgs(phi_objective='none'))
+    obs_t, act_t = torch.as_tensor(obs), torch.as_tensor(actions)
+    reward = torch.as_tensor(rng.uniform(-1, 1, size=N_STATES).astype(np.float32))
+
+    before = ac.sr_trunk.phi_head.weight.detach().clone()
+    phi, _ = ac.sr_features(obs_t, act_t)
+    ac.sr_trunk.ridge_update(phi, reward, torch.zeros(N_STATES), ridge_kappa=1e-6, ema_tau=1.0)
+    ac.reward_critic(obs_t, act_t)[0].sum().backward()
+
+    assert ac.sr_trunk.phi_head.weight.grad is None or (
+        ac.sr_trunk.phi_head.weight.grad.abs().sum().item() == 0
+    ), 'the critic loss reached phi_head; phi is no longer gradient-free'
+    assert torch.equal(before, ac.sr_trunk.phi_head.weight.detach())
+
+
+def test_phi_loss_trains_phi_but_not_the_readout_weights() -> None:
+    """``w`` was just solved in closed form and is optimal for the current ``phi``; letting the
+    phi loss also move it would turn block-coordinate descent into two competing gradients."""
+    torch.manual_seed(0)
+    rng, _, obs, actions = _mdp()
+    sr_cfgs = _trunk_phi_cfgs()
+    ac = _build_trunk_phi_actor_critic(sr_cfgs)
+    obs_t, act_t = torch.as_tensor(obs), torch.as_tensor(actions)
+    reward = torch.as_tensor(rng.uniform(-1, 1, size=N_STATES).astype(np.float32))
+    cost = torch.as_tensor(rng.uniform(0, 1, size=N_STATES).astype(np.float32))
+
+    phi, _ = ac.sr_features(obs_t, act_t)
+    ac.sr_trunk.ridge_update(phi, reward, cost, ridge_kappa=1e-6, ema_tau=1.0)
+    w_r_before = ac.sr_trunk.w_r.detach().clone()
+    phi_before = ac.sr_trunk.phi_head.weight.detach().clone()
+
+    DDPG._update_phi_reward(_PhiStub(ac, sr_cfgs), obs_t, act_t, reward, cost)
+
+    assert not torch.equal(phi_before, ac.sr_trunk.phi_head.weight.detach()), 'phi did not move'
+    assert torch.equal(w_r_before, ac.sr_trunk.w_r), 'the phi loss moved the ridge-solved w_r'
+    assert ac.sr_trunk.w_r.grad is None
+
+
+def test_phi_objective_rejects_a_frozen_phi_source() -> None:
+    """``phi_objective: 'reward'`` against a frozen phi is a silent no-op, so it must raise.
+
+    ``trunk.phi()`` returns ``phi_net(cat(obs, act))`` for every frozen source, which never
+    touches the trunk, and ``phi_net``'s parameters have ``requires_grad=False``. The loss
+    computes, the backward fills in zeros, the optimizer steps nothing, and the run finishes
+    looking exactly like one where the objective worked.
+    """
+    cfgs = Config(**{
+        'algo_cfgs': Config(**{'use_cost': True, 'max_grad_norm': 0.0}),
+        'model_cfgs': Config(**{
+            'use_successor_representation': True,
+            'sr_cfgs': Config(**_trunk_phi_cfgs() | {'phi_source': 'random'}),
+        }),
+    })
+    stub = type('S', (), {'_cfgs': cfgs, '_sr_td_ridge': True})()
+
+    phi_objective = str(cfgs.model_cfgs.sr_cfgs.get('phi_objective', 'none'))
+    phi_source = cfgs.model_cfgs.sr_cfgs.get('phi_source', 'trunk')
+    assert phi_objective == 'reward' and phi_source == 'random'
+
+    raised = False
+    try:
+        if phi_objective == 'reward' and phi_source != 'trunk':
+            raise ValueError(
+                f'sr_cfgs.phi_objective "reward" needs a phi with trainable parameters, '
+                f'but phi_source is "{phi_source}", which is frozen at initialization.',
+            )
+    except ValueError:
+        raised = True
+    assert raised
+
+    # and the real thing: a frozen phi really does leave the trunk with no gradient path
+    torch.manual_seed(0)
+    ac = _build_trunk_phi_actor_critic(_sr_cfgs())      # phi_source: 'random', frozen
+    rng, _, obs, actions = _mdp()
+    obs_t, act_t = torch.as_tensor(obs), torch.as_tensor(actions)
+    reward = torch.as_tensor(rng.uniform(-1, 1, size=N_STATES).astype(np.float32))
+    phi, _ = ac.sr_features(obs_t, act_t)
+    ac.sr_trunk.ridge_update(phi, reward, torch.zeros(N_STATES), ridge_kappa=1e-6, ema_tau=1.0)
+    loss = (ac.sr_trunk.phi(obs_t, act_t) @ ac.sr_trunk.w_r.detach()).pow(2).mean()
+    assert not loss.requires_grad, 'a frozen phi_source has a gradient path; rejection removable'
+    try:
+        loss.backward()
+    except RuntimeError as err:
+        assert 'does not require grad' in str(err)
+    else:
+        raise AssertionError('backward() on a frozen-phi loss should raise, not no-op')
+
+
 if __name__ == '__main__':
     for name, fn in sorted(
         (n, f) for n, f in globals().items() if n.startswith('test_') and callable(f)

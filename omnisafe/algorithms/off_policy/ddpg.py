@@ -148,6 +148,33 @@ class DDPG(BaseAlgo):
         self._sr_readout: str = (
             self._cfgs.model_cfgs.sr_cfgs.get('readout', 'ridge') if self._sr_td_ridge else 'ridge'
         )
+        # What, if anything, trains phi itself: 'none' (nothing does -- see
+        # _update_phi_reward for why that is a problem) or 'reward' (fit the immediate
+        # reward/cost, making the successor-feature linearity premise hold by construction).
+        self._sr_phi_objective: str = (
+            str(self._cfgs.model_cfgs.sr_cfgs.get('phi_objective', 'none'))
+            if self._sr_td_ridge
+            else 'none'
+        )
+        if self._sr_phi_objective not in ('none', 'reward'):
+            raise ValueError(
+                f'Unknown sr_cfgs.phi_objective "{self._sr_phi_objective}"; '
+                'expected "none" or "reward".',
+            )
+        if self._sr_phi_objective == 'reward':
+            # A frozen phi_source has no path from this loss to any trainable parameter:
+            # trunk.phi() returns phi_net(cat(obs, act)), which never touches the trunk, and
+            # phi_net's own parameters have requires_grad=False. The loss therefore carries no
+            # grad_fn and backward() raises "element 0 of tensors does not require grad" partway
+            # into training -- verified, not assumed. Catching it here turns an obscure autograd
+            # error into a message naming the two settings that conflict.
+            phi_source = self._cfgs.model_cfgs.sr_cfgs.get('phi_source', 'trunk')
+            if phi_source != 'trunk':
+                raise ValueError(
+                    f'sr_cfgs.phi_objective "reward" needs a phi with trainable parameters, '
+                    f'but phi_source is "{phi_source}", which is frozen at initialization. '
+                    'Use phi_source: "trunk".',
+                )
 
     def _init_log(self) -> None:
         """Log info about epoch.
@@ -282,6 +309,9 @@ class DDPG(BaseAlgo):
             self._logger.register_key('Misc/WcNorm')
             self._logger.register_key('Misc/GramCond')
             self._logger.register_key('Misc/GramCondCost')
+            self._logger.register_key('Misc/PhiEffRank')
+            if self._sr_phi_objective != 'none':
+                self._logger.register_key('Loss/Loss_phi', delta=True)
 
         self._logger.register_key('Time/Total')
         self._logger.register_key('Time/Rollout')
@@ -709,6 +739,11 @@ class DDPG(BaseAlgo):
                 # Refresh w_r / w_c before the critic losses consume them, mirroring how the
                 # on-policy path solves the ridge on the fresh batch before its minibatch loop.
                 self._ridge_update_successor_weights(obs, act, reward, cost)
+                if self._sr_phi_objective == 'reward':
+                    # Block-coordinate descent: the solve above fixed w given phi, this step
+                    # moves phi given w. Both reduce the same residual ||phi.w - r||^2, the
+                    # one the SR identity Q = psi.w integrates over the whole horizon.
+                    self._update_phi_reward(obs, act, reward, cost)
 
             self._update_reward_critic(obs, act, reward, done, next_obs)
             if self._cfgs.algo_cfgs.use_cost:
@@ -762,6 +797,23 @@ class DDPG(BaseAlgo):
             cond_every=int(sr_cfgs.get('cond_every', 1)),
         )
         self._actor_critic.sync_sr_readout_weights()
+
+        # Effective rank of the ridge's design matrix: the participation ratio of phi's squared
+        # spectrum, exp(-sum p_i log p_i) over p_i = sigma_i^2 / sum sigma^2. sr_dim is only a
+        # ceiling on the basis's width, and the gap between the two is what distinguishes "the
+        # basis is fine, this reward is just hard to fit" from "the basis has collapsed". It
+        # collapses: 1.5 of 64 under the default phi_source 'trunk' on PointGoal1. Shares
+        # cond_every's cadence because it costs the same kind of SVD.
+        self._phi_rank_tick = getattr(self, '_phi_rank_tick', 0) + 1
+        cond_every = int(sr_cfgs.get('cond_every', 1))
+        if cond_every <= 1 or self._phi_rank_tick % cond_every == 1:
+            with torch.no_grad():
+                spectrum = torch.linalg.svdvals(phi.detach().double()).pow(2)
+                weights = spectrum / spectrum.sum().clamp_min(1e-30)
+                self._phi_eff_rank = float(
+                    torch.exp(-(weights * (weights + 1e-30).log()).sum()),
+                )
+        self._logger.store({'Misc/PhiEffRank': getattr(self, '_phi_eff_rank', 0.0)})
         self._logger.store(stats)
 
     def _sgd_update_readout_weights(self) -> None:
@@ -796,6 +848,80 @@ class DDPG(BaseAlgo):
             )
         self._actor_critic.sr_readout_optimizer.step()
         self._logger.store(stats)
+
+    def _update_phi_reward(
+        self,
+        obs: torch.Tensor,
+        act: torch.Tensor,
+        reward: torch.Tensor,
+        cost: torch.Tensor,
+    ) -> None:
+        r"""Train ``phi`` so the immediate reward/cost really is linear in it.
+
+        ``td_ridge`` factorizes the critic as :math:`Q(s,a) = \psi(s,a)^T w` and solves ``w`` by
+        ridge regression of the *immediate* reward onto the *immediate* feature, so the whole
+        construction rests on the successor-feature premise
+
+        .. math:: r(s, a) \approx \phi(s, a)^T w_r .
+
+        Nothing in the stock implementation makes that true. Under ``phi_source: 'trunk'``
+        ``phi_head`` receives no gradient from any loss (the value losses and the ``psi`` TD loss
+        all read out through ``psi``, never through ``phi``), and under the frozen sources
+        ``phi`` is random by construction. Measured on SACLag/SafetyPointGoal1-v0 the premise
+        fails badly: the ridge's own *training* :math:`R^2` against the immediate reward is 0.13,
+        and ``phi``'s effective rank is 1.5 of its 64 dimensions.
+
+        That matters more than an ordinary critic approximation error would, because the residual
+        is not read out once -- the SR identity integrates it over the horizon. Writing
+        :math:`\epsilon = r - \phi^T w_r`,
+
+        .. math::
+            \psi^T w_r = \mathbb{E}\Big[\sum_t \gamma^t \phi_t^T w_r\Big]
+                       = Q^\pi - \mathbb{E}\Big[\sum_t \gamma^t \epsilon_t\Big],
+
+        so whatever part of the residual correlates with the policy's own trajectories is
+        amplified by up to :math:`1/(1-\gamma)`, which is 100 at the default ``gamma: 0.99``.
+
+        This method closes the loop by descending the same residual in ``phi`` that
+        :meth:`_ridge_update_successor_weights` has just minimized in ``w``. ``w`` is detached:
+        it was solved in closed form moments earlier and is already optimal for the current
+        ``phi``, so the two steps are block-coordinate descent on a single objective rather than
+        two losses competing for the same parameters.
+
+        Args:
+            obs (torch.Tensor): The ``observation`` sampled from buffer.
+            act (torch.Tensor): The ``action`` sampled from buffer.
+            reward (torch.Tensor): The ``reward`` sampled from buffer.
+            cost (torch.Tensor): The ``cost`` sampled from buffer.
+        """
+        trunk = self._actor_critic.sr_trunk
+        phi = trunk.phi(obs, act)
+
+        def fraction_unexplained(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+            # Plain MSE would make this loss unable to compete for the shared trunk. The
+            # per-step reward on PointGoal1 has std 0.0077, so its squared error -- and every
+            # gradient drawn from it -- lands around 1e-4, while the psi TD loss above is built
+            # on a unit-norm phi and is O(1): four orders of magnitude louder. Dividing by the
+            # target's own variance turns each term into 1 - R^2, which is scale-free, directly
+            # interpretable, and comparable between the reward and cost streams even though
+            # their units are nothing alike.
+            return ((pred - target) ** 2).mean() / target.var().clamp_min(1e-12)
+
+        loss = fraction_unexplained(phi @ trunk.w_r.detach(), reward)
+        if self._cfgs.algo_cfgs.use_cost:
+            loss = loss + fraction_unexplained(phi @ trunk.w_c.detach(), cost)
+        loss = loss * float(self._cfgs.model_cfgs.sr_cfgs.get('phi_loss_coef', 1.0))
+
+        self._actor_critic.sr_optimizer.zero_grad()
+        loss.backward()
+        if self._cfgs.algo_cfgs.max_grad_norm:
+            clip_grad_norm_(
+                self._actor_critic.sr_trunk.parameters(),
+                self._cfgs.algo_cfgs.max_grad_norm,
+            )
+        self._actor_critic.sr_optimizer.step()
+
+        self._logger.store({'Loss/Loss_phi': loss.item()})
 
     def _update_successor_features(
         self,
@@ -1081,5 +1207,9 @@ class DDPG(BaseAlgo):
                     'Misc/WcNorm': 0.0,
                     'Misc/GramCond': 0.0,
                     'Misc/GramCondCost': 0.0,
+                    'Misc/PhiEffRank': 0.0,
+                    **(
+                        {'Loss/Loss_phi': 0.0} if self._sr_phi_objective != 'none' else {}
+                    ),
                 },
             )

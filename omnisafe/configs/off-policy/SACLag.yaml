@@ -364,6 +364,30 @@ defaults:
       #                trained by the same loss, optimizer and step as psi. Only meaningful
       #                together with that psi_objective, and validated against it at startup.
       phi_source: trunk
+      # what, if anything, trains phi itself (td_ridge mode only).
+      #   'none' (default): nothing does. Under phi_source: 'trunk' phi_head never receives a
+      #           gradient (every trainable loss reads out through psi, never phi) and under the
+      #           frozen sources phi is random by construction -- so the successor-feature
+      #           premise that the immediate reward is LINEAR IN PHI is never enforced, only
+      #           hoped for. Measured on SACLag/SafetyPointGoal1-v0 it does not hold: the ridge's
+      #           own training R^2 against the immediate reward is 0.13-0.43 depending on source,
+      #           and phi's effective rank (participation ratio of its squared spectrum) collapses
+      #           to 1.5 of 64 under the default 'trunk'. Whatever the ridge cannot fit becomes a
+      #           residual that the SR identity Q = psi.w then sums over the whole discounted
+      #           horizon, amplifying any policy-correlated component by up to 1/(1-gamma) = 100.
+      #   'reward': add MSE(phi(s,a).w_r, r) + MSE(phi(s,a).w_c, c) -- w detached, since the ridge
+      #           already solved it -- and backpropagate it into phi and the trunk beneath it.
+      #           Together with the ridge solve this is block-coordinate descent on one objective
+      #           (solve w given phi, then step phi given w), so it makes r ~= phi.w hold by
+      #           optimization rather than by assumption. Requires phi to have trainable
+      #           parameters, i.e. phi_source: 'trunk' (the frozen sources have none, and are
+      #           rejected at startup).
+      phi_objective: none
+      # multiplier on the phi_objective loss (phi_objective: 'reward' only). The loss is
+      # already variance-normalized into (1 - R^2) per stream, so 1.0 puts it on equal footing
+      # with the unit-scale psi TD loss; raise it to make fitting the reward the trunk's
+      # priority, lower it to keep the successor recursion in charge.
+      phi_loss_coef: 1.0
       # hidden layer sizes of the standalone phi network (phi_source: 'separate' /
       # 'contrastive' / 'laplacian' only, and any such entries of phi_ensemble_sources). Sets
       # its hidden widths verbatim, independent of sr_dim (which only sets its output width) and of
